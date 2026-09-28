@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Galeri engine SimOtonom (uji)</title>
+    <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+    <link rel="stylesheet" href="../css/style.css" />
+    <style>
+      body { padding: 20px; }
+      .wrap { display: grid; gap: 16px; max-width: 1300px; margin: 0 auto; }
+      .gal-stage { position: relative; height: 520px; border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Galeri engine (halaman uji)</h1>
+      <div class="gal-stage" id="stage"><div class="hud" id="hud"></div></div>
+      <div class="controls" id="controls"></div>
+    </div>
+    <script type="module">
+      import * as E from '../js/engine/index.js';
+      const { ui } = E;
+      const stage = document.getElementById('stage');
+      const view = new E.View(stage, { bounds: { minX: -5, minY: -22, maxX: 95, maxY: 22 } });
+
+      // jalan dua lajur per arah dan persimpangan
+      const road = E.makeRoad({ points: [{ x: -10, y: 0 }, { x: 60, y: 0 }], lanesPerDir: 2, sidewalk: 3, trimEnd: 0 });
+      const curve = E.makeRoad({ points: E.arcPoints(60, 30, 30, -Math.PI / 2, 0, 20), lanesPerDir: 1, sidewalk: 2 });
+      const cw = E.crosswalk({ x: 50, y: 0, heading: Math.PI / 2, length: 14 });
+      const lane = E.getLane(road, 1, 0);
+      const car = new E.Vehicle({ x: 10, y: lane.points[0].y, heading: 0, ego: true, maxSpeed: 10 });
+      const agent = new E.PathAgent({ path: E.getLane(road, -1, 0).points, cruise: 6, loop: true, color: E.COLORS.vehicles[2] });
+      const ped = new E.PathAgent({ kind: 'pedestrian', path: [{ x: 50, y: -8 }, { x: 50, y: 8 }], cruise: 1.3, loop: true });
+      const bike = new E.PathAgent({ kind: 'cyclist', path: [{ x: -5, y: -6.2 }, { x: 60, y: -6.2 }], cruise: 4, loop: true });
+      const light = new E.TrafficLight({ x: 46, y: -9, heading: Math.PI });
+      const plan = new E.SignalPlan([{ lights: [light], green: 4 }], { yellow: 2, allRed: 2 });
+      const bus = { x: 25, y: 12, heading: 0, length: 12, width: 2.5 };
+      const shuttle = { x: 75, y: 15, heading: Math.PI / 2, length: 5, width: 2.1 };
+      const wall = { ...E.rectBox(-4, -12, -3, 12), kind: 'wall' };
+      const building = E.rectBox(64, -20, 90, -6, { kind: 'building' });
+      const objects = [agent, ped, bike, wall, building, light];
+      const rig = new E.SensorRig(car, E.standardSensors(car));
+      const grid = new E.GridMap({ cols: 10, rows: 6, cellSize: 2, originX: 70, originY: -4 });
+      for (let r = 0; r < 5; r++) grid.setBlocked(4, r);
+      const search = E.createSearch(grid, grid.index(0, 0), grid.index(9, 0));
+      const pid = new E.PID({ kp: 1.2, ki: 0.3, kd: 0.05, min: -3, max: 3 });
+      const labels = E.createLabelLayer();
+      const path = new E.Path(lane.points);
+      let weather = 'cerah';
+
+      const chip = ui.hudChip(document.getElementById('hud'), { label: 'Kecepatan', color: E.COLORS.accent });
+      const g1 = ui.group(document.getElementById('controls'), { title: 'Widget', hint: 'Semua widget dari js/engine/ui.js' });
+      const sl = ui.slider(g1, { label: 'Kecepatan target', min: 0, max: 20, step: 0.5, value: 8, unit: 'm/s' });
+      const tg = ui.toggle(g1, { label: 'Radar', color: E.COLORS.radar, hint: 'Jangkauan 90 m', checked: true, onChange: (on) => rig.setEnabled('radar', on) });
+      ui.segmented(g1, { label: 'Cuaca', options: E.WEATHER_IDS.map((id) => ({ value: id, label: E.WEATHER[id].label })), value: 'cerah', onChange: (w) => (weather = w) });
+      const row = ui.buttonRow(g1);
+      ui.button(row, { label: 'Utama', variant: 'primary', icon: 'play' });
+      ui.button(row, { label: 'Kedua', icon: 'reset', kbd: 'R' });
+      ui.button(row, { label: 'Hapus', variant: 'danger', icon: 'trash', small: true });
+      const g2 = ui.group(document.getElementById('controls'), { title: 'Readout dan grafik' });
+      const rg = ui.readoutGrid(g2);
+      const ro1 = ui.readout(rg, { label: 'Jarak', value: '0 m' });
+      const ro2 = ui.readout(rg, { label: 'Status', value: 'aman' });
+      ro2.setTone('ok');
+      ui.legend(g2, [{ color: E.COLORS.kamera, label: 'Kamera' }, { color: E.COLORS.lidar, label: 'LiDAR', shape: 'line' }, { color: E.COLORS.radar, label: 'Radar', shape: 'square' }]);
+      const chart = ui.timeChart(g2, { label: 'Galat PID', series: [{ label: 'galat', color: E.COLORS.accent }, { label: 'keluaran', color: E.COLORS.radar }], span: 8, unit: 'm/s' });
+      ui.holdButton(ui.buttonRow(g2), { label: 'Gas', icon: 'arrowUp' });
+      const g3 = ui.group(document.getElementById('controls'), { title: 'Tabel dan catatan', wide: true });
+      const table = ui.dataTable(g3, { columns: [{ key: 'a', label: 'Objek' }, { key: 'b', label: 'Jarak', align: 'right' }] });
+      ui.note(g3, 'Catatan informasi dengan <strong>teks tebal</strong>.');
+      ui.note(g3, 'Peringatan contoh.', { tone: 'warn' });
+
+      let time = 0;
+      const loop = new E.Loop({
+        update(dt) {
+          time += dt;
+          plan.update(time);
+          const pp = E.purePursuit(car, path, { lookahead: 6 });
+          const u = pid.update(sl.value - car.speed, dt);
+          car.step(dt, { accel: u, steer: pp.steer });
+          if (car.x > 58) car.setPose(0, lane.points[0].y, 0);
+          agent.step(dt);
+          ped.step(dt);
+          bike.step(dt);
+          rig.update(dt, objects, weather);
+          if (!search.done) search.step();
+          chart.push(time, sl.value - car.speed, u);
+        },
+        render() {
+          const g = view.begin();
+          E.drawGrid(g, view, { spacing: 10 });
+          E.drawRoad(g, road);
+          E.drawRoad(g, curve);
+          E.drawCrosswalk(g, cw);
+          E.drawStopLine(g, E.stopLine({ x: 46.5, y: -3.5, heading: 0, length: 7 }));
+          E.drawBuilding(g, building);
+          E.drawWall(g, wall);
+          E.drawTree(g, 5, -12, 2);
+          E.drawCone(g, { x: 30, y: -12 }, { view });
+          E.drawCardboard(g, { x: 34, y: -12, length: 1, width: 0.8, heading: 0.3 });
+          E.drawHalte(g, { x: 20, y: -12.5, length: 6, width: 2 });
+          E.drawBus(g, bus);
+          E.drawShuttle(g, shuttle, { ego: true });
+          E.drawCar(g, agent, { braking: true });
+          E.drawCyclist(g, bike, { view });
+          E.drawPedestrian(g, ped, { view, phase: time * 7 });
+          E.drawTrafficLight(g, light, { view });
+          E.drawSpeedSign(g, { x: 40, y: -12, text: '40' }, { view });
+          E.drawPath(g, path.points, { view, width: 3, arrows: 10, dash: [8, 6], alpha: 0.8 });
+          E.drawArrow(g, { x: 80, y: 8 }, { x: 90, y: 12 }, { view });
+          E.drawMarker(g, 88, 18, { view });
+          for (const i of search.closed) {
+            const p = grid.toWorld(i);
+            g.fillStyle = 'rgba(96,165,250,0.25)';
+            g.fillRect(p.x - 0.9, p.y - 0.9, 1.8, 1.8);
+          }
+          for (let r = 0; r < 5; r++) {
+            const p = grid.toWorld(grid.index(4, r));
+            g.fillStyle = '#475569';
+            g.fillRect(p.x - 1, p.y - 1, 2, 2);
+          }
+          if (search.found) E.drawPath(g, search.path.map((i) => grid.toWorld(i)), { view, color: E.COLORS.target, width: 3 });
+          E.drawCar(g, car);
+          E.drawWeather(g, view, weather, time, { lights: [{ type: 'cone', x: car.x, y: car.y, heading: car.heading, fov: 0.9, range: 25 }] });
+          const cam = rig.get('kamera');
+          const p = cam.pose(car);
+          E.drawSensorCone(g, p, p.heading, cam.fov, cam.effectiveRange(weather), E.COLORS.kamera, { view });
+          const lid = rig.reading('lidar');
+          if (lid) E.drawPointCloud(g, lid.points, E.COLORS.lidar, { view });
+          for (const d of rig.detections('kamera')) {
+            E.drawBracketBox(g, d.target, E.COLORS.kamera, { view });
+            labels.add(d.target.x, d.target.y, d.kind, { color: E.COLORS.kamera });
+          }
+          for (const d of rig.detections('radar')) labels.add(d.x, d.y, E.fmtSigned(E.msToKmh(d.relSpeed), 0, 'km/jam'), { color: E.COLORS.radar, dy: 20, mono: true });
+          E.drawRing(g, car.x, car.y, 8, { view, dash: [4, 4], color: E.COLORS.ultrasonik });
+          labels.draw(g, view);
+          E.drawScaleBar(g, view);
+          chip.set(E.fmtSpeed(car.speed));
+          ro1.set(E.fmtDist(Math.hypot(agent.x - car.x, agent.y - car.y)));
+          table.setRows([{ a: 'Mobil lain', b: E.fmtDist(Math.hypot(agent.x - car.x, agent.y - car.y)) }, { a: 'Pejalan kaki', b: E.fmtDist(Math.hypot(ped.x - car.x, ped.y - car.y)) }]);
+        },
+      }).start();
+      window.__gallery = { loop, search };
+    </script>
+  </body>
+</html>
