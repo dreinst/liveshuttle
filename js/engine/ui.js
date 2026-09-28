@@ -62,22 +62,19 @@ export function group(parent, { title = '', hint = '', wide = false, className =
 /**
  * Slider angka dengan label dan nilai.
  * opts: { label, min, max, step, value, unit, digits, format(v), onInput(v), hint }
- * @returns {{el, input, value, set(v, silent?), setDisabled(bool)}}
+ * @returns {{el, input, value, set(v, silent?), setDisabled(bool), setHint(text), setLabel(text), setRange(min, max, step?)}}
  */
 export function slider(parent, opts) {
-  const { label, min = 0, max = 1, step = 0.1, value = min, unit = '', hint = '', onInput = null } = opts;
+  const { label, value = opts.min ?? 0, unit = '', hint = '', onInput = null } = opts;
+  let { min = 0, max = 1, step = 0.1 } = opts;
   const digits = opts.digits ?? digitsFromStep(step);
   const format = opts.format || ((v) => fmt(v, digits, unit));
   const id = uniqueId('slider');
   const out = el('output', { class: 'ctl-value', for: id });
   const input = el('input', { type: 'range', id, min, max, step, value });
-  const node = el(
-    'div',
-    { class: 'ctl ctl-slider' },
-    el('div', { class: 'ctl-head' }, el('label', { for: id, text: label }), out),
-    input,
-    hint ? el('div', { class: 'ctl-note', text: hint }) : null,
-  );
+  const labelEl = el('label', { for: id, text: label });
+  let hintEl = hint ? el('div', { class: 'ctl-note', text: hint }) : null;
+  const node = el('div', { class: 'ctl ctl-slider' }, el('div', { class: 'ctl-head' }, labelEl, out), input, hintEl);
   const paint = () => {
     const v = Number(input.value);
     out.textContent = format(v);
@@ -104,6 +101,30 @@ export function slider(parent, opts) {
     setDisabled(d) {
       input.disabled = !!d;
       node.classList.toggle('is-disabled', !!d);
+    },
+    /** Ganti teks kecil di bawah slider. Teks kosong menyembunyikannya. */
+    setHint(text) {
+      text = String(text ?? '');
+      if (!hintEl) {
+        if (!text) return;
+        hintEl = el('div', { class: 'ctl-note' });
+        node.append(hintEl);
+      }
+      if (hintEl.textContent !== text) hintEl.textContent = text;
+      hintEl.hidden = !text;
+    },
+    setLabel(text) {
+      labelEl.textContent = String(text);
+    },
+    /** Ubah batas (dan langkah) slider. Nilai sekarang dijepit ke batas baru tanpa memanggil onInput. */
+    setRange(newMin, newMax, newStep = step) {
+      min = newMin;
+      max = newMax;
+      step = newStep;
+      input.min = String(min);
+      input.max = String(max);
+      input.step = String(step);
+      paint();
     },
   };
 }
@@ -185,7 +206,12 @@ export function segmented(parent, opts) {
     onChange?.(v);
   };
   buttons.forEach((b, i) => {
-    b.addEventListener('click', () => choose(options[i].value));
+    b.addEventListener('click', (e) => {
+      choose(options[i].value);
+      // Setelah klik mouse atau sentuh (detail > 0), lepas fokus supaya tombol panah kembali ke
+      // pintasan pelajaran (misalnya maju dan mundur). Pengguna papan ketik tetap memegang fokus.
+      if (e.detail > 0) b.blur();
+    });
     b.addEventListener('keydown', (e) => {
       const d = e.key === 'ArrowRight' || e.key === 'ArrowDown' ? 1 : e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 0;
       if (!d) return;
@@ -234,7 +260,7 @@ export function button(parent, opts) {
  * Tombol tahan: aktif selama ditekan (mouse, sentuh, atau Spasi/Enter).
  * Cocok untuk gas, rem, atau maju/mundur. Pasangkan dengan tombol keyboard lewat ctx.keys().
  * opts: { label, icon, kbd, onChange(active), variant }
- * @returns {{el, active, setActive(bool)}}
+ * @returns {{el, active, setActive(bool), setDisabled(bool), setLabel(text)}}
  */
 export function holdButton(parent, opts) {
   const { label, icon: ic = null, kbd = null, onChange = null, variant = 'secondary' } = opts;
@@ -273,6 +299,14 @@ export function holdButton(parent, opts) {
       return active;
     },
     setActive: set,
+    /** Nonaktifkan tombol. Bila sedang ditahan, tombol dilepas dulu (onChange(false) terpanggil). */
+    setDisabled(d) {
+      if (d) set(false);
+      node.disabled = !!d;
+    },
+    setLabel(text) {
+      node.querySelector('.btn-label').textContent = String(text);
+    },
   };
 }
 
@@ -375,9 +409,28 @@ export function dataTable(parent, { columns, rows = [], caption = '', empty = 'B
   return { el: wrap, table, setRows };
 }
 
-/** Catatan kecil di panel kontrol. tone: 'info' | 'warn' | 'ok'. html dianggap tepercaya. */
+/**
+ * Catatan kecil di panel kontrol. tone: 'info' | 'warn' | 'ok'. html dianggap tepercaya.
+ * Mengembalikan elemen callout. Elemen itu juga punya node.setTone(tone) dan node.setHtml(html)
+ * untuk mengubah warna dan isi tanpa membuat ulang.
+ */
 export function note(parent, html, { tone = 'info' } = {}) {
-  const node = el('div', { class: `ctl-callout is-${tone}`, html: `${icon(tone === 'warn' ? 'alert' : tone === 'ok' ? 'check' : 'info')}<div>${html}</div>` });
+  const iconFor = (t) => icon(t === 'warn' ? 'alert' : t === 'ok' ? 'check' : 'info');
+  const node = el('div', { class: `ctl-callout is-${tone}`, html: `${iconFor(tone)}<div>${html}</div>` });
+  let current = tone;
+  node.setTone = (t = 'info') => {
+    if (t === current) return;
+    node.classList.remove(`is-${current}`);
+    node.classList.add(`is-${t}`);
+    current = t;
+    const body = node.lastElementChild;
+    node.innerHTML = iconFor(t);
+    node.append(body);
+  };
+  node.setHtml = (h) => {
+    const body = node.lastElementChild;
+    if (body.innerHTML !== h) body.innerHTML = h;
+  };
   parent.append(node);
   return node;
 }
@@ -385,11 +438,12 @@ export function note(parent, html, { tone = 'info' } = {}) {
 /**
  * Chip kecil untuk HUD di atas kanvas (ctx.hud).
  * opts: { label, color }
- * @returns {{el, set(text), show(bool), setTone(tone)}}
+ * @returns {{el, set(text), show(bool), setTone(tone), setLabel(text), setColor(css)}}
  */
 export function hudChip(parent, { label = '', color = null } = {}) {
   const valueEl = el('span', { class: 'hud-value' });
-  const node = el('div', { class: 'hud-chip' }, label ? el('span', { class: 'hud-label', text: label }) : null, valueEl);
+  let labelEl = label ? el('span', { class: 'hud-label', text: label }) : null;
+  const node = el('div', { class: 'hud-chip' }, labelEl, valueEl);
   if (color) node.style.setProperty('--tone', color);
   parent.append(node);
   let last = null;
@@ -408,17 +462,39 @@ export function hudChip(parent, { label = '', color = null } = {}) {
     setTone(tone) {
       node.dataset.tone = tone || '';
     },
+    /** Ganti atau tambahkan label chip. Teks kosong menyembunyikan label. */
+    setLabel(text) {
+      text = String(text ?? '');
+      if (!labelEl) {
+        if (!text) return;
+        labelEl = el('span', { class: 'hud-label' });
+        node.prepend(labelEl);
+      }
+      if (labelEl.textContent !== text) labelEl.textContent = text;
+      labelEl.hidden = !text;
+    },
+    setColor(css) {
+      if (css) node.style.setProperty('--tone', css);
+      else node.style.removeProperty('--tone');
+    },
   };
 }
 
 /**
  * Grafik deret waktu kecil (misalnya galat kemudi atau kecepatan).
- * opts: { label, series: [{ label, color }], span (detik yang terlihat), min, max, unit, digits, height }
+ * opts: { label, series: [{ label, color }], span (detik yang terlihat), min, max, unit, digits, height,
+ *         scale: 'linear' (bawaan) | 'log' (log10, nilai <= 0 dianggap kosong; min dan max harus > 0 bila diisi) }
  * min/max null berarti skala otomatis. Menggambar ulang otomatis sekali per frame setelah push().
- * @returns {{el, push(t, ...values), clear(), draw()}}
+ * Nilai yang bukan angka (null, NaN, Infinity) memutus garis, jadi deret yang dimatikan lalu
+ * dinyalakan lagi tidak disambung lurus melewati celahnya.
+ * @returns {{el, push(t, ...values), clear(), draw(), setRange(min, max)}}
  */
 export function timeChart(parent, opts) {
-  const { label = '', series, span = 10, min = null, max = null, unit = '', digits = 1, height = 120 } = opts;
+  const { label = '', series, span = 10, unit = '', digits = 1, height = 120, scale = 'linear' } = opts;
+  let { min = null, max = null } = opts;
+  const isLog = scale === 'log';
+  const valid = (v) => Number.isFinite(v) && (!isLog || v > 0);
+  const tf = (v) => (isLog ? Math.log10(v) : v);
   const canvas = el('canvas', { class: 'chart-canvas', role: 'img', 'aria-label': label || 'Grafik' });
   canvas.style.height = `${height}px`;
   const values = series.map(() => el('span', { class: 'chart-now' }));
@@ -446,29 +522,36 @@ export function timeChart(parent, opts) {
     g.clearRect(0, 0, w, h);
     const tEnd = data.length ? data[data.length - 1][0] : span;
     const tStart = tEnd - span;
-    let lo = min;
-    let hi = max;
+    // batas dalam ruang yang digambar (linear, atau log10 untuk skala log)
+    let lo = min != null ? tf(min) : null;
+    let hi = max != null ? tf(max) : null;
     if (lo == null || hi == null) {
       let a = Infinity;
       let b = -Infinity;
-      for (const row of data) for (let i = 1; i < row.length; i++) if (Number.isFinite(row[i])) {
-        a = Math.min(a, row[i]);
-        b = Math.max(b, row[i]);
+      for (const row of data) {
+        if (row[0] < tStart) continue;
+        for (let i = 1; i < row.length; i++) {
+          if (!valid(row[i])) continue;
+          const v = tf(row[i]);
+          a = Math.min(a, v);
+          b = Math.max(b, v);
+        }
       }
       if (!Number.isFinite(a)) {
         a = 0;
         b = 1;
       }
       if (a === b) {
-        a -= 1;
-        b += 1;
+        a -= isLog ? 0.5 : 1;
+        b += isLog ? 0.5 : 1;
       }
       const pad = (b - a) * 0.1;
       lo = lo ?? a - pad;
       hi = hi ?? b + pad;
     }
     const X = (t) => ((t - tStart) / span) * (w - 8) + 4;
-    const Y = (v) => h - 6 - ((v - lo) / (hi - lo || 1)) * (h - 12);
+    const Y = (u) => h - 6 - ((u - lo) / (hi - lo || 1)) * (h - 12);
+    const shown = (u) => (isLog ? 10 ** u : u);
     // grid
     g.strokeStyle = 'rgba(148, 163, 184, 0.14)';
     g.lineWidth = 1;
@@ -479,7 +562,7 @@ export function timeChart(parent, opts) {
       g.lineTo(w, y);
     }
     g.stroke();
-    if (lo < 0 && hi > 0) {
+    if (!isLog && lo < 0 && hi > 0) {
       g.strokeStyle = 'rgba(226, 232, 240, 0.35)';
       g.setLineDash([4, 4]);
       g.beginPath();
@@ -491,9 +574,15 @@ export function timeChart(parent, opts) {
     g.font = '10px ui-monospace, monospace';
     g.fillStyle = 'rgba(148, 163, 184, 0.9)';
     g.textBaseline = 'top';
-    g.fillText(fmt(hi, digits, unit), 4, 2);
+    // skala log: angka kecil diberi digit tambahan supaya tidak terbaca 0
+    const axisText = (u) => {
+      const v = shown(u);
+      const d = isLog && v > 0 && v < 1 ? Math.max(digits, Math.min(4, Math.ceil(-Math.log10(v)) + 1)) : digits;
+      return fmt(v, d, unit);
+    };
+    g.fillText(axisText(hi), 4, 2);
     g.textBaseline = 'bottom';
-    g.fillText(fmt(lo, digits, unit), 4, h - 1);
+    g.fillText(axisText(lo), 4, h - 1);
     series.forEach((s, si) => {
       g.strokeStyle = s.color;
       g.lineWidth = 2;
@@ -501,10 +590,14 @@ export function timeChart(parent, opts) {
       g.beginPath();
       let started = false;
       for (const row of data) {
+        if (row[0] < tStart) continue;
         const v = row[si + 1];
-        if (!Number.isFinite(v) || row[0] < tStart) continue;
+        if (!valid(v)) {
+          started = false; // celah: garis berikutnya mulai baru
+          continue;
+        }
         const x = X(row[0]);
-        const y = Y(Math.max(lo, Math.min(hi, v)));
+        const y = Y(Math.max(lo, Math.min(hi, tf(v))));
         if (started) g.lineTo(x, y);
         else {
           g.moveTo(x, y);
@@ -530,6 +623,12 @@ export function timeChart(parent, opts) {
     },
     clear() {
       data.length = 0;
+      schedule();
+    },
+    /** Ubah batas sumbu tegak. null = otomatis. */
+    setRange(newMin = null, newMax = null) {
+      min = newMin;
+      max = newMax;
       schedule();
     },
     draw,

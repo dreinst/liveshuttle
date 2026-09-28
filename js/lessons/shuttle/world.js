@@ -1,60 +1,38 @@
-// Simulasi pelajaran Misi Shuttle Otonom: shuttle, mobil lain, pejalan kaki, penumpang.
+// Simulasi pelajaran Misi Shuttle Otonom di jalan asli sekitar Universitas Ma Chung.
 //
-// Semua kendaraan memakai aturan yang sama:
-//   - rute berupa deretan link (lajur berarah) yang disambung kurva penghubung di persimpangan;
-//   - jarak ke kendaraan di depan diatur dengan Intelligent Driver Model (IDM);
-//   - berhenti di garis henti bila lampu merah, atau kuning dan masih sempat berhenti nyaman;
-//   - masuk persimpangan hanya dengan "reservasi": lintasannya tidak boleh bersilangan dengan
-//     kendaraan yang sudah memegang reservasi, dan lajur tujuannya harus ada ruang;
-//   - memberi jalan ke pejalan kaki di zebra cross.
-// Shuttle memakai model sepeda kinematik (engine Vehicle) dengan kemudi pure pursuit. Mobil lain
-// disederhanakan: posisinya mengikuti garis lajur dengan tepat.
+// Isi:
+//   - SHUTTLE 01 melayani lima halte yang sama dengan Shuttle 3D Ma Chung, berurutan, dengan rute A*;
+//   - penumpang datang secara acak, naik dan turun di halte (pintu kiri, sisi trotoar);
+//   - lalu lintas lokal (sepeda motor, mobil, angkot) dan pejalan kaki di sekitar shuttle;
+//   - lampu lalu lintas simulasi di dua simpang Jalan Karangampel Timur;
+//   - penutupan jalan dengan hitung ulang rute, hujan, statistik misi;
+//   - pemantau aturan keras: "Terobos lampu merah" dan "Kontak dengan pejalan kaki" harus selalu 0.
 //
-// Rute shuttle antarhalte dicari dengan A* dari engine/planning.js. Karena shuttle tidak bisa
-// putar balik, keadaan pencarian adalah link (ruas beserta arah datangnya). Node saja tidak cukup.
-// Biaya pindah ke link = panjang ruasnya, heuristik = jarak garis lurus (admissible).
+// Fisika memakai langkah tetap (dt 1/60 detik). Percepatan waktu menjalankan lebih banyak langkah,
+// tidak pernah dt yang lebih besar.
 
-import { Vehicle } from '../../engine/vehicle.js';
-import { Path, joinPolylines, boxesOverlap, distanceToBox } from '../../engine/geometry.js';
-import { findPath } from '../../engine/planning.js';
-import { purePursuit } from '../../engine/control.js';
-import { Rng, clamp, kmhToMs, angleDiff, wrapAngle } from '../../engine/math.js';
-import { shouldStopForYellow } from '../../engine/traffic.js';
+import { Traffic, Vehicle } from './traffic.js';
+import { Pedestrians } from './peds.js';
+import { brakeLimit, stopDistance, InvariantMonitor } from '../../sim3d/shield.js';
 import { Sensor, SensorRig } from '../../engine/sensors.js';
+import { mulberry32, kmhToMs } from '../../engine/math.js';
+import { segmentIntersection } from '../../engine/geometry.js';
 import { COLORS } from '../../engine/theme.js';
-import {
-  LINKS,
-  MOVES,
-  NODE_LIST,
-  ROADS,
-  PLANS,
-  LIGHTS,
-  ZEBRAS,
-  HALTE,
-  HALF_W,
-  BUILDINGS,
-  TRUNKS,
-  SHELTERS,
-  PARKED,
-  openDegree,
-} from './campus.js';
 
+export const DT = 1 / 60;
 export const CAPACITY = 12;
 export const MAX_CLOSED = 2;
-export const EMERGENCY_DECEL = 3; // m/s^2, di atas ini dihitung pengereman darurat
+/** Perlambatan di atas nilai ini dihitung sebagai pengereman darurat (m/s²). */
+export const EMERGENCY_DECEL = 3;
 export const RAIN_FACTOR = 0.7;
-export const COMFORT_YELLOW = 2.5; // perlambatan nyaman untuk dilema lampu kuning
-const START = '__mulai__';
-const SHUTTLE_START = { link: 'B>D', x: 1.75, y: 24 };
-const CAR_STARTS = [
-  { link: 'E>F', at: 22, cruiseF: 0.86, color: COLORS.vehicles[0] },
-  { link: 'H>E', at: 12, cruiseF: 0.95, color: COLORS.vehicles[2] },
-  { link: 'D>B', at: 30, cruiseF: 0.9, color: COLORS.vehicles[4] },
-];
+/** Koefisien gesek ban dengan aspal (perkiraan): kering 0,8, basah 0,5. */
+export const MU = { cerah: 0.8, hujan: 0.5 };
+export const HALTE_COLORS = ['#f472b6', '#c084fc', '#fb923c', '#60a5fa', '#a3e635'];
+export const LIDAR_RANGE = 45;
+
 const INITIAL_PAX = [
   [0, 1],
   [0, 2],
-  [0, 3],
   [1, 3],
   [2, 4],
   [2, 0],
@@ -62,223 +40,191 @@ const INITIAL_PAX = [
   [4, 0],
   [4, 2],
 ];
+/** Posisi awal shuttle: di lajur halte Gerbang Ma Chung, sekitar 80 m sebelum halte. */
+const START_BEFORE_HALTE = 78;
 
-// ---------- rute ----------
+export function createWorld(net, { seed = 20260928, npcTarget = 12, pedTarget = 18 } = {}) {
+  const city = net.city;
+  let rand = mulberry32(seed);
+  const rng = () => rand();
+  const H = net.halte;
+  H.forEach((h, i) => (h.color = HALTE_COLORS[i]));
 
-/** Susun rute dari daftar id link: path gabungan, posisi tiap link, kurva, dan zebra cross. */
-export function buildRoute(ids) {
-  const polys = [];
-  const segs = [];
-  const zebras = [];
-  let s = 0;
-  for (let i = 0; i < ids.length; i++) {
-    const L = LINKS[ids[i]];
-    const seg = { link: L, s0: s, s1: s + L.length, move: null, b1: s + L.length };
-    polys.push(L.pts);
-    s = seg.s1;
-    for (const z of L.zebras) zebras.push({ zebra: z.zebra, s0: seg.s0 + z.s0, s1: seg.s0 + z.s1 });
-    if (i + 1 < ids.length) {
-      const M = MOVES.get(`${L.id}|${ids[i + 1]}`);
-      if (!M) throw new Error(`Tidak ada gerakan ${L.id} ke ${ids[i + 1]}`);
-      polys.push(M.points);
-      s += M.length;
-      seg.move = M;
-      seg.b1 = s;
-    }
-    segs.push(seg);
-  }
-  const pts = joinPolylines(...polys);
-  const path = new Path(pts);
-  // jari-jari lengkung di tiap titik, untuk batas kecepatan belok
-  const radius = new Float64Array(pts.length).fill(Infinity);
-  for (let i = 1; i < pts.length - 1; i++) {
-    const l1 = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-    const l2 = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
-    const h1 = Math.atan2(pts[i].y - pts[i - 1].y, pts[i].x - pts[i - 1].x);
-    const h2 = Math.atan2(pts[i + 1].y - pts[i].y, pts[i + 1].x - pts[i].x);
-    const k = Math.abs(wrapAngle(h2 - h1)) / Math.max(0.3, (l1 + l2) / 2);
-    if (k > 1e-3) radius[i] = 1 / k;
-  }
-  return { ids: [...ids], segs, zebras, path, radius };
-}
-
-function indexAt(path, s) {
-  const cum = path.cum;
-  let lo = 0;
-  let hi = cum.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (cum[mid] <= s) lo = mid;
-    else hi = mid;
-  }
-  return lo;
-}
-
-// ---------- dunia ----------
-
-export function createWorld() {
-  const rng = new Rng(20250901);
   const W = {
     time: 0,
     weather: 'cerah',
-    limitKmh: 20,
-    closed: new Set(),
-    cones: [],
-    active: HALTE.map(() => true),
-    queues: HALTE.map(() => []),
+    limitKmh: 25,
+    active: H.map(() => true),
+    queues: H.map(() => []),
     unreachable: new Set(),
-    skipped: new Set(), // halte yang dilewati karena tak terjangkau sejak halte terakhir
+    skipped: new Set(),
     lastDone: null,
-    cars: [],
-    peds: [],
-    movers: [],
+    target: null,
+    stopDecision: null,
+    mode: 'drive',
+    dwell: null,
+    onboard: [],
     events: [],
     stats: null,
     loop: null,
     oldRoute: null,
     lastSearch: null,
     pendingLeader: false,
-    collisions: 0,
+    leader: null,
+    nextPax: 5,
     paxSeq: 0,
-    pedSeq: 0,
-    nextPax: 3,
+    emergency: false,
+    emergencyAt: -10,
+    shieldAt: -10,
+    shieldWhat: null,
   };
 
-  // ---------- shuttle ----------
-  const sh = new Vehicle({
-    id: 'shuttle',
-    kind: 'shuttle',
-    label: 'SHUTTLE 01',
-    ego: true,
-    length: 5,
-    width: 2.1,
-    wheelbase: 3.2,
-    maxSteer: 0.6,
-    steerRate: 1.1,
-    maxAccel: 1.2,
-    maxBrake: 6,
-    maxSpeed: 10,
-    color: COLORS.ego,
+  // ---------- pemantau aturan keras (terpisah dari perisai) ----------
+  // kontak pejalan kaki dihitung InvariantMonitor milik Shuttle 3D (kotak kendaraan vs lingkaran badan)
+  const inv = new InvariantMonitor({
+    get simTime() {
+      return W.time;
+    },
   });
-  sh.isShuttle = true;
-  W.sh = sh;
+  const monitor = {
+    redRuns: 0,
+    otherCollisions: 0,
+    shuttleShield: 0,
+    events: inv.events,
+    get pedContacts() {
+      return inv.pedContact;
+    },
+    note: (e) => inv.note(e),
+    reset() {
+      this.redRuns = this.otherCollisions = this.shuttleShield = 0;
+      inv.pedContact = 0;
+      inv.events.length = 0;
+      inv.contacts.clear();
+    },
+  };
 
-  const rig = new SensorRig(
-    sh,
-    [new Sensor('lidar', { rays: 360, rate: 10, mount: { forward: 0.3 } }), new Sensor('kamera', { rate: 8, mount: { forward: 2.3 } })],
-    { seed: 11 },
-  );
-  W.rig = rig;
-  const staticObjects = [...BUILDINGS, ...SHELTERS, ...TRUNKS, ...LIGHTS, ...PARKED];
+  const app = {
+    city,
+    rng,
+    get simTime() {
+      return W.time;
+    },
+    focus: { x: 0, y: 0 },
+    get mu() {
+      return MU[W.weather];
+    },
+    get weather() {
+      return W.weather;
+    },
+    egoSpeedLimit() {
+      return kmhToMs(W.limitKmh) * (W.weather === 'hujan' ? RAIN_FACTOR : 1);
+    },
+    onShield(veh, cons) {
+      if (!veh.ego) return;
+      monitor.shuttleShield++;
+      W.shieldAt = W.time;
+      W.shieldWhat = cons.kind;
+    },
+    onClamp(veh, cons) {
+      monitor.note({ type: 'jepit', veh: veh.id, kind: veh.type, what: cons.kind });
+    },
+  };
+  const traffic = new Traffic(app);
+  app.traffic = traffic;
+  traffic.target = npcTarget;
+  const peds = new Pedestrians(app);
+  peds.target = pedTarget;
+  const J = traffic.junctions;
+
+  // ---------- shuttle ----------
+  const sh = new Vehicle('shuttle', { ego: true, rng });
+  sh.vDesBase = 30 / 3.6;
+  sh.label = 'SHUTTLE 01';
+  sh.color = COLORS.ego;
+  sh.route = [];
+
+  const lidar = new Sensor('lidar', { range: LIDAR_RANGE, rays: 240, rate: 10, mount: { forward: 0.4 } });
+  const kamera = new Sensor('kamera', { rate: 6, mount: { forward: 2.9 } });
+  const rig = new SensorRig(sh, [lidar, kamera], { seed: 11 });
   const sensorObjects = [];
-
-  // ---------- parameter per kendaraan ----------
-  function params(m) {
-    const wet = W.weather === 'hujan';
-    const limit = kmhToMs(W.limitKmh);
-    if (m.isShuttle) {
-      return { v0: limit * (wet ? RAIN_FACTOR : 1), a: 1.0, b: 1.5, tau: wet ? 3 : 1.5, g0: wet ? 5 : 3, aMax: wet ? 4 : 6, lat: 1.2 };
-    }
-    return { v0: limit * m.cruiseF * (wet ? 0.8 : 1), a: 1.6, b: 2.0, tau: wet ? 2.2 : 1.2, g0: wet ? 4 : 2.5, aMax: wet ? 4 : 6, lat: 1.8 };
-  }
-  W.params = params;
+  const shelters = H.map((h) => ({ ...h.shelter, id: `halte-${h.id}`, kind: 'building', label: `Halte ${h.name}` }));
 
   // ---------- posisi di rute ----------
-  const front = (m) => m.s + m.length / 2;
-  const rear = (m) => m.s - m.length / 2;
 
-  function locate(m) {
-    const segs = m.route.segs;
-    let i = 0;
-    while (i + 1 < segs.length && m.s >= segs[i + 1].s0) i++;
-    return i;
-  }
-
-  /** Link tempat kendaraan berada dan jarak bagian belakangnya dari awal lajur itu. */
-  function linkPos(m) {
-    const segs = m.route.segs;
-    const i = locate(m);
-    const seg = segs[i];
-    if (m.s <= seg.s1 || !seg.move) return { link: seg.link, sRear: rear(m) - seg.s0, sFront: front(m) - seg.s0, inBox: false };
-    return { link: seg.move.out, sRear: rear(m) - seg.b1, sFront: front(m) - seg.b1, inBox: true, node: seg.move.node };
-  }
-  W.linkPos = linkPos;
-
-  function committedIds(m) {
-    const segs = m.route.segs;
-    const i = locate(m);
-    const ids = m.route.ids.slice(0, i + 1);
-    const seg = segs[i];
-    if (seg.move && (front(m) > seg.s1 - 0.2 || (m.res && m.res.move === seg.move))) ids.push(seg.move.out.id);
-    return ids;
-  }
-
-  function release(m) {
-    if (!m.res) return;
-    m.res.node.res.delete(m.id);
-    m.res = null;
-  }
-
-  function setRoute(m, ids) {
-    const keepS = m.s;
-    m.route = buildRoute(ids);
-    m.s = keepS;
-    if (m.res && !m.route.segs.some((sg) => sg.move === m.res.move)) release(m);
-  }
-
-  /** Buang link yang sudah dilewati supaya path tetap pendek. */
-  function shiftRoute(m) {
-    const segs = m.route.segs;
-    if (segs.length > 1 && rear(m) > segs[1].s0 + 1.5) {
-      const off = segs[1].s0;
-      m.route = buildRoute(m.route.ids.slice(1));
-      m.s -= off;
+  /** Jarak pusat shuttle ke titik henti halte h di sepanjang rencananya (m), atau null. */
+  function distToHalte(h) {
+    if (sh.link === h.link && h.s >= sh.s - 1.5) return h.s - sh.s;
+    let d = sh.link.len - sh.s;
+    for (const l of sh.path) {
+      if (l === h.link) return d + h.s;
+      d += l.len;
     }
+    for (const l of sh.route) {
+      if (l === h.link) return d + h.s;
+      d += l.len;
+    }
+    return null;
   }
 
-  // ---------- A* ----------
-  const isOpen = (linkId) => !W.closed.has(LINKS[linkId].road.id);
-
-  function astar(fromId, goalId) {
-    const L0 = LINKS[fromId];
-    const G = LINKS[goalId];
-    const space = {
-      neighbors(id) {
-        const L = id === START ? L0 : LINKS[id];
-        const out = [];
-        for (const n of L.next) if (isOpen(n)) out.push([n, LINKS[n].cost]);
-        return out;
-      },
-      heuristic(id, goal) {
-        if (id === goal) return 0;
-        const L = id === START ? L0 : LINKS[id];
-        return Math.hypot(L.to.x - G.from.x, L.to.y - G.from.y) + G.cost;
-      },
+  /** Titik-titik rute shuttle dari posisinya sampai halte tujuan (untuk digambar). */
+  function routePoints(maxLen = 4000) {
+    const pts = [];
+    const T = W.target != null ? H[W.target] : null;
+    const push = (link, s0, s1) => {
+      const P = link.poly;
+      const a = P.at(Math.max(0, s0), {});
+      pts.push({ x: a.x, y: a.z });
+      for (let i = 0; i < P.n; i++) if (P.cum[i] > s0 && P.cum[i] < s1) pts.push({ x: P.x[i], y: P.z[i] });
+      const b = P.at(Math.min(P.len, s1), {});
+      pts.push({ x: b.x, y: b.z });
     };
-    return findPath(space, START, goalId, { algorithm: 'astar' });
-  }
-
-  /** Rencana rute shuttle ke halte H dari posisinya sekarang. Mengembalikan daftar id link atau null. */
-  function planTo(H, { forceLoop = false } = {}) {
-    const comm = committedIds(sh);
-    const last = comm[comm.length - 1];
-    const i = locate(sh);
-    const cur = sh.route.segs[i];
-    const frontOnLast = last === cur.link.id && comm.length === i + 1 ? front(sh) - cur.s0 : -Infinity;
-    // saat sedang menepi ke halte ini, titik henti yang tinggal beberapa sentimeter tetap dianggap di depan
-    const arriving = sh.mode === 'drive' && sh.target === H.index && sh.stopDecision === 'stop';
-    if (!forceLoop && H.link.id === last && H.s > frontOnLast + (arriving ? -1.0 : 0.3)) {
-      W.lastSearch = { expanded: 0, cost: 0, trivial: true };
-      return comm;
+    let total = 0;
+    const links = [sh.link, ...sh.path, ...sh.route];
+    for (let i = 0; i < links.length; i++) {
+      const l = links[i];
+      const s0 = i === 0 ? sh.s : 0;
+      let s1 = l.len;
+      const end = T && l === T.link && (i > 0 || T.s >= sh.s);
+      if (end) s1 = T.s;
+      if (s1 > s0) push(l, s0, s1);
+      total += s1 - s0;
+      if (end || total > maxLen) break;
     }
-    if (!isOpen(H.link.id)) return null;
-    const res = astar(last, H.link.id);
-    if (!res.found) return null;
-    W.lastSearch = { expanded: res.expanded, cost: res.cost, trivial: false };
-    return [...comm, ...res.path.slice(1)];
+    return pts;
   }
 
-  const isNeeded = (i) => W.active[i] || sh.onboard.some((p) => p.to === i);
+  // ---------- rencana rute ----------
+
+  /** Potong rencana jalur sampai bagian yang sudah pasti (izin simpang dan jarak henti). */
+  function commitPath() {
+    const aB = brakeLimit(sh, MU[W.weather]);
+    const reach = stopDistance(sh.v, aB) + 8;
+    let base = sh.link.len - (sh.s + sh.len / 2);
+    let keep = 0;
+    let lastGrant = -1;
+    for (let i = 0; i < sh.path.length; i++) if (sh.path[i].kind === 'conn' && J.hasGrant(sh, sh.path[i])) lastGrant = i;
+    for (let i = 0; i < sh.path.length; i++) {
+      if (base > reach && i > lastGrant + 1) break;
+      keep = i + 1;
+      base += sh.path[i].len;
+    }
+    if (keep > 0 && sh.path[keep - 1].kind === 'conn' && keep < sh.path.length) keep++;
+    if (keep < sh.path.length) {
+      sh.path.length = keep;
+      sh.pathLen = sh.path.reduce((a, l) => a + l.len, 0);
+    }
+    sh.route = [];
+  }
+
+  /** Rute A* dari ujung rencana jalur sekarang ke halte h. Mengembalikan { links, expanded } atau null. */
+  function planFromPathEnd(h) {
+    const last = sh.path.length ? sh.path[sh.path.length - 1] : sh.link;
+    const startS = sh.path.length ? 0 : sh.s;
+    if (last.kind !== 'lane' && last.kind !== 'conn') return null;
+    return net.route(last, startS, h);
+  }
+
+  const isNeeded = (i) => W.active[i] || W.onboard.some((p) => p.to === i);
 
   function processHalte(i, how) {
     const L = W.loop;
@@ -287,7 +233,8 @@ export function createWorld() {
       if (how === 'dilayani' || how === 'dilewati') {
         L.start = i;
         L.count = 0;
-        L.viol0 = W.stats.violations;
+        L.red0 = monitor.redRuns;
+        L.ped0 = monitor.pedContacts;
         L.t0 = W.time;
       }
       return;
@@ -295,12 +242,13 @@ export function createWorld() {
     if (i === L.start) {
       if (how === 'dilayani' || how === 'dilewati') {
         if (L.count > 0) {
-          const clean = W.stats.violations === L.viol0;
+          const clean = monitor.redRuns === L.red0 && monitor.pedContacts === L.ped0;
           W.stats.loops++;
           W.events.push({ type: 'loop', clean, time: W.time - L.t0 });
         }
         L.count = 0;
-        L.viol0 = W.stats.violations;
+        L.red0 = monitor.redRuns;
+        L.ped0 = monitor.pedContacts;
         L.t0 = W.time;
       } else L.start = null;
       return;
@@ -308,501 +256,71 @@ export function createWorld() {
     L.count++;
   }
 
-  /** Pilih halte berikutnya mulai dari indeks `from`, lalu susun rutenya. */
-  function chooseTarget(from, { notNow = null } = {}) {
-    const before = sh.route.ids.join(',');
-    for (let k = 0; k < HALTE.length; k++) {
-      const i = (from + k) % HALTE.length;
-      const H = HALTE[i];
+  /** Pilih halte berikutnya mulai dari indeks from, lalu susun rutenya dari ujung rencana jalur. */
+  function chooseTarget(from) {
+    const before = sh.route.map((l) => l.id).join(',');
+    for (let k = 0; k < H.length; k++) {
+      const i = (((from + k) % H.length) + H.length) % H.length;
       if (!isNeeded(i)) {
-        if (k > 0 || sh.target !== i) processHalte(i, 'tidak-dilayani');
+        if (k > 0 || W.target !== i) processHalte(i, 'tidak-dilayani');
         continue;
       }
-      // halte yang baru saja dilayani atau dilewati baru bisa dikunjungi lagi setelah satu putaran
-      const ids = planTo(H, { forceLoop: i === notNow });
-      if (ids) {
+      const r = H[i].link.closed ? null : planFromPathEnd(H[i]);
+      if (r) {
         W.unreachable.delete(i);
-        if (sh.target !== i) {
-          sh.target = i;
-          sh.stopDecision = null;
+        if (W.target !== i) {
+          W.target = i;
+          W.stopDecision = null;
+          sh.stopTarget = null;
         }
-        setRoute(sh, ids);
+        sh.route = r.links.slice(1);
+        W.lastSearch = { expanded: r.expanded, cost: r.cost };
         refreshReach();
-        return { ok: true, changed: before !== ids.join(','), target: i };
+        return { ok: true, changed: before !== sh.route.map((l) => l.id).join(','), target: i };
       }
       W.unreachable.add(i);
       W.skipped.add(i);
       processHalte(i, 'tak-terjangkau');
     }
-    sh.target = null;
-    sh.stopDecision = null;
-    setRoute(sh, committedIds(sh));
+    W.target = null;
+    W.stopDecision = null;
+    sh.stopTarget = null;
+    sh.route = [];
     refreshReach();
     return { ok: false, changed: true, target: null };
   }
 
   /** Hapus tanda "jalannya ditutup" dari halte yang ternyata sudah bisa dicapai lagi. */
   function refreshReach() {
-    const saved = W.lastSearch;
-    for (const i of [...W.unreachable]) if (i !== sh.target && planTo(HALTE[i])) W.unreachable.delete(i);
-    W.lastSearch = saved;
+    for (const i of [...W.unreachable]) if (i !== W.target && !H[i].link.closed && planFromPathEnd(H[i])) W.unreachable.delete(i);
   }
 
-  /**
-   * Setelah jalan dibuka: halte yang tadi dilewati karena jalannya ditutup (di antara halte terakhir
-   * dan target sekarang) dilayani lagi, asalkan letaknya searah, yaitu lebih dekat dari target sekarang.
-   * Mengembalikan indeks halte itu, atau null.
-   */
+  /** Setelah jalan dibuka: layani lagi halte yang tadi dilewati, bila letaknya lebih dekat dari target sekarang. */
   function reconsiderSkipped() {
-    if (sh.target == null || W.lastDone == null) return null;
-    const curS = stopSOnRoute(HALTE[sh.target]);
-    if (curS == null) return null;
-    const curLeft = curS - front(sh);
-    const n = HALTE.length;
-    for (let k = 1; k < n; k++) {
-      const i = (W.lastDone + k) % n;
-      if (i === sh.target) break;
-      if (!W.skipped.has(i) || !isNeeded(i)) continue;
-      const saved = W.lastSearch;
-      const ids = planTo(HALTE[i]);
-      if (ids) {
-        const R = buildRoute(ids);
-        let sS = null;
-        for (const sg of R.segs) if (sg.link === HALTE[i].link) sS = sg.s0 + HALTE[i].s;
-        if (sS != null && sS - front(sh) < curLeft) {
-          W.skipped.delete(i);
-          W.unreachable.delete(i);
-          sh.target = i;
-          sh.stopDecision = null;
-          setRoute(sh, ids);
-          return i;
-        }
+    if (W.target == null || W.lastDone == null) return null;
+    const cur = distToHalte(H[W.target]);
+    if (cur == null) return null;
+    for (let k = 1; k < H.length; k++) {
+      const i = (W.lastDone + k) % H.length;
+      if (i === W.target) break;
+      if (!W.skipped.has(i) || !isNeeded(i) || H[i].link.closed) continue;
+      const r = planFromPathEnd(H[i]);
+      if (!r) continue;
+      let d = sh.link.len - sh.s + sh.pathLen;
+      for (const l of r.links.slice(1)) d += l.len;
+      d -= H[i].link.len - H[i].s;
+      if (d < cur) {
+        W.skipped.delete(i);
+        W.unreachable.delete(i);
+        W.target = i;
+        W.stopDecision = null;
+        sh.stopTarget = null;
+        sh.route = r.links.slice(1);
+        W.lastSearch = { expanded: r.expanded, cost: r.cost };
+        return i;
       }
-      W.lastSearch = saved;
     }
     return null;
-  }
-
-  function stopSOnRoute(H) {
-    const segs = sh.route.segs;
-    for (let k = segs.length - 1; k >= 0; k--) if (segs[k].link === H.link) return segs[k].s0 + H.s;
-    return null;
-  }
-  W.stopS = () => (sh.target == null ? null : stopSOnRoute(HALTE[sh.target]));
-
-  // ---------- mobil lain ----------
-  function makeCar(spec, i) {
-    return {
-      id: `mobil-${i + 1}`,
-      kind: 'car',
-      label: 'Mobil',
-      length: 4.5,
-      width: 1.8,
-      color: spec.color,
-      cruiseF: spec.cruiseF,
-      baseCruiseF: spec.cruiseF,
-      x: 0,
-      y: 0,
-      heading: 0,
-      speed: 0,
-      vx: 0,
-      vy: 0,
-      braking: false,
-      route: null,
-      s: 0,
-      res: null,
-      yellow: new Map(),
-      dec: { code: 'melaju' },
-      accel: 0,
-    };
-  }
-
-  // urutan jalan lingkar searah layanan shuttle (untuk mobil pelan di depan shuttle)
-  const RING_NEXT = { 'D>H': 'H>F', 'H>F': 'F>B', 'F>B': 'B>D', 'B>D': 'D>H' };
-
-  function extendCar(c) {
-    let guard = 0;
-    while (c.route.ids.length < 3 && guard++ < 5) {
-      const last = LINKS[c.route.ids[c.route.ids.length - 1]];
-      const opts = last.next.filter(isOpen);
-      if (!opts.length) break;
-      const ring = c.leader ? RING_NEXT[last.id] : null;
-      c.route = buildRoute([...c.route.ids, ring && opts.includes(ring) ? ring : rng.pick(opts)]);
-    }
-  }
-
-  function syncCarPose(c) {
-    const p = c.route.path.sample(c.s);
-    c.x = p.x;
-    c.y = p.y;
-    c.heading = p.heading;
-    c.vx = Math.cos(p.heading) * c.speed;
-    c.vy = Math.sin(p.heading) * c.speed;
-  }
-
-  // ---------- pengambilan keputusan (dipakai semua kendaraan) ----------
-
-  function findLeader(m) {
-    const path = m.route.path;
-    const hint = m.s + 30;
-    let best = null;
-    for (const o of W.movers) {
-      if (o === m) continue;
-      const dx = o.x - m.x;
-      const dy = o.y - m.y;
-      if (dx * dx + dy * dy > 75 * 75) continue;
-      const c = path.closest(o.x, o.y, hint, 48);
-      if (c.s <= m.s + 0.3 || Math.abs(c.lateral) > 2.1) continue;
-      const dh = Math.abs(angleDiff(o.heading, c.heading));
-      const ext = Math.abs(Math.cos(dh)) * (o.length / 2) + Math.abs(Math.sin(dh)) * (o.width / 2);
-      const gap = c.s - front(m) - ext;
-      if (!best || gap < best.gap) best = { gap, v: Math.max(0, o.speed * Math.cos(dh)), obj: o, sRear: c.s - ext, ped: false };
-    }
-    for (const p of W.peds) {
-      if (p.state !== 'cross' || Math.abs(p.off) > HALF_W + 0.3) continue;
-      const dx = p.x - m.x;
-      const dy = p.y - m.y;
-      if (dx * dx + dy * dy > 40 * 40) continue;
-      const c = path.closest(p.x, p.y, hint, 48);
-      if (c.s <= m.s || Math.abs(c.lateral) > m.width / 2 + 0.8) continue;
-      const gap = c.s - front(m) - p.radius;
-      if (!best || gap < best.gap) best = { gap, v: 0, obj: p, sRear: c.s, ped: true };
-    }
-    return best;
-  }
-
-  function tryReserve(m, node, move) {
-    for (const [id, r] of node.res) {
-      if (id === m.id) continue;
-      if (move.conflicts.has(r.move)) return { ok: false, why: 'silang', other: r.mover };
-    }
-    const need = m.length + 3;
-    for (const o of W.movers) {
-      if (o === m) continue;
-      const pos = linkPos(o);
-      if (pos.link === move.out && pos.sRear < need && o.speed < 1.2) return { ok: false, why: 'penuh', other: o };
-    }
-    release(m);
-    node.res.set(m.id, { move, mover: m });
-    m.res = { node, move, go: false };
-    return { ok: true };
-  }
-
-  /** Keadaan persimpangan berikutnya: batas kecepatan dan/atau titik henti. */
-  function junction(m, P, lead) {
-    const v = m.speed;
-    const f = front(m);
-    for (const seg of m.route.segs) {
-      if (!seg.move) return null;
-      const d = seg.s1 - f;
-      if (d < -0.2) continue;
-      if (d > 70) return null;
-      const node = seg.move.node;
-      const light = seg.link.light;
-      const cap = light ? null : { v: Math.sqrt(3.2 * 3.2 + 2 * 1.0 * Math.max(0, d - 1)), code: 'simpang', info: { node } };
-      if (m.res && m.res.move === seg.move) {
-        if (light && !m.res.go) {
-          if (light.state === 'red') {
-            release(m);
-            return { stop: d, code: 'merah', info: { node, light } };
-          }
-          if (light.state === 'yellow') {
-            if (shouldStopForYellow(d, v, COMFORT_YELLOW)) {
-              release(m);
-              return { stop: d, code: 'kuning', info: { node, light } };
-            }
-            m.res.go = true;
-          }
-        }
-        return m.res.go && light && light.state !== 'green' ? { go: 'kuning-terus', info: { node, light }, cap } : { go: 'lewat', info: { node, move: seg.move }, cap };
-      }
-      if (light) {
-        if (light.state === 'red') return { stop: d, code: 'merah', info: { node, light } };
-        if (light.state === 'yellow') {
-          let dec = m.yellow.get(light.id);
-          if (!dec || dec.t < W.time - 6) {
-            dec = { t: W.time, stop: shouldStopForYellow(d, v, COMFORT_YELLOW), d, v };
-            m.yellow.set(light.id, dec);
-          }
-          if (dec.stop) return { stop: d, code: 'kuning', info: { node, light, dec } };
-        }
-      }
-      const dDecide = (v * v) / (2 * P.b) + 6;
-      if (d > dDecide) return cap ? { cap } : null;
-      // kendaraan di depan belum masuk persimpangan: cukup ikuti, reservasi nanti
-      if (lead && !lead.ped && lead.sRear < seg.s1 + 0.5) return cap ? { cap } : null;
-      const r = tryReserve(m, node, seg.move);
-      if (r.ok) {
-        m.res.go = !!light && light.state === 'yellow';
-        return cap ? { cap } : null;
-      }
-      return { stop: d, code: r.why, info: { node, other: r.other }, cap };
-    }
-    return null;
-  }
-
-  function curveCap(m, f, P) {
-    const R = m.route;
-    const cum = R.path.cum;
-    let best = null;
-    for (let j = indexAt(R.path, f); j < cum.length; j++) {
-      const ahead = cum[j] - f;
-      if (ahead > 40) break;
-      const rad = R.radius[j];
-      if (rad === Infinity) continue;
-      const vc = Math.sqrt(P.lat * rad);
-      const allowed = Math.sqrt(vc * vc + 2 * 1.0 * Math.max(0, ahead));
-      if (!best || allowed < best.v) best = { v: allowed, radius: rad, ahead: Math.max(0, ahead) };
-    }
-    return best;
-  }
-
-  /** Hitung percepatan satu kendaraan dan catat alasan keputusannya. */
-  function control(m) {
-    const P = params(m);
-    const v = m.speed;
-    const f = front(m);
-    const R = m.route;
-    const lead = findLeader(m);
-    const jn = junction(m, P, lead);
-
-    let v0 = P.v0;
-    let capCode = null;
-    let capInfo = null;
-    const curve = curveCap(m, f, P);
-    if (curve && curve.v < v0) {
-      v0 = curve.v;
-      capCode = 'belok';
-      capInfo = curve;
-    }
-    if (jn && jn.cap && jn.cap.v < v0) {
-      v0 = jn.cap.v;
-      capCode = jn.cap.code;
-      capInfo = jn.cap.info;
-    }
-    let best = clamp(P.a * (1 - (v / Math.max(0.3, v0)) ** 4), -1.2, P.a);
-    let code = capCode && v0 < P.v0 - 0.2 && best < 0.3 ? capCode : 'melaju';
-    let info = code === 'melaju' ? null : capInfo;
-    let near = null;
-    const take = (a, c, i) => {
-      if (a < best) {
-        best = a;
-        code = c;
-        info = i;
-      }
-    };
-    const stopAt = (d, g0, c, i, soft = false) => {
-      const room = d - g0;
-      const req = room > 0.01 ? (v * v) / (2 * room) : Infinity;
-      if (!near || d < near.d) near = { d, code: c, info: i };
-      let a;
-      if (room <= 0.05 || (room < 1.5 && v < 0.6)) a = v > 0.05 ? -Math.max(P.b, Math.min(req, P.aMax)) : -P.b;
-      else if (req >= 0.6 * P.b) a = -req;
-      else return;
-      if (soft && a < -P.b * 1.15) return;
-      take(a, c, i);
-    };
-
-    if (lead) {
-      const g0 = lead.ped ? 2 : P.g0;
-      const tau = lead.ped ? 1 : P.tau;
-      const s = Math.max(0.2, lead.gap);
-      const dv = v - lead.v;
-      const sStar = g0 + Math.max(0, v * tau + (v * dv) / (2 * Math.sqrt(P.a * P.b)));
-      const inter = (sStar / s) ** 2;
-      const a = P.a * (1 - (v / Math.max(0.3, P.v0)) ** 4 - inter);
-      lead.target = sStar;
-      // label "mengikuti" hanya bila kendaraan di depan benar-benar memengaruhi percepatan
-      if (inter < 0.12) best = Math.min(best, a);
-      else take(a, lead.ped ? 'pejalan' : 'ikuti', lead);
-    }
-    if (jn && jn.stop != null) stopAt(jn.stop, 0.8, jn.code, jn.info);
-
-    for (const z of R.zebras) {
-      if (f > z.s0 - 0.3) continue;
-      const d = z.s0 - f;
-      if (d > 45) continue;
-      let crossing = false;
-      let waiting = false;
-      for (const p of W.peds) {
-        if (p.zebra !== z.zebra) continue;
-        if (p.state === 'cross') crossing = true;
-        else if (p.state === 'wait' && !p.sudden) waiting = true; // pejalan kaki "mendadak" tidak memberi tanda akan menyeberang
-      }
-      if (crossing) stopAt(d, 1.2, 'pejalan', { zebra: z.zebra });
-      else if (waiting) stopAt(d, 1.2, 'pejalan', { zebra: z.zebra, waiting: true }, true);
-      // jangan berhenti di atas zebra cross karena antrean
-      if (lead && !lead.ped && lead.v < 0.8 && lead.sRear > z.s0 && lead.sRear < z.s1 + m.length + 1) stopAt(d, 1.0, 'antre', { zebra: z.zebra }, true);
-    }
-
-    if (m.isShuttle) {
-      if (m.target != null && m.stopDecision === 'stop') {
-        const sS = stopSOnRoute(HALTE[m.target]);
-        if (sS != null) stopAt(sS - f, 0, 'halte', { halte: HALTE[m.target] });
-      }
-    }
-    // pengaman: jangan pernah melewati ujung rute
-    if (R.path.length - f < 60) stopAt(R.path.length - f, 0.5, 'buntu', null);
-
-    if (code === 'melaju' && jn && jn.go) {
-      code = jn.go;
-      info = jn.info;
-    }
-    const a = clamp(best, -P.aMax, P.a);
-    m.dec = { code, info, near, lead, v0, a };
-    return a;
-  }
-
-  // ---------- pejalan kaki ----------
-
-  function zebraAhead(m, Z) {
-    const r = rear(m);
-    for (const z of m.route.zebras) if (z.zebra === Z && z.s1 + 0.2 > r) return z;
-    return null;
-  }
-
-  function canCross(p) {
-    let tightest = Infinity;
-    let moving = false;
-    for (const m of W.movers) {
-      const z = zebraAhead(m, p.zebra);
-      if (!z) continue;
-      const f = front(m);
-      if (f > z.s0 - 0.2 && rear(m) < z.s1 + 0.2) return false; // kendaraan di atas zebra
-      if (f >= z.s0) continue;
-      const d = z.s0 - f;
-      const v = m.speed;
-      if (p.sudden) {
-        const phys = 0.25 * v + (v * v) / (2 * params(m).aMax) + 1.2;
-        if (d < phys) return false;
-        if (v > 0.5 && d < 40) {
-          moving = true;
-          tightest = Math.min(tightest, d - phys);
-        }
-      } else if (!(v < 0.4 || d > (v * v) / 2 + 1.5 * v + 4)) return false;
-    }
-    if (p.sudden) {
-      // pejalan kaki dari tombol menunggu shuttle mendekat, lalu melangkah pada saat terakhir yang
-      // masih aman secara fisik (shuttle masih bisa berhenti dengan rem penuh)
-      const z = p.forShuttle && p.t < 25 ? zebraAhead(sh, p.zebra) : null;
-      if (z && front(sh) < z.s0 && z.s0 - front(sh) < 70) {
-        const v = sh.speed;
-        const phys = 0.25 * v + (v * v) / (2 * params(sh).aMax) + 1.2;
-        return v > 0.5 && z.s0 - front(sh) - phys < 0.5;
-      }
-      return moving ? tightest < 0.5 : p.t > 1.2;
-    }
-    return true;
-  }
-
-  function spawnPed(Z, sudden) {
-    const side = rng.chance(0.5) ? 1 : -1;
-    const p = {
-      id: `pejalan-${++W.pedSeq}`,
-      kind: 'pedestrian',
-      label: 'Pejalan kaki',
-      radius: 0.35,
-      zebra: Z,
-      dir: side,
-      off: -side * Z.curb,
-      off1: side * Z.curb,
-      along: rng.range(-0.8, 0.8),
-      state: 'wait',
-      sudden,
-      alpha: 0,
-      phase: 0,
-      speed: 0,
-      t: 0,
-      x: 0,
-      y: 0,
-      heading: 0,
-      vx: 0,
-      vy: 0,
-      leave: 1,
-    };
-    placePed(p);
-    W.peds.push(p);
-    return p;
-  }
-
-  function placePed(p) {
-    const Z = p.zebra;
-    p.x = Z.x + Z.u.x * p.off + Z.v.x * p.along;
-    p.y = Z.y + Z.u.y * p.off + Z.v.y * p.along;
-    if (p.state === 'leave') {
-      p.heading = Math.atan2(Z.v.y * p.leave, Z.v.x * p.leave);
-      p.vx = Z.v.x * p.leave * 1.2;
-      p.vy = Z.v.y * p.leave * 1.2;
-    } else {
-      p.heading = Math.atan2(Z.u.y * p.dir, Z.u.x * p.dir);
-      p.vx = p.state === 'cross' ? Z.u.x * p.dir * p.speed : 0;
-      p.vy = p.state === 'cross' ? Z.u.y * p.dir * p.speed : 0;
-    }
-  }
-
-  function updatePeds(dt) {
-    for (const Z of ZEBRAS) {
-      Z.timer -= dt;
-      if (Z.timer <= 0) {
-        Z.timer = rng.range(16, 34);
-        const here = W.peds.filter((p) => p.zebra === Z && p.state !== 'leave').length;
-        if (here < 2 && W.peds.length < 8) spawnPed(Z, false);
-      }
-    }
-    for (const p of W.peds) {
-      p.t += dt;
-      if (p.state === 'wait') {
-        p.alpha = Math.min(1, p.alpha + dt * 2.5);
-        if (p.t > (p.sudden ? 0.15 : 0.6) && canCross(p)) {
-          p.state = 'cross';
-          p.speed = p.sudden ? 1.6 : 1.3;
-          if (p.sudden) W.events.push({ type: 'ped-step', ped: p });
-        }
-      } else if (p.state === 'cross') {
-        p.off += p.dir * p.speed * dt;
-        p.phase += dt * 7;
-        if ((p.dir > 0 && p.off >= p.off1) || (p.dir < 0 && p.off <= p.off1)) {
-          p.off = p.off1;
-          p.state = 'leave';
-          p.leave = rng.chance(0.5) ? 1 : -1;
-        }
-      } else {
-        p.along += p.leave * 1.2 * dt;
-        p.phase += dt * 6;
-        p.alpha -= dt / 2.5;
-      }
-      placePed(p);
-    }
-    W.peds = W.peds.filter((p) => p.alpha > 0 || p.state !== 'leave');
-  }
-
-  function addPedestrian() {
-    const f = front(sh);
-    const v = sh.speed;
-    const phys = 0.25 * v + (v * v) / (2 * params(sh).aMax) + 1.2;
-    let Z = null;
-    for (const z of sh.route.zebras) {
-      const d = z.s0 - f;
-      if (d > phys + 3 && d < 110) {
-        Z = z.zebra;
-        break;
-      }
-    }
-    const onRoute = !!Z;
-    if (!Z) {
-      let bestD = Infinity;
-      for (const z of ZEBRAS) {
-        const d = Math.hypot(z.x - sh.x, z.y - sh.y);
-        if (d < bestD && d > 12) {
-          bestD = d;
-          Z = z;
-        }
-      }
-    }
-    if (W.peds.filter((p) => p.zebra === Z && p.state !== 'leave').length >= 3) return { ok: false, msg: 'Zebra cross itu sedang ramai. Coba lagi beberapa detik lagi.' };
-    const p = spawnPed(Z, true);
-    p.forShuttle = onRoute;
-    return { ok: true, zebra: Z, onRoute };
   }
 
   // ---------- penumpang ----------
@@ -812,20 +330,20 @@ export function createWorld() {
   }
 
   function servable(i) {
-    return W.active[i] && !W.closed.has(HALTE[i].link.road.id);
+    return W.active[i] && !H[i].link.closed;
   }
 
   function spawnPax() {
-    const origins = HALTE.map((h, i) => i).filter((i) => servable(i) && W.queues[i].length < 8);
+    const origins = H.map((h, i) => i).filter((i) => servable(i) && W.queues[i].length < 8);
     if (!origins.length) return;
-    const from = rng.pick(origins);
-    const dests = HALTE.map((h, i) => i).filter((i) => i !== from && servable(i));
+    const from = origins[Math.floor(rng() * origins.length)];
+    const dests = H.map((h, i) => i).filter((i) => i !== from && servable(i));
     if (!dests.length) return;
-    addPax(from, rng.pick(dests));
+    addPax(from, dests[Math.floor(rng() * dests.length)]);
   }
 
   function needStop(i) {
-    return sh.onboard.some((p) => p.to === i) || (W.queues[i].length > 0 && sh.onboard.length < CAPACITY);
+    return W.onboard.some((p) => p.to === i) || (W.queues[i].length > 0 && W.onboard.length < CAPACITY);
   }
 
   function markDone(i) {
@@ -833,18 +351,21 @@ export function createWorld() {
     W.skipped.clear();
   }
 
-  function startDwell(H) {
-    sh.mode = 'dwell';
-    sh.dwell = { halte: H, phase: 'buka', t: 0, door: 0, anim: null, off: 0, on: 0 };
-    markDone(H.index);
-    processHalte(H.index, 'dilayani');
+  function startDwell(h) {
+    W.mode = 'dwell';
+    W.dwell = { halte: h, phase: 'buka', t: 0, door: 0, anim: null, off: 0, on: 0 };
+    sh.holdAtHalte = true;
+    markDone(h.index);
+    processHalte(h.index, 'dilayani');
     // rute ke halte berikutnya langsung disiapkan, jadi tetap terlihat selama pintu terbuka
-    chooseTarget(H.index + 1, { notNow: H.index });
+    chooseTarget(h.index + 1);
+    // shuttle tetap ditahan di halte ini sampai pintu tertutup
+    sh.stopTarget = { link: h.link, s: h.s };
   }
 
   function updateDwell(dt) {
-    const D = sh.dwell;
-    const H = D.halte;
+    const D = W.dwell;
+    const h = D.halte;
     D.t += dt;
     if (D.anim) {
       D.anim.t += dt;
@@ -853,9 +374,9 @@ export function createWorld() {
           W.stats.delivered++;
           D.off++;
         } else {
-          sh.onboard.push(D.anim.pax);
+          W.onboard.push(D.anim.pax);
           D.on++;
-          W.events.push({ type: 'board', halte: H });
+          W.events.push({ type: 'board', halte: h });
         }
         D.anim = null;
       }
@@ -868,17 +389,17 @@ export function createWorld() {
         D.t = 0;
       }
     } else if (D.phase === 'turun') {
-      const k = sh.onboard.findIndex((p) => p.to === H.index);
+      const k = W.onboard.findIndex((p) => p.to === h.index);
       if (k >= 0) {
-        const pax = sh.onboard.splice(k, 1)[0];
+        const pax = W.onboard.splice(k, 1)[0];
         D.anim = { kind: 'turun', pax, t: 0, dur: 0.55 };
       } else {
         D.phase = 'naik';
         D.t = 0;
       }
     } else if (D.phase === 'naik') {
-      const q = W.queues[H.index];
-      if (q.length && sh.onboard.length < CAPACITY) {
+      const q = W.queues[h.index];
+      if (q.length && W.onboard.length < CAPACITY) {
         const pax = q.shift();
         pax.tBoard = W.time;
         W.stats.waitSum += pax.tBoard - pax.t0;
@@ -891,325 +412,358 @@ export function createWorld() {
     } else if (D.phase === 'tutup') {
       D.door = Math.max(0, 1 - D.t / 1.0);
       if (D.t >= 1.0) {
-        sh.mode = 'drive';
-        sh.dwell = null;
-        sh.lastServed = { halte: H, off: D.off, on: D.on, time: W.time };
-        if (sh.target != null) sh.stopDecision = null;
-        chooseTarget(sh.target ?? H.index + 1, { notNow: H.index });
+        W.mode = 'drive';
+        W.dwell = null;
+        sh.holdAtHalte = false;
+        sh.stopTarget = null;
+        W.stopDecision = null;
+        // rencana diperbarui (jalan bisa saja ditutup atau dibuka selama pintu terbuka)
+        commitPath();
+        chooseTarget(W.target ?? h.index + 1);
       }
     }
   }
 
   function updateHalteDecision() {
-    if (sh.target == null || sh.mode !== 'drive') return;
-    const H = HALTE[sh.target];
-    const sS = stopSOnRoute(H);
-    if (sS == null) return;
-    const d = sS - front(sh);
-    const lock = (sh.speed * sh.speed) / (2 * 0.9) + 12;
-    if (d > lock) sh.stopDecision = needStop(H.index) ? 'stop' : 'pass';
-    else if (sh.stopDecision == null) {
-      // keputusan pertama saat sudah dekat: berhenti hanya bila masih bisa mengerem dengan nyaman
-      const comfy = d > (sh.speed * sh.speed) / (2 * 1.2) + 1;
-      sh.stopDecision = comfy && needStop(H.index) ? 'stop' : 'pass';
+    if (W.target == null || W.mode !== 'drive') return;
+    const h = H[W.target];
+    const d = distToHalte(h);
+    if (d == null) return;
+    const lock = (sh.v * sh.v) / (2 * 0.9) + 12;
+    if (d > lock) W.stopDecision = needStop(h.index) ? 'stop' : 'pass';
+    else if (W.stopDecision == null) {
+      const comfy = d > (sh.v * sh.v) / (2 * 1.2) + 1;
+      W.stopDecision = comfy && needStop(h.index) ? 'stop' : 'pass';
     }
-    if (d <= lock && sh.stopDecision === 'pass') {
-      sh.lastPassed = { halte: H, time: W.time };
-      markDone(H.index);
-      processHalte(H.index, 'dilewati');
-      chooseTarget(H.index + 1, { notNow: H.index });
+    sh.stopTarget = W.stopDecision === 'stop' ? { link: h.link, s: h.s } : null;
+    if (d <= lock && W.stopDecision === 'pass') {
+      markDone(h.index);
+      processHalte(h.index, 'dilewati');
+      chooseTarget(h.index + 1);
       return;
     }
-    if (sh.stopDecision === 'stop' && d < 0.7 && d > -1.5 && sh.speed < 0.2) startDwell(H);
-    else if (d <= -1.5) {
-      // terlewat (seharusnya tidak terjadi): anggap dilewati dan lanjut ke halte berikutnya
-      markDone(H.index);
-      processHalte(H.index, 'dilewati');
-      chooseTarget(H.index + 1, { notNow: H.index });
+    if (W.stopDecision === 'stop' && sh.link === h.link && Math.abs(sh.s - h.s) < 0.7 && sh.v < 0.05) startDwell(h);
+    else if (d < -2) {
+      markDone(h.index);
+      processHalte(h.index, 'dilewati');
+      chooseTarget(h.index + 1);
     }
   }
 
-  // ---------- gerak ----------
+  // ---------- pemantau ----------
 
-  function stepShuttle(dt) {
-    const P = params(sh);
-    sh.maxBrake = P.aMax;
-    let a;
-    if (sh.mode === 'dwell') {
-      updateDwell(dt);
-      a = -P.b;
-      sh.dec = { code: 'dwell', info: { halte: sh.dwell ? sh.dwell.halte : null }, a: 0 };
-    } else {
-      updateHalteDecision();
-      a = control(sh);
-    }
-    const pp = purePursuit(sh, sh.route.path, { lookahead: 2.5, gain: 0.55, hintS: sh.s - sh.wheelbase / 2 });
-    sh.pp = pp;
-    const f0 = front(sh);
-    sh.step(dt, { accel: a, steer: pp.steer });
-    sh.cmdAccel = a;
-    sh.s = sh.route.path.closest(sh.x, sh.y, sh.s, 12).s;
-    // pengereman darurat (tepi naik)
-    const emergency = a < -EMERGENCY_DECEL && sh.speed > 0.3;
-    if (emergency && !sh.emergency) {
-      W.stats.emergencies++;
-      W.events.push({ type: 'emergency', dec: sh.dec });
-      sh.emergencyAt = W.time;
-    }
-    sh.emergency = emergency;
-    // pelanggaran lampu merah: bemper depan melewati garis henti saat merah
-    const f1 = front(sh);
-    for (const seg of sh.route.segs) {
-      const light = seg.link.light;
-      if (!light || !seg.move) continue;
-      const line = seg.s1 - 0.4;
-      if (f0 < line && f1 >= line && light.state === 'red') {
-        W.stats.violations++;
-        W.events.push({ type: 'violation', light });
-      }
-    }
+  const prevFront = new Map();
+
+  function recordFronts() {
+    prevFront.clear();
+    for (const v of traffic.all) prevFront.set(v, v.frontPoint());
   }
 
-  function stepCar(c, dt) {
-    // mobil pelan di depan shuttle (langkah hujan): merayap bila shuttle tertinggal jauh
-    if (c.leader) c.cruiseF = Math.hypot(c.x - sh.x, c.y - sh.y) > 30 ? 0.35 : 0.6;
-    const a = control(c);
-    c.accel = a;
-    c.speed = Math.max(0, c.speed + a * dt);
-    c.braking = a < -0.6 && c.speed > 0.2;
-    c.s += c.speed * dt;
-    syncCarPose(c);
-  }
-
-  function releasePassed(m) {
-    if (!m.res) return;
-    const seg = m.route.segs.find((sg) => sg.move === m.res.move);
-    if (!seg || rear(m) > seg.b1 + 0.3) release(m);
-  }
-
-  function checkCollisions() {
-    const all = [sh, ...W.cars];
-    for (let i = 0; i < all.length; i++) {
-      for (let j = i + 1; j < all.length; j++) {
-        if (Math.abs(all[i].x - all[j].x) > 8 || Math.abs(all[i].y - all[j].y) > 8) continue;
-        if (boxesOverlap(all[i], all[j], -0.05)) {
-          if (!W.inContact) W.collisions++;
-          W.inContact = true;
-          return;
-        }
-      }
-      for (const p of W.peds) {
-        if (p.state !== 'cross') continue;
-        if (distanceToBox(p.x, p.y, all[i]) < p.radius * 0.6) {
-          if (!W.inContact) W.collisions++;
-          W.inContact = true;
-          return;
+  /** Terobos lampu merah: bumper depan memotong garis henti lengan yang sedang merah (geometri). */
+  function checkRedRuns() {
+    for (const v of traffic.all) {
+      const a = prevFront.get(v);
+      if (!a) continue;
+      const b = v.frontPoint();
+      if (a.x === b.x && a.y === b.y) continue;
+      for (const hd of net.heads) {
+        const L = hd.line;
+        const minX = Math.min(L.x0, L.x1) - 1;
+        const maxX = Math.max(L.x0, L.x1) + 1;
+        const minY = Math.min(L.y0, L.y1) - 1;
+        const maxY = Math.max(L.y0, L.y1) + 1;
+        if (Math.max(a.x, b.x) < minX || Math.min(a.x, b.x) > maxX || Math.max(a.y, b.y) < minY || Math.min(a.y, b.y) > maxY) continue;
+        // hanya kendaraan yang bergerak searah lengan (masuk ke persimpangan)
+        if ((b.x - a.x) * Math.cos(L.h) + (b.y - a.y) * Math.sin(L.h) <= 0) continue;
+        // garis henti diperpanjang 0,3 m di kedua ujung
+        const ux = (L.x1 - L.x0) / L.half;
+        const uy = (L.y1 - L.y0) / L.half;
+        const p0 = { x: L.x0 - ux * 0.3, y: L.y0 - uy * 0.3 };
+        const p1 = { x: L.x1 + ux * 0.3, y: L.y1 + uy * 0.3 };
+        if (!segmentIntersection(a, b, p0, p1)) continue;
+        if (hd.ctl.color(hd.arm) === 'red') {
+          monitor.redRuns++;
+          monitor.note({ type: 'lampu-merah', veh: v.id, kind: v.type, where: hd.name });
         }
       }
     }
-    W.inContact = false;
   }
 
-  function updateSensorObjects() {
-    sensorObjects.length = 0;
-    for (const o of staticObjects) sensorObjects.push(o);
-    for (const c of W.cars) sensorObjects.push(c);
-    for (const p of W.peds) sensorObjects.push(p);
-    for (const c of W.cones) sensorObjects.push(c);
-  }
+  // ---------- langkah ----------
 
-  function placeLeaderNow() {
-    const f = front(sh);
-    let targetS = f + 26;
-    // jangan menaruh mobil di dalam kotak persimpangan
-    for (const seg of sh.route.segs) {
-      if (seg.move && targetS > seg.s1 - 2.5 && targetS < seg.b1 + 2.5) targetS = seg.b1 + 2.5;
-    }
-    // jangan pula di atas atau tepat sebelum zebra cross
-    for (const z of sh.route.zebras) {
-      if (targetS > z.s0 - 5 && targetS < z.s1 + 1) targetS = z.s1 + 1.5;
-    }
-    if (targetS > sh.route.path.length - 8) return false;
-    for (const o of W.movers) {
-      if (o === sh) continue;
-      const c = sh.route.path.closest(o.x, o.y, targetS, 20);
-      if (Math.abs(c.lateral) < 3 && Math.abs(c.s - targetS) < 9) return false;
-    }
-    // mobil yang paling jauh dari shuttle dipindahkan ke depan shuttle
-    let car = null;
-    let far = -1;
-    for (const c of W.cars) {
-      const d = Math.hypot(c.x - sh.x, c.y - sh.y);
-      if (d > far) {
-        far = d;
-        car = c;
-      }
-    }
-    if (!car) return false;
-    release(car);
-    // rute mobil = rute shuttle sampai halte berikutnya, lalu terus mengikuti jalan lingkar
-    car.route = buildRoute(sh.route.ids);
-    car.s = targetS + car.length / 2;
-    car.speed = Math.min(sh.speed, kmhToMs(W.limitKmh) * 0.6);
-    car.cruiseF = 0.6;
-    car.leader = true;
-    extendCar(car);
-    syncCarPose(car);
-    W.leaderCar = car;
-    return true;
-  }
-
-  function releaseLeader() {
-    W.pendingLeader = false;
-    const c = W.leaderCar;
-    if (!c) return;
-    c.leader = false;
-    c.cruiseF = c.baseCruiseF;
-    W.leaderCar = null;
-  }
+  let balanceAt = 0;
+  let hiddenFn = null;
 
   function update(dt) {
     W.time += dt;
     W.stats.time = W.time;
-    for (const plan of PLANS) plan.update(W.time);
+    for (const ctl of net.signals) ctl.step(dt);
+    app.focus.x = sh.x;
+    app.focus.y = sh.z;
 
     W.nextPax -= dt;
     if (W.nextPax <= 0) {
       spawnPax();
-      W.nextPax = rng.range(6, 14);
-    }
-    updatePeds(dt);
-
-    if (W.pendingLeader && sh.mode === 'drive' && sh.speed > 1) {
-      if (placeLeaderNow()) W.pendingLeader = false;
+      W.nextPax = 6 + rng() * 8;
     }
 
-    const odo0 = sh.odometer;
-    stepShuttle(dt);
-    W.stats.distance += sh.odometer - odo0;
-    for (const c of W.cars) stepCar(c, dt);
-
-    for (const m of W.movers) {
-      releasePassed(m);
-      shiftRoute(m);
-      if (!m.isShuttle) extendCar(m);
+    if (W.pendingLeader && W.mode === 'drive' && sh.v > 1) placeLeaderNow();
+    if (W.leader) {
+      const Lv = W.leader;
+      if (!Lv.alive) W.leader = null;
+      else {
+        // angkot pelan tetap di depan shuttle: merayap bila shuttle tertinggal jauh
+        const far = Math.hypot(Lv.x - sh.x, Lv.z - sh.z) > 45;
+        Lv.vDesBase = kmhToMs(W.limitKmh) * (far ? 0.3 : 0.55);
+      }
     }
-    checkCollisions();
+
+    traffic.beginTick();
+    peds.step(dt);
+    if (peds.lastTest) W.events.push({ type: 'test-ped', ped: peds.lastTest });
+    J.beginTick();
+    traffic.requestAll();
+    J.process();
+    recordFronts();
+    const odo0 = sh.odo;
+    traffic.stepAll(dt);
+    W.stats.distance += sh.odo - odo0;
+
+    if (W.mode === 'dwell') updateDwell(dt);
+    else updateHalteDecision();
+
+    // pengereman darurat (tepi naik)
+    const emergency = sh.a < -EMERGENCY_DECEL && sh.v > 0.3;
+    if (emergency && !W.emergency) {
+      W.stats.emergencies++;
+      W.emergencyAt = W.time;
+      W.events.push({ type: 'emergency', reason: sh.planReason });
+    }
+    W.emergency = emergency;
+
+    checkRedRuns();
+    inv.checkContacts(traffic.all, peds.grid);
+    const fresh = traffic.checkOverlaps();
+    if (fresh) monitor.otherCollisions += fresh;
+
+    if (W.time >= balanceAt) {
+      balanceAt = W.time + 0.5;
+      traffic.balance(hiddenFn);
+      peds.balance();
+      traffic.watchdog();
+    }
+    traffic.updateFades(dt);
+  }
+
+  // ---------- sensor (untuk tampilan dan panel, tidak dipakai keputusan) ----------
+
+  function updateSensorObjects() {
+    sensorObjects.length = 0;
+    const r = LIDAR_RANGE + 12;
+    for (const b of net.map.buildingsNear(sh.x, sh.z, r)) sensorObjects.push(b);
+    for (const s of shelters) if (Math.hypot(s.x - sh.x, s.y - sh.z) < r) sensorObjects.push(s);
+    for (const c of traffic.cars) if (Math.hypot(c.x - sh.x, c.z - sh.z) < r && c.alpha > 0.3) sensorObjects.push(c);
+    for (const p of peds.peds) if (Math.hypot(p.x - sh.x, p.z - sh.z) < r && p.alpha > 0.3) sensorObjects.push(p);
+    for (const hd of net.heads) {
+      hd.light.state = hd.ctl.color(hd.arm);
+      if (Math.hypot(hd.light.x - sh.x, hd.light.y - sh.z) < 80) sensorObjects.push(hd.light);
+    }
+  }
+
+  /** Pindai sensor. lapse = percepatan waktu: pindaian tetap sekitar 10 kali per detik waktu nyata. */
+  function scanSensors(dt, lapse = 1) {
+    lidar.rate = 10 / Math.max(1, lapse);
+    kamera.rate = 6 / Math.max(1, lapse);
     updateSensorObjects();
     rig.update(dt, sensorObjects, W.weather);
   }
 
   // ---------- aksi dari panel ----------
 
-  function rebuildCones() {
-    W.cones = [];
-    for (const id of W.closed) {
-      for (const L of ROADS[id].links) {
-        const p = L.lane.sample(0.9);
-        const lx = Math.sin(p.heading);
-        const ly = -Math.cos(p.heading);
-        for (const k of [-1.25, 0, 1.25]) W.cones.push({ id: `kerucut-${L.id}-${k}`, kind: 'cone', label: 'Kerucut', x: p.x + lx * k, y: p.y + ly * k, radius: 0.3 });
+  function placeLeaderNow() {
+    // cari tempat di lajur lurus 25 sampai 45 m di depan bumper shuttle
+    const front = sh.s + sh.len / 2;
+    let base = sh.link.len - front;
+    for (let i = 0; i < sh.path.length; i++) {
+      const l = sh.path[i];
+      if (l.kind === 'lane' && l.ring === null && !l.sig) {
+        for (let want = 25; want <= 45; want += 5) {
+          const s = want - base;
+          if (s < 4 || s > l.len - 8) continue;
+          if (!traffic.spawnFree(l, s, 4.15, 6)) continue;
+          const a = traffic.makeNpc('angkot');
+          a.leader = true;
+          a.alpha = 0;
+          a.fade = 1;
+          a.route = [...sh.path.slice(i + 1), ...sh.route];
+          traffic.addAt(a, l, s, Math.min(sh.v, 4));
+          W.leader = a;
+          W.pendingLeader = false;
+          return true;
+        }
       }
+      base += l.len;
+      if (base > 60) break;
     }
+    return false;
   }
 
-  function fixCarRoutes() {
-    for (const c of W.cars) {
-      const comm = committedIds(c);
-      const rest = c.route.ids.slice(comm.length);
-      if (rest.some((id) => !isOpen(id))) {
-        setRoute(c, comm);
-        extendCar(c);
-      }
+  function releaseLeader() {
+    W.pendingLeader = false;
+    if (W.leader) {
+      W.leader.leader = false;
+      W.leader.vDesBase = W.leader.dyn.vDes[0];
     }
+    W.leader = null;
   }
 
-  function onShuttleRoad(roadId) {
-    return LINKS[sh.route.ids[locate(sh)]].road.id === roadId;
+  /** Jalan-jalan di rute shuttle yang belum pasti dilewati (setelah bagian yang sudah pasti). */
+  function roadsAhead() {
+    const aB = brakeLimit(sh, MU[W.weather]);
+    const reach = stopDistance(sh.v, aB) + 8;
+    const all = [...sh.path, ...sh.route];
+    let lastGrant = -1;
+    for (let i = 0; i < all.length; i++) if (all[i].kind === 'conn' && J.hasGrant(sh, all[i])) lastGrant = i;
+    let base = sh.link.len - (sh.s + sh.len / 2);
+    const out = [];
+    for (let i = 0; i < all.length; i++) {
+      const l = all[i];
+      if (base > reach && i > lastGrant + 1 && l.kind === 'lane' && l.roadId >= 0 && l !== sh.link) {
+        const R = net.roadById.get(l.roadId);
+        if (R && !out.includes(R)) out.push(R);
+      }
+      base += l.len;
+    }
+    return out;
+  }
+
+  /** Apakah putaran masih bisa dijalankan setelah penutupan? */
+  function loopFeasible() {
+    const act = H.map((h, i) => i).filter((i) => W.active[i] && !H[i].link.closed);
+    if (act.length < 2) return false;
+    for (let k = 0; k < act.length; k++) {
+      const a = H[act[k]];
+      const b = H[act[(k + 1) % act.length]];
+      if (!net.route(a.link, a.s, b)) return false;
+    }
+    return true;
+  }
+
+  /** Kendaraan lain yang rencananya melewati jalan yang ditutup memilih belokan lain (bila belum terlanjur). */
+  function fixCarPaths() {
+    for (const c of traffic.cars) {
+      const f = c.path.findIndex((l) => l.closed || (l.kind === 'conn' && l.to.closed));
+      if (f < 0) continue;
+      let lastGrant = -1;
+      for (let i = 0; i < c.path.length; i++) if (c.path[i].kind === 'conn' && J.hasGrant(c, c.path[i])) lastGrant = i;
+      let keep = f;
+      if (lastGrant >= 0) keep = Math.max(keep, lastGrant + 2);
+      if (c.link.kind === 'conn') keep = Math.max(keep, 1);
+      keep = Math.min(keep, c.path.length);
+      if (keep < c.path.length) {
+        c.path.length = keep;
+        c.pathLen = c.path.reduce((a, l) => a + l.len, 0);
+        c.route = null;
+        traffic.extendPath(c);
+      }
+    }
   }
 
   function toggleRoad(roadId) {
-    const R = ROADS[roadId];
-    if (W.closed.has(roadId)) {
-      W.closed.delete(roadId);
-      rebuildCones();
-      fixCarRoutes();
-      chooseTarget(sh.target ?? 0);
+    const R = net.roadById.get(roadId);
+    if (!R) return { ok: false, msg: 'Jalan tidak dikenal.' };
+    if (net.closed.has(roadId)) {
+      net.setClosed(roadId, false);
+      fixCarPaths();
+      commitPath();
+      chooseTarget(W.target ?? 0);
       const back = reconsiderSkipped();
-      return { ok: true, closed: false, back, msg: `${R.name} dibuka lagi.${back != null ? ` Shuttle kembali melayani halte ${HALTE[back].name}.` : ''}` };
+      return { ok: true, closed: false, road: R, back };
     }
-    if (W.closed.size >= MAX_CLOSED) return { ok: false, msg: `Paling banyak ${MAX_CLOSED} ruas bisa ditutup sekaligus. Buka salah satu dulu.` };
-    const test = new Set(W.closed);
-    test.add(roadId);
-    for (const n of NODE_LIST) {
-      if (openDegree(n, test) < 2) return { ok: false, msg: `${R.name} tidak bisa ditutup karena ${n.name} akan menjadi jalan buntu. Kendaraan di sini tidak bisa putar balik.` };
-    }
-    for (const m of W.movers) {
-      if (m.res && m.res.move.out.road === R && linkPos(m).link.road !== R) return { ok: false, msg: 'Ada kendaraan yang sedang masuk ke ruas ini. Coba lagi beberapa detik lagi.' };
-    }
-    const comm = committedIds(sh);
-    const ahead = sh.route.ids.slice(comm.length);
-    const onRoute = ahead.some((id) => LINKS[id].road === R);
-    const onCommitted = comm.some((id) => LINKS[id].road === R);
+    if (net.closed.size >= MAX_CLOSED) return { ok: false, msg: `Paling banyak ${MAX_CLOSED} jalan bisa ditutup sekaligus. Buka salah satu dulu.` };
+    const onRoute = [sh.link, ...sh.path, ...sh.route].some((l) => l.roadId === roadId);
     const oldPts = routePoints();
-    W.closed.add(roadId);
-    rebuildCones();
-    fixCarRoutes();
-    const prevTarget = sh.target;
-    const res = chooseTarget(sh.target ?? 0);
-    const rerouted = onRoute && res.changed;
+    const beforeIds = [...sh.path, ...sh.route].map((l) => l.id).join(',');
+    const saved = { path: sh.path.slice(), pathLen: sh.pathLen, route: sh.route.slice() };
+    net.setClosed(roadId, true);
+    // shuttle harus tetap punya jalan: putaran halte masih bisa dijalankan dan ada halte yang terjangkau
+    let ok = loopFeasible();
+    if (ok && W.mode === 'drive') {
+      commitPath();
+      ok = H.some((h, i) => isNeeded(i) && !h.link.closed && planFromPathEnd(h));
+    }
+    if (!ok) {
+      net.setClosed(roadId, false);
+      sh.path = saved.path;
+      sh.pathLen = saved.pathLen;
+      sh.route = saved.route;
+      return { ok: false, msg: `${R.name || 'Jalan ini'} tidak bisa ditutup. Shuttle tidak punya jalan lain untuk menyelesaikan putarannya (shuttle tidak putar balik).` };
+    }
+    fixCarPaths();
+    const prevTarget = W.target;
+    let res = { ok: true, target: W.target };
+    if (W.mode === 'drive') res = chooseTarget(W.target ?? 0);
+    const changed = beforeIds !== [...sh.path, ...sh.route].map((l) => l.id).join(',');
+    const rerouted = onRoute && changed;
     if (rerouted) {
       W.oldRoute = { pts: oldPts, time: W.time };
-      W.events.push({ type: 'reroute', road: R, target: sh.target, prevTarget, expanded: W.lastSearch?.expanded ?? 0 });
+      W.events.push({ type: 'reroute', road: R, target: W.target, prevTarget, expanded: W.lastSearch?.expanded ?? 0 });
     }
-    return { ok: true, closed: true, road: R, onRoute, onCommitted: onCommitted && onShuttleRoad(roadId), rerouted, target: sh.target, prevTarget };
+    return { ok: true, closed: true, road: R, onRoute, rerouted, target: res.target ?? W.target, prevTarget };
   }
 
-  /** Tutup ruas pertama di rute shuttle yang boleh ditutup. */
+  /** Tutup jalan pertama di rute shuttle yang boleh ditutup. */
   function closeAhead() {
-    if (W.closed.size >= MAX_CLOSED) return { ok: false, msg: `Paling banyak ${MAX_CLOSED} ruas bisa ditutup sekaligus. Buka salah satu dulu.` };
-    const comm = committedIds(sh);
-    const ahead = [...new Set(sh.route.ids.slice(comm.length).map((id) => LINKS[id].road))].filter((R) => !W.closed.has(R.id));
-    // utamakan ruas yang bukan ruas halte tujuan, supaya shuttle benar-benar mencari jalan memutar
-    const goalRoad = sh.target != null ? HALTE[sh.target].link.road : null;
-    ahead.sort((a, b) => (a === goalRoad) - (b === goalRoad));
+    if (net.closed.size >= MAX_CLOSED) return { ok: false, msg: `Paling banyak ${MAX_CLOSED} jalan bisa ditutup sekaligus. Buka salah satu dulu.` };
+    const goalRoad = W.target != null ? H[W.target].link.roadId : -1;
+    const ahead = roadsAhead().filter((R) => !net.closed.has(R.id));
+    ahead.sort((a, b) => (a.id === goalRoad) - (b.id === goalRoad));
     let lastMsg = null;
     for (const R of ahead) {
       const r = toggleRoad(R.id);
       if (r.ok) return r;
       lastMsg = r.msg;
     }
-    return { ok: false, msg: lastMsg || 'Belum ada ruas di depan shuttle yang bisa ditutup. Tunggu sampai rute berikutnya melewati persimpangan.' };
+    return { ok: false, msg: lastMsg || 'Belum ada jalan di depan shuttle yang bisa ditutup. Tunggu sebentar lalu coba lagi.' };
   }
 
   function openAll() {
-    if (!W.closed.size) return { ok: false, back: null };
-    W.closed.clear();
-    rebuildCones();
-    fixCarRoutes();
-    chooseTarget(sh.target ?? 0);
+    if (!net.closed.size) return { ok: false, back: null };
+    for (const id of [...net.closed]) net.setClosed(id, false);
+    fixCarPaths();
+    commitPath();
+    chooseTarget(W.target ?? 0);
     return { ok: true, back: reconsiderSkipped() };
   }
 
   function setActive(i, on) {
     if (!on && W.active.filter(Boolean).length <= 2) return { ok: false, msg: 'Minimal dua halte harus tetap dilayani.' };
     W.active[i] = on;
+    if (!on && !loopFeasible()) {
+      W.active[i] = true;
+      return { ok: false, msg: 'Halte ini masih dibutuhkan karena ada jalan yang ditutup. Buka jalannya dulu.' };
+    }
     let left = 0;
     if (!on) {
       left = W.queues[i].length;
       W.queues[i].length = 0;
-      // penumpang yang menunggu di halte lain dengan tujuan halte ini membatalkan perjalanan
       for (const q of W.queues) {
         const n = q.length;
         for (let k = q.length - 1; k >= 0; k--) if (q[k].to === i) q.splice(k, 1);
         left += n - q.length;
       }
     }
-    if (sh.target != null) {
-      const sS = stopSOnRoute(HALTE[sh.target]);
-      const locked = sh.mode === 'drive' && sS != null && sS - front(sh) <= (sh.speed * sh.speed) / (2 * 0.9) + 12;
-      if (!locked && !isNeeded(sh.target)) chooseTarget(sh.target + 1);
-    } else chooseTarget(i);
+    if (W.target != null) {
+      const d = distToHalte(H[W.target]);
+      const locked = W.mode === 'drive' && d != null && d <= (sh.v * sh.v) / (2 * 0.9) + 12;
+      if (!locked && !isNeeded(W.target) && W.mode === 'drive') {
+        commitPath();
+        chooseTarget(W.target + 1);
+      }
+    } else if (W.mode === 'drive') {
+      commitPath();
+      chooseTarget(i);
+    }
     return { ok: true, left };
   }
 
@@ -1222,86 +776,96 @@ export function createWorld() {
   }
 
   function resetLoop() {
-    W.loop = { start: null, count: 0, viol0: W.stats.violations, t0: W.time };
+    W.loop = { start: null, count: 0, red0: monitor.redRuns, ped0: monitor.pedContacts, t0: W.time };
   }
 
   function placeLeader() {
     W.pendingLeader = true;
   }
 
-  /** Pastikan ada penumpang yang menunggu di halte i (untuk preset langkah pertama). */
+  /** Pastikan ada penumpang yang menunggu di halte i (preset langkah pertama). */
   function seedPassengers(i, n = 2) {
     if (!servable(i)) return;
-    const dests = HALTE.map((h, k) => k).filter((k) => k !== i && servable(k));
+    const dests = H.map((h, k) => k).filter((k) => k !== i && servable(k));
     for (let k = W.queues[i].length; k < n && dests.length; k++) addPax(i, dests[(k + i) % dests.length]);
   }
 
-  function routePoints() {
-    const path = sh.route.path;
-    const f = front(sh);
-    const end = W.stopS() ?? path.length;
-    const pts = [path.sample(f)];
-    for (let i = indexAt(path, f) + 1; i < path.points.length && path.cum[i] < end; i++) pts.push(path.points[i]);
-    if (end > f) pts.push(path.sample(end));
-    return pts.map((p) => ({ x: p.x, y: p.y }));
+  function requestTestPed() {
+    return peds.requestTest(sh);
   }
 
   // ---------- ulang ----------
+
   function reset() {
+    rand = mulberry32(seed);
     W.time = 0;
-    W.stats = { delivered: 0, distance: 0, time: 0, waitSum: 0, waitN: 0, violations: 0, emergencies: 0, loops: 0 };
+    W.stats = { delivered: 0, distance: 0, time: 0, waitSum: 0, waitN: 0, emergencies: 0, loops: 0 };
     W.events.length = 0;
-    W.peds = [];
-    W.queues = HALTE.map(() => []);
+    W.queues = H.map(() => []);
     W.unreachable.clear();
     W.skipped.clear();
     W.lastDone = null;
     W.oldRoute = null;
     W.pendingLeader = false;
-    W.leaderCar = null;
-    W.collisions = 0;
-    W.inContact = false;
+    W.leader = null;
     W.nextPax = 5;
     W.paxSeq = 0;
-    rng.reseed(20250901);
-    for (const n of NODE_LIST) n.res.clear();
-    ZEBRAS.forEach((Z, i) => (Z.timer = 6 + i * 7));
+    W.mode = 'drive';
+    W.dwell = null;
+    W.onboard = [];
+    W.target = null;
+    W.stopDecision = null;
+    W.emergency = false;
+    W.emergencyAt = -10;
+    W.shieldAt = -10;
+    W.shieldWhat = null;
+    balanceAt = 0;
+    monitor.reset();
+    for (const ctl of net.signals) ctl.reset();
+    // semua kendaraan dan pejalan kaki dibuang
+    for (const v of traffic.all.slice()) traffic.removeVeh(v);
+    traffic.stats.clamps = traffic.stats.followClamps = traffic.stats.lineClamps = 0;
+    traffic.stats.recovered = traffic.stats.overlaps = 0;
+    traffic.overlapPairs.clear();
+    peds.clear();
+    for (const l of city.links) {
+      l.occN = 0;
+      l.pedN = 0;
+      if (l.holders) l.holders.length = 0;
+      if (l.approach) l.approach.length = 0;
+    }
     for (const [from, to] of INITIAL_PAX) if (servable(from) && servable(to)) addPax(from, to, 0);
-    for (const plan of PLANS) plan.update(0);
     resetLoop();
 
-    // shuttle di Jl. Rektorat, menuju halte pertama (Gerbang Utama)
-    const L = LINKS[SHUTTLE_START.link];
-    const s0 = L.lane.closest(SHUTTLE_START.x, SHUTTLE_START.y).s;
-    const p = L.lane.sample(s0);
-    sh.setPose(p.x, p.y, p.heading);
-    sh.odometer = 0;
-    sh.onboard = [];
-    sh.mode = 'drive';
-    sh.dwell = null;
-    sh.res = null;
-    sh.yellow = new Map();
-    sh.target = null;
-    sh.stopDecision = null;
-    sh.emergency = false;
-    sh.emergencyAt = -10;
-    sh.lastServed = null;
-    sh.lastPassed = null;
-    sh.cmdAccel = 0;
-    sh.dec = { code: 'melaju' };
-    sh.route = buildRoute([L.id]);
-    sh.s = s0;
+    // shuttle di lajur halte Gerbang Ma Chung, menuju halte itu
+    const h0 = H[0];
+    sh.alive = true;
+    sh.grants.length = 0;
+    sh.reqConn = null;
+    sh.rbExit = null;
+    sh.rbExitPending = null;
+    sh.holdAtHalte = false;
+    sh.stopTarget = null;
+    sh.sigKey = 0;
+    sh.sigArmCtl = null;
+    sh.sigDecision = '';
+    sh.stuckT = 0;
+    sh.shieldOn = false;
+    sh.odo = 0;
+    sh.route = [];
+    sh.place(h0.link, Math.max(sh.len / 2 + 1, h0.s - START_BEFORE_HALTE), 0);
+    traffic.all.push(sh);
+    app.focus.x = sh.x;
+    app.focus.y = sh.z;
     chooseTarget(0);
-
-    W.cars = CAR_STARTS.map((spec, i) => {
-      const c = makeCar(spec, i);
-      c.route = buildRoute([spec.link]);
-      c.s = spec.at;
-      extendCar(c);
-      syncCarPose(c);
-      return c;
-    });
-    W.movers = [sh, ...W.cars];
+    traffic.extendPath(sh);
+    // lalu lintas dan pejalan kaki awal di sekitar shuttle (langsung terlihat, tanpa memudar)
+    traffic.beginTick();
+    peds.register();
+    for (let i = 0; i < traffic.target * 3 && traffic.cars.length < traffic.target; i++) traffic.spawnNear(25, traffic.radius - 20, null, false);
+    for (let i = 0; i < peds.target * 3 && peds.peds.length < peds.target; i++) peds.spawnNear(10, peds.radius, false);
+    traffic.beginTick();
+    peds.register();
     rig.clear();
     updateSensorObjects();
     rig.scanNow(sensorObjects, W.weather);
@@ -1312,26 +876,36 @@ export function createWorld() {
   return {
     W,
     sh,
+    net,
+    traffic,
+    peds,
     rig,
+    lidar,
+    kamera,
+    monitor,
+    app,
     reset,
     update,
-    params,
+    scanSensors,
     toggleRoad,
     closeAhead,
     openAll,
     setActive,
     setWeather,
     setLimit,
-    addPedestrian,
     placeLeader,
     releaseLeader,
     seedPassengers,
     resetLoop,
+    requestTestPed,
     routePoints,
-    committedIds: () => committedIds(sh),
-    locate: (m) => locate(m),
-    front,
-    sensorObjects,
+    distToHalte,
     isNeeded,
+    setHidden(fn) {
+      hiddenFn = fn;
+    },
+    get sensorObjects() {
+      return sensorObjects;
+    },
   };
 }

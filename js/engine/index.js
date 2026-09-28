@@ -15,4 +15,5 @@ export * from './sensors.js';
 export * from './planning.js';
 export * from './control.js';
 export * from './icons.js';
+export * from './osm2d.js';
 export * as ui from './ui.js';

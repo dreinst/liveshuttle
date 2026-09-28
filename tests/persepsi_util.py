@@ -1,4 +1,4 @@
-"""Alat bantu uji untuk pelajaran Persepsi (port 8113)."""
+"""Alat bantu uji untuk pelajaran Persepsi (port 8243, server: python3 tests/serve.py 8243)."""
 import json
 import sys
 
@@ -6,8 +6,9 @@ from playwright.sync_api import sync_playwright
 
 CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-arm64/"
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
-BASE = "http://127.0.0.1:8113/"
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/persepsi/"
+PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8243"
+BASE = f"http://127.0.0.1:{PORT}/"
+SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/persepsi-malang/"
 
 
 class Session:

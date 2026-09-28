@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <title>Uji situs: aktor Malang dari dekat</title>
+    <link rel="icon" href="../favicon.svg" />
+    <link rel="stylesheet" href="../css/style.css" />
+    <style>body { margin: 0; background: #0b1220; } .c { position: relative; width: 900px; height: 420px; margin: 8px; }</style>
+  </head>
+  <body>
+    <div class="c" id="a"></div>
+    <div class="c" id="b"></div>
+    <script type="module">
+      import { View } from '../js/engine/canvas.js';
+      import { COLORS } from '../js/engine/theme.js';
+      import * as D from '../js/engine/draw.js';
+      import { makeRoad } from '../js/engine/road.js';
+      // dekat: 60 px/m
+      {
+        const v = new View(document.getElementById('a'), { bounds: { minX: -7.5, minY: -3.5, maxX: 7.5, maxY: 3.5 }, padding: 0 });
+        const g = v.begin(COLORS.asphalt);
+        ['default', 'hijab', 'backpack', 'umbrella'].forEach((variant, i) => D.drawPedestrian(g, { x: -6 + i * 1.6, y: -2.2, heading: -Math.PI / 2 }, { view: v, variant, accent: variant === 'hijab' ? COLORS.hijab[1] : undefined }));
+        D.drawMotor(g, { x: 1, y: -2.2, heading: 0 }, { view: v, helmet: COLORS.helmets[2] });
+        D.drawMotor(g, { x: 4.5, y: -2.2, heading: 0, passenger: true }, { view: v });
+        D.drawAngkot(g, { x: -3.5, y: 1.5, heading: 0, code: 'ADL' }, { view: v });
+        D.drawCityCar(g, { x: 1.5, y: 1.5, heading: 0, color: '#94a3b8' }, { view: v });
+        D.drawHalteSign(g, { x: 5.5, y: 2.2, label: 'Halte' }, { view: v });
+      }
+      // skala pelajaran: 12 px/m, jalan dua lajur, lampu gaya 3D di trotoar kiri
+      {
+        const v = new View(document.getElementById('b'), { bounds: { minX: -36, minY: -17, maxX: 36, maxY: 17 }, padding: 0 });
+        const g = v.begin();
+        const road = makeRoad({ points: [{ x: -40, y: 0 }, { x: 40, y: 0 }], sidewalk: 2 });
+        D.drawRoad(g, road);
+        // lalu lintas ke timur di lajur kiri (y negatif), lampu menghadap ke barat (datangnya kendaraan)
+        D.drawTrafficSignal(g, { x: 10, y: -3.5 - 0.7, heading: Math.PI, state: 'red' }, { view: v, simulated: true });
+        D.drawTrafficSignal(g, { x: -10, y: 3.5 + 0.7, heading: 0, state: 'green' }, { view: v });
+        D.drawAngkot(g, { x: -4, y: -1.75, heading: 0, code: 'AL' }, { view: v, minPx: 0 });
+        D.drawMotor(g, { x: -12, y: -2.4, heading: 0, passenger: true }, { view: v });
+        D.drawMotor(g, { x: 3, y: 2.3, heading: Math.PI }, { view: v });
+        D.drawMPV(g, { x: 18, y: 1.75, heading: Math.PI, color: '#e2e8f0' }, { view: v });
+        D.drawPedestrian(g, { x: 0, y: -6, heading: 0 }, { view: v, variant: 'hijab' });
+        D.drawPedestrian(g, { x: 3, y: 6, heading: Math.PI }, { view: v, variant: 'umbrella' });
+        D.drawPedestrian(g, { x: -20, y: 6, heading: 0 }, { view: v, variant: 'backpack' });
+        D.drawHalteSign(g, { x: -24, y: -5, label: 'Halte Ma Chung' }, { view: v });
+        D.drawScaleBar(g, v);
+      }
+      window.__done = true;
+    </script>
+  </body>
+</html>

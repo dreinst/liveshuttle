@@ -1,6 +1,8 @@
 """Uji model pelajaran Level Otomasi tanpa UI (penguji independen).
 
 Modul scene.js diimpor di halaman lalu dijalankan langkah demi langkah dengan dt 1/60 detik.
+Disesuaikan dengan versi perjalanan Ma Chung: level 4 hanya aktif di dalam kawasan (trip < batas),
+batas kecepatan 40 km/jam di kota dan 30 km/jam di kawasan.
 Pemakaian: python3 tests/level-otomasi_indep_model.py [--port 8131]
 """
 import json
@@ -63,7 +65,7 @@ async () => {
   // ---------- L5 melewati batas, L4 dan L5 melewati zona ----------
   for (const [name, p] of [
     ['l5boundary', { level: 5, egoAt: 650, speed: M.V_SET, lead: null, boundary: 200 }],
-    ['l4zone', { level: 4, egoAt: 650, speed: M.V_SET, lead: null, zone: 300 }],
+    ['l4zone', { level: 4, egoAt: 650, trip: 100, speed: M.V_KAWASAN, lead: null, zone: 300 }],
     ['l5zone', { level: 5, egoAt: 200, speed: M.V_SET, lead: null, zone: 250 }],
   ]) {
     const sc = mk(); const st = sc.st;

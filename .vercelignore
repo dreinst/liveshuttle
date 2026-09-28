@@ -1,0 +1,8 @@
+# Berkas pengembangan yang tidak ikut dideploy ke Vercel.
+# js/data/ dan js/sim3d/data/ tetap dideploy (dipakai situs).
+/docs/
+/tests/
+/data/
+/tools/
+*.py
+__pycache__/

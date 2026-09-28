@@ -1,5 +1,5 @@
 """Uji lama pelajaran Level Otomasi: rebase dunia setelah perjalanan jauh, level 4 ke level 5 dari
-bahu jalan, level 2 di tikungan, dan laju frame.
+tepi kiri jalan, level 2 di tikungan, dan laju frame.
 
 Pemakaian: python3 tests/level-otomasi_soak.py [--port 8111]
 """
@@ -41,7 +41,7 @@ with sync_playwright() as pw:
       requestAnimationFrame(f); })""")
     R["fps"] = round(fps, 1)
 
-    # level 4 berhenti di bahu jalan, lalu level 5 kembali ke lajur kiri
+    # level 4 berhenti di tepi kiri jalan, lalu level 5 kembali ke lajur kiri
     page.locator('.step-dot[data-go="4"]').dispatch_event("click")
     page.locator(".speed-wrap .seg-btn", has_text="2x").click()
     t0 = time.time()
@@ -53,7 +53,7 @@ with sync_playwright() as pw:
     R["l5-from-shoulder"] = {"pos": readout(page, 3), "speed": readout(page, 0), "alert": alert(page)}
     page.locator(".stage").screenshot(path=SHOTS + "soak-l5-merge.png")
 
-    # level 5 jalan jauh (melewati beberapa periode jalan dan beberapa batas area operasi)
+    # level 5 jalan jauh (keluar dari kawasan Villa Puncak Tidar lalu melewati beberapa periode jalan)
     samples = []
     for i in range(12):
         page.wait_for_timeout(5000)

@@ -4,17 +4,20 @@
 // Berkas ini tidak menyentuh DOM, jadi bisa diuji langsung dengan Node (lihat tests/kontrol_model.py).
 //
 // Hal yang dibuat mirip mobil sungguhan:
-//   - setir punya jeda aktuator (STEER_DELAY) dan batas kecepatan putar roda (STEER_RATE);
-//   - gas dan rem punya batas (ACCEL_MAX, BRAKE_MAX) dan tanggapan yang tertunda (ACCEL_LAG);
+//   - setir punya jeda aktuator (steerDelay) dan batas kecepatan putar roda (steerRate);
+//   - gas dan rem punya batas (accelMax, brakeMax) dan tanggapan yang tertunda (accelLag);
 //   - ada hambatan gulir dan hambatan udara, jadi pengendali P saja menyisakan selisih kecepatan;
-//   - sensor kecepatan sedikit berderau, jadi Kd yang besar membuat perintah gas bergetar.
+//   - sensor kecepatan sedikit berderau, jadi Kd yang besar membuat perintah gas bergetar;
+//   - pengemudi cadangan mengambil alih sebelum terlambat: ia menghitung ke depan apa yang terjadi
+//     bila ia memegang setir sekarang, dan tidak menunggu sampai bodi mobil keluar dari badan jalan.
 // Penyederhanaan: model sepeda kinematik (ban tidak pernah selip) dan posisi mobil diketahui
 // tepat (lokalisasi sempurna).
 
 import { Vehicle } from '../../engine/vehicle.js';
 import { PID } from '../../engine/control.js';
-import { clamp, wrapAngle, Rng } from '../../engine/math.js';
-import { closestNear, curvatureAt } from './track.js';
+import { clamp, wrapAngle, approach, Rng } from '../../engine/math.js';
+import { boxCorners } from '../../engine/geometry.js';
+import { closestNear, curvatureAt, zoneAt } from './track.js';
 
 export const CFG = Object.freeze({
   wheelbase: 2.7,
@@ -31,14 +34,25 @@ export const CFG = Object.freeze({
   gripAccel: 8.5, // m/s^2, percepatan samping terbesar yang masih ditahan ban (sekitar 0,87 g)
   latAccel: 3, // m/s^2, batas percepatan samping saat "pelan di tikungan"
   comfortDecel: 2, // m/s^2, perlambatan nyaman sebelum tikungan
-  ldMin: 1,
+  ldMin: 2,
   ldMax: 20,
   ldAdaptiveMin: 2,
-  takeoverCte: 3.5, // m, bila sumbu roda belakang sejauh ini dari jalur, pengemudi cadangan mengambil alih
-  takeoverHeading: 0.52, // rad (30 derajat), atau bila arah mobil menyimpang sebesar ini dari arah jalur
-  takeoverBrake: 6, // m/s^2, pengemudi cadangan boleh mengerem lebih keras daripada pengendali
+  takeoverCte: 1.5, // m, bila sumbu roda belakang (kini atau sesaat lagi) sejauh ini dari jalur, pengemudi cadangan mengambil alih
+  takeoverPredict: 0.6, // detik, pengemudi cadangan melihat ke mana mobil bergerak sejauh ini ke depan
+  takeoverLatAccel: 7, // m/s^2, atau bila mobil menyentak ke samping sekeras ini (sekitar 0,7 g)
+  flipSteer: 0.3, // rad, perintah setir sebesar ini dihitung "besar"
+  flipCount: 2, // atau bila perintah setir besar berganti arah sebanyak ini
+  flipWindow: 2, // detik, dalam rentang waktu ini
+  takeoverHeading: 0.44, // rad (25 derajat), atau bila arah mobil menyimpang sebesar ini dari arah jalur
+  takeoverLd: [0.6, 5, 12], // lookahead pengemudi cadangan: k (detik), batas bawah dan atas (m)
+  takeoverBrake: 8, // m/s^2, pengemudi cadangan boleh mengerem lebih keras daripada pengendali (rem penuh)
   takeoverKmh: 25, // km/jam, kecepatan saat pengemudi cadangan mengemudi
+  takeoverCrawlKmh: 8, // km/jam, selama mobil masih jauh dari jalur, pengemudi cadangan melambat sampai merayap
   takeoverMin: 2.5, // detik, lama minimum pengambilalihan
+  takeoverBody: 2.3, // m, atau bila sudut bodi mobil akan sejauh ini dari jalur (badan jalan sekitar 5 m)
+  recoverHorizon: 1.6, // detik, pengawas menghitung sejauh ini ke depan bila pengemudi cadangan mengambil alih sekarang
+  zoneKmh: 20, // km/jam, batas kecepatan perencana di zona bundaran
+  settleHold: 3, // detik, kecepatan harus tenang selama ini sebelum uji respons dianggap selesai
 });
 
 export const DEFAULTS = Object.freeze({
@@ -54,6 +68,9 @@ export const DEFAULTS = Object.freeze({
 
 const KMH = 1 / 3.6;
 
+/** Mobil memotong tikungan ke sisi dalam (ciri Ld terlalu panjang)? `st` = state simulasi. */
+export const cuttingInside = (st) => Math.abs(st.curvatureHere) > 0.01 && Math.sign(st.curvatureHere) === Math.sign(st.cte) && Math.abs(st.cte) >= 0.6;
+
 /**
  * Pure pursuit klasik: titik tujuan adalah perpotongan lingkaran berjari-jari Ld (berpusat di
  * sumbu roda belakang) dengan jalur, di depan titik terdekat. Lalu
@@ -61,10 +78,9 @@ const KMH = 1 / 3.6;
  * Bila mobil lebih jauh dari Ld terhadap jalur, lingkaran tidak memotong jalur. Titik tujuan lalu
  * diambil sejauh Ld di sepanjang jalur dan rumus memakai jarak sebenarnya ke titik itu.
  */
-export function pursuit(track, ra, heading, ld, near, wheelbase = CFG.wheelbase, maxSteer = CFG.maxSteer) {
+export function pursuit(track, ra, heading, ld, near) {
   const path = track.ref;
   let target = null;
-  let onCircle = false;
   if (near.dist < ld) {
     const pts = path.points;
     const segs = pts.length - 1;
@@ -88,7 +104,6 @@ export function pursuit(track, ra, heading, ld, near, wheelbase = CFG.wheelbase,
           const t = (-B + Math.sqrt(disc)) / (2 * A); // titik keluar lingkaran
           if (t >= 0 && t <= 1) {
             target = { x: ax + ex * t, y: ay + ey * t };
-            onCircle = true;
             break;
           }
         }
@@ -108,8 +123,8 @@ export function pursuit(track, ra, heading, ld, near, wheelbase = CFG.wheelbase,
   const dist = Math.max(0.3, Math.hypot(dx, dy));
   const alpha = wrapAngle(Math.atan2(dy, dx) - heading);
   const curvature = (2 * Math.sin(alpha)) / dist;
-  const steer = clamp(Math.atan(wheelbase * curvature), -maxSteer, maxSteer);
-  return { target, onCircle, alpha, dist, curvature, steer };
+  const steer = clamp(Math.atan(CFG.wheelbase * curvature), -CFG.maxSteer, CFG.maxSteer);
+  return { target, alpha, dist, curvature, steer };
 }
 
 /** Titik-titik busur yang akan dilalui sumbu roda belakang dengan kelengkungan tertentu. */
@@ -131,8 +146,8 @@ export function arcPoints(ra, heading, curvature, length, n = 24) {
  * lalu menilai apakah mobil berayun kiri kanan berulang kali.
  */
 class SwingDetector {
-  constructor(hysteresis = 0.08) {
-    this.h = hysteresis;
+  constructor() {
+    this.h = 0.08; // histeresis (m)
     this.reset();
   }
   reset() {
@@ -199,8 +214,8 @@ class SwingDetector {
  * Buat simulasi. `track` dari buildTrack(). `settings` boleh diubah langsung oleh pelajaran
  * (ld, adaptive, k, targetKmh, kp, ki, kd, curveSlow); panggil notify*() supaya pengukuran tahu.
  */
-export function createSim(track, { seed = 7, cfg = null } = {}) {
-  const C = cfg ? { ...CFG, ...cfg } : CFG;
+export function createSim(track, { seed = 7 } = {}) {
+  const C = CFG;
   const settings = { ...DEFAULTS };
   const rng = new Rng(seed);
   const ego = new Vehicle({
@@ -215,39 +230,15 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     maxSpeed: 30,
   });
   const pid = new PID({ kp: settings.kp, ki: settings.ki, kd: settings.kd, min: -C.brakeMax, max: C.accelMax, integralLimit: 20, derivativeFilter: 0.8 });
-  const swing = new SwingDetector(0.08);
-
-  const state = {
-    time: 0,
-    s: 0, // posisi sepanjang jalur acuan (sumbu roda belakang)
-    progress: 0, // jarak tempuh sepanjang jalur sejak mulai (tidak dibungkus)
-    cte: 0, // galat lintasan (m), positif = di kanan jalur acuan
-    curvatureHere: 0,
-    ldEff: settings.ld,
-    pp: null, // hasil pure pursuit terakhir
-    steerCmd: 0,
-    steerDelayed: 0,
-    aCmd: 0,
-    aAct: 0,
-    vMeas: 0,
-    vRef: 0,
-    vSet: 0,
-    latAccel: 0,
-    lap: null, // putaran yang sedang diukur
-    lastLap: null, // putaran penuh terakhir { rms, max, avgKmh, time, ... }
-    laps: 0,
-    episode: null, // uji respons kecepatan terakhir
-    trail: [], // jejak sumbu roda belakang { x, y, cte }
-    takeover: null, // { time, at, ld, targetKmh, kmh } saat pengemudi cadangan mengemudi
-    lastTakeover: null,
-    takeovers: 0,
-    headingError: 0,
-  };
+  const swing = new SwingDetector();
+  const state = {}; // diisi placeAtStart() dan evaluate()
 
   const delaySteps = Math.max(0, Math.round(C.steerDelay * 60));
   const accelSteps = Math.max(0, Math.round(C.accelDelay * 60));
   let steerQueue = [];
   let accelQueue = [];
+  const steerFlips = []; // waktu perintah setir besar berganti arah
+  let lastBigSteer = 0;
 
   function placeAtStart() {
     const p = track.ref.sample(0);
@@ -257,51 +248,70 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     ego.odometer = 0;
     rng.reseed(seed); // derau sensor sama setiap kali diulang
     steerQueue = new Array(delaySteps).fill(0);
+    steerFlips.length = 0;
+    lastBigSteer = 0;
     accelQueue = new Array(accelSteps).fill(0);
     pid.reset();
     swing.reset();
     Object.assign(state, {
       time: 0,
-      s: 0,
-      progress: 0,
-      cte: 0,
-      pp: null,
+      s: 0, // posisi sepanjang jalur acuan (sumbu roda belakang)
+      progress: 0, // jarak tempuh sepanjang jalur sejak mulai (tidak dibungkus)
+      cte: 0, // galat lintasan (m), positif = di kanan jalur acuan
+      pp: null, // hasil pure pursuit terakhir
       steerCmd: 0,
       steerDelayed: 0,
       aCmd: 0,
       aAct: 0,
       vMeas: 0,
       latAccel: 0,
-      lastLap: null,
+      lastLap: null, // putaran penuh terakhir { rms, max, avgKmh, time, ... }
       laps: 0,
-      trail: [],
-      takeover: null,
+      episode: null, // uji respons kecepatan terakhir
+      trail: [], // jejak sumbu roda belakang { x, y, cte }
+      takeover: null, // { time, at, ld, targetKmh, kmh, reason, inside, s } saat pengemudi cadangan mengemudi
       lastTakeover: null,
       takeovers: 0,
       headingError: 0,
     });
-    state.lap = newLap();
-    state.episode = null;
+    state.lap = newLap(); // putaran yang sedang diukur
     startEpisode(true);
     evaluate();
   }
 
   function newLap() {
-    return { start: state.progress, startTime: state.time, sumSq: 0, sumW: 0, max: 0, dist: 0, minSpeed: Infinity, takeover: !!state.takeover, settings: snapshot() };
+    return { start: state.progress, startTime: state.time, sumSq: 0, sumW: 0, max: 0, dist: 0, takeover: !!state.takeover, settings: snapshot() };
   }
 
   const snapshot = () => ({ ld: settings.ld, adaptive: settings.adaptive, k: settings.k, targetKmh: settings.targetKmh, curveSlow: settings.curveSlow });
 
-  function ldNow(v = ego.speed) {
-    if (settings.adaptive) return clamp(settings.k * v, C.ldAdaptiveMin, C.ldMax);
+  function ldNow() {
+    if (settings.adaptive) return clamp(settings.k * ego.speed, C.ldAdaptiveMin, C.ldMax);
     return clamp(settings.ld, C.ldMin, C.ldMax);
   }
 
-  /** Kecepatan acuan: target, atau lebih pelan menjelang dan di dalam tikungan. */
+  /**
+   * Kecepatan acuan: target, tetapi selalu paling tinggi C.zoneKmh di zona bundaran (mobil sudah
+   * melambat pelan-pelan sebelum masuk), dan bila "pelan di tikungan" menyala, juga lebih pelan
+   * menjelang dan di dalam setiap tikungan.
+   */
   function speedRef() {
     const vSet = settings.targetKmh * KMH;
-    if (!settings.curveSlow) return vSet;
+    const vZone = C.zoneKmh * KMH;
     let v = vSet;
+    state.zoneLimited = false;
+    if (vSet > vZone) {
+      for (let d = 0; d <= 90; d += 1.5) {
+        if (!zoneAt(track, state.s + d)) continue;
+        const vz = Math.sqrt(vZone * vZone + 2 * C.comfortDecel * d);
+        if (vz < v) {
+          v = vz;
+          state.zoneLimited = true;
+        }
+        break;
+      }
+    }
+    if (!settings.curveSlow) return v;
     for (let d = 0; d <= 90; d += 1.5) {
       const k = Math.abs(curvatureAt(track, state.s + d));
       if (k < 1e-4) continue;
@@ -347,8 +357,8 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
       valid: false,
       spoiled: settings.curveSlow ? 'tikungan' : state.takeover ? 'cadangan' : null,
       stale: false,
-      fromStandstill,
       settledSince: null,
+      done: false,
     };
     refreshValid(state.episode);
   }
@@ -362,9 +372,11 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
 
   function trackEpisode() {
     const ep = state.episode;
-    if (!ep) return;
+    if (!ep || ep.done) return;
     const v = ego.speed;
     if (settings.curveSlow) spoilEpisode('tikungan');
+    // perencana menurunkan kecepatan acuan menjelang bundaran sebelum uji selesai: uji terganggu
+    if (state.zoneLimited) spoilEpisode('bundaran');
     if (ep.dir > 0) ep.extreme = Math.max(ep.extreme, v);
     else ep.extreme = Math.min(ep.extreme, v);
     const beyond = ep.dir > 0 ? ep.extreme - ep.target : ep.target - ep.extreme;
@@ -378,6 +390,50 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     if (ep.reachedAt != null && Math.abs(v - ep.target) <= band) {
       if (ep.settledSince == null) ep.settledSince = state.time;
     } else ep.settledSince = null;
+    // uji selesai: kecepatan sudah tenang di dekat target selama C.settleHold detik. Hasilnya
+    // dibekukan, jadi perlambatan di bundaran sesudahnya tidak mengubah angka overshoot.
+    if (ep.settledSince != null && state.time - ep.settledSince >= C.settleHold) ep.done = true;
+  }
+
+  /**
+   * Pengawas menghitung apa yang terjadi bila pengemudi cadangan mengambil alih SEKARANG: model
+   * sepeda kinematik yang sama dijalankan maju C.recoverHorizon detik dengan setir dan rem pengemudi
+   * cadangan (setir langsung dan dua kali lebih cepat, rem sampai merayap). Setir yang sedang
+   * terbanting ke arah yang salah butuh waktu untuk berbalik, dan selama itu mobil masih bergeser.
+   * Hasil: { axle, body } = simpangan terbesar sumbu roda belakang dan sudut bodi dari jalur (m).
+   */
+  function recoveryExcursion() {
+    const h = 1 / 20;
+    const lr = C.wheelbase / 2;
+    const [kLd, minLd, maxLd] = C.takeoverLd;
+    const box = { x: ego.x, y: ego.y, heading: ego.heading, length: ego.length, width: ego.width };
+    let v = ego.speed;
+    let steer = ego.steer;
+    let a = state.aAct;
+    let sHint = state.s;
+    let axle = 0;
+    let body = 0;
+    for (let t = 0; t <= C.recoverHorizon; t += h) {
+      const ra = { x: box.x - Math.cos(box.heading) * lr, y: box.y - Math.sin(box.heading) * lr };
+      const near = closestNear(track.ref, ra.x, ra.y, sHint, 14);
+      sHint = near.s;
+      axle = Math.max(axle, Math.abs(near.lateral));
+      for (const p of boxCorners(box)) body = Math.max(body, Math.abs(closestNear(track.ref, p.x, p.y, sHint + lr, 12).lateral));
+      if (axle > C.takeoverCte || body > C.takeoverBody) break;
+      const pp = pursuit(track, ra, box.heading, clamp(kLd * v, minLd, maxLd), near);
+      const v0 = Math.max(v, 0.1);
+      const grip = Math.min(C.maxSteer, Math.atan((C.wheelbase * C.gripAccel) / (v0 * v0)));
+      steer = approach(steer, clamp(pp.steer, -grip, grip), 2 * C.steerRate * h);
+      // rem baru bekerja sesudah jeda aktuator
+      const aCmd = t < C.accelDelay ? a : clamp(1.5 * (C.takeoverCrawlKmh * KMH - v), -C.takeoverBrake, C.accelMax);
+      a += (aCmd - a) * (1 - Math.exp(-h / C.accelLag));
+      v = Math.max(0, v + (a - C.aero * v * v - (v > 0.01 ? C.rolling : 0)) * h);
+      const beta = Math.atan(0.5 * Math.tan(steer));
+      box.x += v * Math.cos(box.heading + beta) * h;
+      box.y += v * Math.sin(box.heading + beta) * h;
+      box.heading += (v / lr) * Math.sin(beta) * h;
+    }
+    return { axle, body };
   }
 
   // ---------- satu langkah simulasi ----------
@@ -390,13 +446,16 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     state.ldEff = ldNow();
     state.pp = pursuit(track, ra, ego.heading, state.ldEff, near);
     state.headingError = wrapAngle(ego.heading - near.heading);
-    state.vSet = settings.targetKmh * KMH;
     state.vRef = speedRef();
     if (state.takeover) {
-      // pengemudi cadangan memakai lookahead panjang yang pasti stabil dan kecepatan rendah
-      const safeLd = clamp(0.9 * ego.speed, 8, 14);
+      // pengemudi cadangan memegang setir sendiri (tanpa jeda aktuator, jadi lookahead sedang pun stabil)
+      // dan melaju pelan
+      const [kLd, minLd, maxLd] = C.takeoverLd;
+      const safeLd = clamp(kLd * ego.speed, minLd, maxLd);
       state.safePp = pursuit(track, ra, ego.heading, safeLd, near);
-      state.vRef = Math.min(state.vRef, C.takeoverKmh * KMH);
+      // selama mobil masih jauh dari jalur atau miring, pengemudi cadangan mengerem sampai merayap
+      const offLine = Math.abs(near.lateral) > 0.8 || Math.abs(state.headingError) > 0.2;
+      state.vRef = Math.min(state.vRef, (offLine ? C.takeoverCrawlKmh : C.takeoverKmh) * KMH);
     } else state.safePp = null;
     return near;
   }
@@ -411,7 +470,6 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     const gripSteer = Math.min(C.maxSteer, Math.atan((C.wheelbase * C.gripAccel) / (v0 * v0)));
     const active = state.takeover ? state.safePp : pp;
     state.steerCmd = clamp(active.steer, -gripSteer, gripSteer);
-    state.gripLimited = Math.abs(active.steer) > gripSteer;
     if (state.takeover) {
       // pengemudi cadangan memegang setir langsung: tanpa jeda aktuator dan memutar lebih cepat
       steerQueue.fill(state.steerCmd);
@@ -421,6 +479,13 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
       steerQueue.push(state.steerCmd);
       state.steerDelayed = steerQueue.length > delaySteps ? steerQueue.shift() : state.steerDelayed;
       ego.steerRate = C.steerRate;
+      // catat saat perintah setir besar berganti arah (kiri penuh lalu kanan penuh): ciri ayunan
+      if (Math.abs(state.steerCmd) >= C.flipSteer) {
+        const sign = Math.sign(state.steerCmd);
+        if (lastBigSteer && sign !== lastBigSteer) steerFlips.push(state.time);
+        lastBigSteer = sign;
+      }
+      while (steerFlips.length && steerFlips[0] < state.time - C.flipWindow) steerFlips.shift();
     }
 
     // kecepatan: PID menghitung percepatan yang diminta dari selisih kecepatan terukur
@@ -460,7 +525,6 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     lap.sumW += w;
     lap.dist += ds;
     lap.max = Math.max(lap.max, Math.abs(state.cte));
-    if (ego.speed * 3.6 < lap.minSpeed) lap.minSpeed = ego.speed * 3.6;
     if (state.progress - lap.start >= L) {
       const time = state.time - lap.startTime;
       state.lastLap = {
@@ -468,7 +532,6 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
         max: lap.max,
         time,
         avgKmh: (lap.dist / Math.max(1e-6, time)) * 3.6,
-        minKmh: lap.minSpeed,
         settings: lap.settings,
         takeover: lap.takeover,
         endTime: state.time,
@@ -479,8 +542,30 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
 
     // pengawas: mobil terlalu jauh dari jalur, pengemudi cadangan mengambil alih
     const swerving = ego.speed > 3 && Math.abs(state.headingError) > C.takeoverHeading;
-    if (!state.takeover && (Math.abs(state.cte) > C.takeoverCte || swerving)) {
-      state.takeover = { time: 0, at: state.time, ld: state.ldEff, targetKmh: settings.targetKmh, kmh: ego.speed * 3.6 };
+    // galat yang diperkirakan sesaat lagi: galat sekarang ditambah laju menyampingnya
+    const ctePredicted = state.cte + ego.speed * Math.sin(state.headingError) * C.takeoverPredict;
+    // mobil menyentak ke samping jauh lebih keras daripada yang dibutuhkan jalan (ciri ayunan)
+    const jerky = Math.abs(state.latAccel) > C.takeoverLatAccel;
+    const flipping = steerFlips.length >= C.flipCount;
+    // Bila menunggu lebih lama, pengemudi cadangan tidak sempat lagi menahan mobil di badan jalan.
+    // Hanya dihitung saat mobil tidak tenang di jalurnya (hemat hitungan).
+    const calm = Math.abs(state.cte) < 0.25 && Math.abs(state.headingError) < 0.07 && Math.abs(ego.steer - Math.atan(C.wheelbase * state.curvatureHere)) < 0.1;
+    const recovery = state.takeover || calm ? null : recoveryExcursion();
+    const lateTakeover = !!recovery && (recovery.axle > C.takeoverCte || recovery.body > C.takeoverBody);
+    const reason = Math.abs(state.cte) > C.takeoverCte
+      ? 'galat'
+      : Math.abs(ctePredicted) > C.takeoverCte || lateTakeover
+        ? 'arah-galat'
+        : swerving
+          ? 'arah'
+          : jerky
+            ? 'sentakan'
+            : flipping
+              ? 'setir'
+              : null;
+    if (!state.takeover && reason) {
+      // inside: mobil sedang memotong tikungan saat diambil alih
+      state.takeover = { time: 0, at: state.time, ld: state.ldEff, targetKmh: settings.targetKmh, kmh: ego.speed * 3.6, reason, inside: cuttingInside(state), s: state.s };
       state.lastTakeover = state.takeover;
       state.takeovers++;
       state.lap.takeover = true;
@@ -489,6 +574,8 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
       state.takeover.time += dt;
       if (state.takeover.time > C.takeoverMin && Math.abs(state.cte) < 0.3 && Math.abs(state.headingError) < 0.06) {
         state.takeover = null;
+        steerFlips.length = 0;
+        lastBigSteer = 0;
         swing.reset();
         pid.reset();
         state.lap = newLap();
@@ -503,7 +590,7 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     const ra = ego.rearAxle();
     if (!last || Math.hypot(ra.x - last.x, ra.y - last.y) > 0.4) {
       tr.push({ x: ra.x, y: ra.y, cte: state.cte });
-      if (tr.length > 1150) tr.splice(0, tr.length - 1150);
+      if (tr.length > 2300) tr.splice(0, tr.length - 2300);
     }
   }
 
@@ -516,9 +603,7 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     state,
     settings,
     step,
-    evaluate,
     reset: placeAtStart,
-    ldNow,
     /** Pengaturan kemudi atau kecepatan target berubah: mulai ukur putaran baru dari sini. */
     notifyTrackingChange() {
       state.lap = newLap();
@@ -535,6 +620,5 @@ export function createSim(track, { seed = 7, cfg = null } = {}) {
     },
     swingSummary: (window, minP2P) => swing.summary(state.time, window, minP2P),
     lapProgress: () => clamp((state.progress - state.lap.start) / track.length, 0, 1),
-    currentLapRms: () => (state.lap.sumW > 0 ? Math.sqrt(state.lap.sumSq / state.lap.sumW) : 0),
   };
 }

@@ -2,46 +2,60 @@
 //
 // Susunan mengikuti pelajaran contoh (sensor.js):
 //   - teks pelajaran di objek default export;
-//   - lintasan di ./kontrol/track.js, model (pure pursuit, PID, pengukuran) di ./kontrol/sim.js,
+//   - lintasan di ./kontrol/track.js (bentuknya dari jalan sungguhan di peta OpenStreetMap 'machung'),
+//     model (pure pursuit, PID, pengukuran, pengemudi cadangan) di ./kontrol/sim.js,
 //     gambar di ./kontrol/scene.js;
-//   - mount(ctx) menyusun kanvas, loop, panel kontrol, deteksi tugas, dan preset tiap langkah.
+//   - mount(ctx) memuat peta, menyusun kanvas, loop, panel kontrol, deteksi tugas, dan preset tiap langkah.
+//
+// Lintasan: boulevard satu arah di kawasan Villa Puncak Tidar, selatan Universitas Ma Chung, dari
+// bundaran besar di barat daya kampus ke bundaran di timur dan kembali lewat jalur seberang
+// (sekitar 890 m). Jalannya dianggap ditutup untuk uji kendali: tidak ada kendaraan lain, pejalan
+// kaki, atau lampu lalu lintas (di OSM memang tidak ada lampu lalu lintas di sekitar kampus).
 //
 // Hasil uji model (tests/kontrol_model.py, dijalankan dengan Node):
-//   - Ld 3 m pada 40 km/jam: ayunan membesar sampai pengemudi cadangan mengambil alih (jeda setir 0,18 detik).
-//   - Ld 5 sampai 12 m pada 30 sampai 50 km/jam: RMS galat satu putaran di bawah 0,3 m.
-//   - Ld 15 m atau lebih: mobil memotong sisi dalam tikungan sekitar 1 sampai 2,6 m.
+//   - Ld 2 sampai 3 m pada 40 km/jam: mobil berayun dan pengemudi cadangan mengambil alih dalam beberapa detik.
+//   - Ld 5 sampai 10 m pada 40 km/jam: RMS galat satu putaran di bawah 0,3 m.
+//   - Ld 15 m atau lebih: mobil memotong sisi dalam tikungan di bundaran.
 //   - dari diam ke 40 km/jam: Kp 0,8 dan Ki 0,2 memberi overshoot sekitar 3%, Ki 1 sekitar 12%.
 
 import { COLORS } from '../engine/theme.js';
-import { fmt, fmtSigned, clamp } from '../engine/math.js';
+import { fmt, fmtSigned, fmtSpeed, fmtPercent, clamp, kmhToMs, msToKmh } from '../engine/math.js';
 import { drawScaleBar, createLabelLayer } from '../engine/draw.js';
 import * as ui from '../engine/ui.js';
-import { buildTrack } from './kontrol/track.js';
-import { createSim, CFG, DEFAULTS } from './kontrol/sim.js';
-import { createScene, TRAIL_COLORS, ARC_COLOR, CIRCLE_COLOR } from './kontrol/scene.js';
+import { buildTrack, zoneAt } from './kontrol/track.js';
+import { createSim, cuttingInside, CFG, DEFAULTS } from './kontrol/sim.js';
+import { createScene, fmtLd, errorTone, TRAIL_COLORS, ARC_COLOR, CIRCLE_COLOR, ZONE_COLOR } from './kontrol/scene.js';
 
-const KMH = 1 / 3.6;
-const MIN_STEP_KMH = 10; // lonjakan kecepatan terkecil yang dihitung untuk tugas PID
-const OVERSHOOT_GAINS = { kp: 0.8, ki: 1, kd: 0 };
+const MIN_STEP = kmhToMs(10) - 1e-6; // lonjakan kecepatan terkecil (m/s) yang dihitung untuk tugas PID
+const ATTRIB_W = 168; // lebar kira-kira lencana atribusi OSM (piksel CSS)
+const ATTRIB_H = 18;
 
-// Preset tiap langkah. Nilai yang tidak disebut dibiarkan sesuai pilihan pelajar.
-// restart = mobil kembali ke garis start dan melaju dari diam.
+// Preset tiap langkah. Setiap langkah juga memakai Ld tetap, kecepatan target 40 km/jam, dan
+// Pelan di tikungan mati. gains = nilai awal PID, restart = mobil kembali ke garis start dan melaju dari diam.
 const STEP_PRESETS = [
-  { adaptive: false, ld: 8, targetKmh: 40, curveSlow: false },
-  { adaptive: false, ld: 8, targetKmh: 40, curveSlow: false },
-  { adaptive: false, ld: 18, targetKmh: 40, curveSlow: false },
-  { adaptive: false, ld: 8, targetKmh: 40, curveSlow: false, gains: { kp: DEFAULTS.kp, ki: DEFAULTS.ki, kd: DEFAULTS.kd }, restart: true },
-  { adaptive: false, ld: 8, targetKmh: 40, curveSlow: false, gains: OVERSHOOT_GAINS, restart: true },
+  { ld: 8 },
+  { ld: 8 },
+  { ld: 18 },
+  { ld: 8, gains: { kp: DEFAULTS.kp, ki: DEFAULTS.ki, kd: DEFAULTS.kd }, restart: true },
+  { ld: 8, gains: { kp: 0.8, ki: 1, kd: 0 }, restart: true },
 ];
 
-const fmtLd = (ld) => fmt(ld, Math.abs(ld - Math.round(ld)) > 0.05 ? 1 : 0, 'm');
+/** Kalimat penyebab pengambilalihan untuk status dan pemberitahuan. */
+function takeoverText(t) {
+  if (!t) return '';
+  // memotong tikungan hanya terjadi dengan Ld panjang; dengan Ld pendek penyebabnya ayunan
+  if (t.inside && t.ld >= 10) return 'Mobil memotong tikungan terlalu dalam.';
+  if (t.reason === 'sentakan' || t.reason === 'setir' || t.ld <= 4) return 'Mobil berayun terlalu keras.';
+  return 'Mobil menyimpang terlalu jauh dari jalur.';
+}
 
 export default {
   id: 'kontrol',
   title: 'Kendali Kemudi dan Kecepatan',
   layout: 'sim',
   intro:
-    '<p>Mobil otonom sudah punya jalur. Sekarang ia harus memutar setir, menginjak gas, dan mengerem supaya tetap di jalur itu. Kamu akan menyetel dua pengendali di lintasan uji yang berkelok: <strong>pure pursuit</strong> untuk setir dan <strong>PID</strong> untuk kecepatan.</p>',
+    '<p>Mobil otonom sudah punya jalur. Sekarang ia harus memutar setir, menginjak gas, dan mengerem supaya tetap di jalur itu. Kamu akan menyetel dua pengendali: <strong>pure pursuit</strong> untuk setir dan <strong>PID</strong> untuk kecepatan.</p>' +
+    '<p>Lintasan uji di sini adalah jalan sungguhan. Bentuknya diambil dari data OpenStreetMap: boulevard dua jalur satu arah dengan bundaran di kedua ujungnya, di kawasan Villa Puncak Tidar, selatan Universitas Ma Chung. Anggap jalan ini sedang ditutup untuk uji kendali, jadi tidak ada kendaraan lain, pejalan kaki, atau lampu lalu lintas.</p>',
   steps: [
     {
       title: 'Lookahead terlalu pendek',
@@ -54,17 +68,17 @@ export default {
     {
       title: 'Lookahead terlalu panjang',
       body:
-        '<p>Dengan Ld pendek, simpangan sekecil apa pun dibalas dengan belokan tajam. Karena setir selalu sedikit terlambat, mobil kebablasan ke sisi lain dan ayunannya makin besar. Bila mobil menyimpang lebih dari 3,5 m atau arahnya melenceng lebih dari 30 derajat, pengemudi cadangan mengambil alih, seperti pada uji jalan mobil otonom sungguhan.</p>' +
-        '<p>Ld yang panjang membuat setir tenang. Masalahnya, titik tujuan sudah masuk tikungan saat mobil masih di jalan lurus. Mobil berbelok terlalu awal dan <strong>memotong tikungan</strong> ke sisi dalam. Di tikungan kanan, sisi dalam berarti lajur lawan.</p>',
-      task: { id: 'lookahead-large', text: 'Besarkan lookahead menjadi <strong>15 m atau lebih</strong>, lalu lihat mobil memotong tikungan.' },
+        '<p>Dengan Ld pendek, simpangan sekecil apa pun dibalas dengan belokan tajam. Karena setir selalu sedikit terlambat, mobil kebablasan ke sisi lain dan ayunannya makin besar. Seperti pada uji jalan mobil otonom sungguhan, pengemudi cadangan mengambil alih bila mobil menyentak ke samping terlalu keras atau arahnya melenceng lebih dari 25 derajat. Ia juga mengambil alih bila memperkirakan mobil akan menyimpang lebih dari 1,5 m atau keluar dari badan jalan. Badan jalan boulevard ini diperkirakan hanya 5 m lebarnya.</p>' +
+        '<p>Ld yang panjang membuat setir tenang. Masalahnya, titik tujuan sudah masuk tikungan saat mobil masih di jalan lurus. Mobil berbelok terlalu awal dan <strong>memotong tikungan</strong> ke sisi dalam. Lengkungan boulevard ini landai, jadi efeknya paling jelas di bundaran. Saat masuk, mobil memotong belokan di mulut bundaran. Di dalam bundaran, ia memotong ke arah pulau tengah.</p>',
+      task: { id: 'lookahead-large', text: 'Besarkan lookahead menjadi <strong>15 m atau lebih</strong>, lalu lihat mobil memotong tikungan di bundaran berikutnya.' },
     },
     {
       title: 'Cari lookahead yang pas',
       body:
-        '<p><strong>Galat lintasan</strong> adalah jarak tengah sumbu roda belakang dari jalur acuan. Nilai positif berarti mobil ada di kanan jalur. RMS (akar dari rata-rata kuadrat galat) merangkum galat satu putaran menjadi satu angka. Jejak berwarna di lintasan menunjukkan di mana galatnya besar.</p>' +
-        '<p>Makin cepat mobil, makin panjang Ld yang dibutuhkan. Karena itu Ld sering dibuat sebanding dengan kecepatan, Ld = k · v dengan v dalam m/s. Mode <strong>Adaptif</strong> di panel Kemudi memakai rumus ini.</p>' +
-        '<p class="note">Putaran diukur ulang setiap kali kamu mengubah pengaturan kemudi atau kecepatan. Sakelar Pelan di tikungan menurunkan kecepatan sebelum tikungan supaya percepatan samping tidak lebih dari 3 m/s².</p>',
-      task: { id: 'tuned', text: 'Cari lookahead yang membuat <strong>RMS galat lintasan di bawah 0,3 m</strong> selama satu putaran penuh, dengan kecepatan rata-rata 30 km/jam atau lebih.' },
+        '<p><strong>Galat lintasan</strong> adalah jarak tengah sumbu roda belakang dari jalur acuan. Nilai positif berarti mobil ada di kanan jalur. RMS (akar dari rata-rata kuadrat galat) merangkum galat satu putaran menjadi satu angka. Jejak berwarna di jalan menunjukkan di mana galatnya besar.</p>' +
+        '<p>Makin cepat mobil, makin panjang Ld yang dibutuhkan. Karena itu Ld sering dibuat sebanding dengan kecepatan, Ld = k · v dengan v dalam m/s. Mode <strong>Adaptif</strong> di panel Kemudi memakai rumus ini. Di bundaran mobil melambat, jadi Ld adaptif ikut memendek di sana.</p>' +
+        '<p class="note">Satu putaran sekitar 890 m, kira-kira 1 menit 45 detik pada 40 km/jam (tombol 2x mempercepat simulasi). Putaran diukur ulang setiap kali kamu mengubah pengaturan kemudi atau kecepatan. Di bundaran, perencana kecepatan selalu menurunkan kecepatan acuan ke 20 km/jam.</p>',
+      task: { id: 'tuned', text: 'Cari lookahead yang membuat <strong>RMS galat lintasan di bawah 0,3 m</strong> selama satu putaran penuh, dengan kecepatan target 40 km/jam atau lebih.' },
     },
     {
       title: 'PID untuk kecepatan',
@@ -74,7 +88,8 @@ export default {
         '<ul><li>Kp bereaksi pada selisih saat ini. Kalau hanya ada Kp, kecepatan berhenti sedikit di bawah target karena hambatan udara dan hambatan gulir ban terus memperlambat mobil.</li>' +
         '<li>Ki menjumlahkan selisih dari waktu ke waktu, sehingga sisa selisih itu lama-lama habis.</li>' +
         '<li>Kd bereaksi pada laju perubahan selisih.</li></ul>' +
-        '<p><strong>Overshoot</strong> adalah seberapa jauh kecepatan melewati target, dibandingkan besar lonjakannya. Contohnya, target naik dari 0 ke 40 km/jam dan kecepatan sempat mencapai 44 km/jam. Overshoot-nya 4 dari 40, yaitu 10%.</p>',
+        '<p><strong>Overshoot</strong> adalah seberapa jauh kecepatan melewati target, dibandingkan besar lonjakannya. Contohnya, target naik dari 0 ke 40 km/jam dan kecepatan sempat mencapai 44 km/jam. Overshoot-nya 4 dari 40, yaitu 10%.</p>' +
+        '<p class="note">Uji dari diam menaruh mobil di garis start, sekitar 300 m sebelum bundaran timur. Uji selesai setelah kecepatan tenang di dekat target selama 3 detik. Bila mobil sudah harus melambat untuk bundaran sebelum itu, ujinya tidak dihitung.</p>',
       task: { id: 'pid-overshoot', text: 'Buat <strong>overshoot kecepatan lebih dari 10%</strong>. Naikkan Ki sampai sekitar 1, lalu tekan <strong>Uji dari diam</strong> di panel Hasil.' },
     },
     {
@@ -88,11 +103,11 @@ export default {
     },
   ],
   summary:
-    '<ul><li>Pure pursuit mengarahkan mobil ke titik tujuan sejauh Ld di depan. Ld terlalu pendek membuat mobil berayun karena setir selalu terlambat. Ld terlalu panjang membuat mobil memotong tikungan.</li>' +
+    '<ul><li>Pure pursuit mengarahkan mobil ke titik tujuan sejauh Ld di depan. Ld terlalu pendek membuat mobil berayun karena setir selalu terlambat. Ld terlalu panjang membuat mobil memotong tikungan, paling terasa di bundaran.</li>' +
     '<li>Ld yang baik bertambah seiring kecepatan, sehingga rumus Ld = k · v sering dipakai.</li>' +
     '<li>PID mengatur kecepatan. Kp mempercepat tanggapan dan Ki menghapus selisih yang tersisa, tetapi Ki yang besar menimbulkan overshoot.</li>' +
     '<li>Setir, gas, dan rem punya jeda dan batas. Karena itu pengendali tidak bisa dibuat seagresif mungkin.</li></ul>' +
-    '<p class="note">Penyederhanaan di simulasi ini: model sepeda kinematik (ban tidak pernah selip), posisi mobil diketahui tepat, dan pengendali tidak pernah meminta belokan melebihi cengkeram ban (sekitar 0,87 g). Mobil sungguhan juga memakai pengendali lain, misalnya Stanley (mengoreksi galat dari posisi roda depan) atau MPC (menghitung gerakan beberapa detik ke depan dengan model kendaraan).</p>',
+    '<p class="note">Penyederhanaan di simulasi ini: model sepeda kinematik (ban tidak pernah selip), posisi mobil diketahui tepat, dan pengendali tidak pernah meminta belokan melebihi cengkeram ban (sekitar 0,87 g). Bentuk jalan berasal dari OpenStreetMap lalu dihaluskan sedikit, dan lebar jalan 5 m hanya perkiraan. Mobil sungguhan juga memakai pengendali lain, misalnya Stanley (mengoreksi galat dari posisi roda depan) atau MPC (menghitung gerakan beberapa detik ke depan dengan model kendaraan).</p>',
 
   styles: `
     .lesson-kontrol .chart-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
@@ -119,20 +134,8 @@ export default {
     }
   `,
 
-  mount(ctx) {
-    // ---------- model ----------
-    const track = buildTrack();
-    const sim = createSim(track, { seed: 7 });
-    const scene = createScene(track);
-    const st = sim.state;
-    const set = sim.settings;
-    const holds = {};
-    let stepStart = 0; // waktu simulasi saat langkah sekarang dibuka
-    let camera = 'ikuti';
-    let takeoverToastAt = -Infinity;
-    let lastTakeoverCount = 0;
-
-    // ---------- kanvas dan loop ----------
+  async mount(ctx) {
+    // ---------- kanvas dulu, supaya panggung tidak kosong selama peta dimuat ----------
     const labels = createLabelLayer();
     // Kotak penunjuk setir dan peta mini (piksel CSS). Dipakai untuk menggambar dan untuk
     // memastikan label di kanvas tidak tertutup kotak-kotak itu.
@@ -141,10 +144,13 @@ export default {
       gauge: narrow ? { w: 118, h: 80 } : { w: 150, h: 92 },
       mini: narrow ? { w: 116, h: 88 } : { w: 172, h: 130 },
     });
-    // Seluruh lintasan: sisakan tempat untuk chip HUD di atas, dan untuk penunjuk setir di kanan
-    // bawah (layar lebar) atau di bawah (layar tegak), mana yang membuat lintasan tampak lebih besar.
     const OVERVIEW_PAD = 14;
+    let track = null;
     let fitHudBottom = 0; // tinggi HUD yang dipakai saat fit terakhir
+    let hudRect = null;
+    // Seluruh lintasan: sisakan tempat untuk chip HUD di atas, dan untuk penunjuk setir (plus lencana
+    // atribusi di atasnya) di kanan bawah (layar lebar) atau di bawah (layar tegak), mana yang membuat
+    // lintasan tampak lebih besar.
     const overviewBounds = (v) => {
       const b = track.bounds;
       const base = { minX: b.minX - 4, minY: b.minY - 4, maxX: b.maxX + 4, maxY: b.maxY + 4 };
@@ -156,7 +162,7 @@ export default {
       const aw = v.width - 2 * OVERVIEW_PAD;
       const ah = v.height - 2 * OVERVIEW_PAD - roomTop;
       const roomX = gauge.w + m;
-      const roomY = gauge.h + m;
+      const roomY = gauge.h + m + ATTRIB_H + 4;
       const sRight = Math.min((aw - roomX) / tw, ah / th);
       const sBottom = Math.min(aw / tw, (ah - roomY) / th);
       if (sRight <= 0 && sBottom <= 0) return base;
@@ -166,11 +172,22 @@ export default {
       else out.maxY += roomY / s;
       return out;
     };
-    const view = ctx.createView({
-      label: 'Lintasan uji dari atas. Mobil otonom hijau toska mengikuti jalur acuan di lajur kiri.',
-      background: COLORS.ground,
-      padding: 14,
-    });
+    const view = ctx.createView({ label: 'Peta boulevard Villa Puncak Tidar dari atas. Peta sedang dimuat.' });
+    ctx.setStatus('Memuat peta boulevard Villa Puncak Tidar dari data OpenStreetMap.');
+
+    // ---------- peta dan model ----------
+    const map = await ctx.loadMap('machung');
+    if (ctx.signal.aborted) return {};
+    track = buildTrack(map);
+    const sim = createSim(track, { seed: 7 });
+    const scene = createScene(track, map);
+    const st = sim.state;
+    const set = sim.settings;
+    let holds = {};
+    let stepStart = 0; // waktu simulasi saat langkah sekarang dibuka
+    let camera = 'ikuti';
+    let takeoverToastAt = -Infinity;
+    let lastTakeoverCount = 0;
 
     let chartTick = 0;
     const loop = ctx.createLoop({
@@ -179,7 +196,7 @@ export default {
         if (++chartTick >= 4) {
           chartTick = 0;
           cteChart.push(st.time, st.cte);
-          speedChart.push(st.time, sim.ego.speed * 3.6, st.vRef * 3.6);
+          speedChart.push(st.time, msToKmh(sim.ego.speed), msToKmh(st.vRef));
         }
       },
       render,
@@ -203,7 +220,7 @@ export default {
       max: CFG.ldMax,
       step: 0.5,
       value: set.ld,
-      format: (v) => fmtLd(v),
+      format: fmtLd,
       onInput: (v) => {
         set.ld = v;
         sim.notifyTrackingChange();
@@ -216,7 +233,7 @@ export default {
       step: 0.05,
       value: set.k,
       format: (v) => fmt(v, 2, 'detik'),
-      hint: 'Ld = k · v, dibatasi 2 sampai 20 m.',
+      hint: `Ld = k · v, dibatasi ${fmt(CFG.ldAdaptiveMin, 0)} sampai ${fmt(CFG.ldMax, 0)} m.`,
       onInput: (v) => {
         set.k = v;
         sim.notifyTrackingChange();
@@ -235,6 +252,7 @@ export default {
       step: 1,
       value: set.targetKmh,
       unit: 'km/jam',
+      hint: `Di bundaran, perencana selalu membatasi ${fmt(CFG.zoneKmh, 0)} km/jam.`,
       onInput: (v) => {
         set.targetKmh = v;
         sim.notifyTargetChange();
@@ -242,7 +260,7 @@ export default {
     });
     const curveToggle = ui.toggle(speedGroup, {
       label: 'Pelan di tikungan',
-      hint: 'Batas percepatan samping 3 m/s²', // spasi tak terputus: angka dan satuan tidak terpisah baris
+      hint: 'Batas percepatan samping 3\u00a0m/s²', // spasi tak terputus: angka dan satuan tidak terpisah baris
       color: COLORS.warn,
       checked: set.curveSlow,
       onChange: (on) => {
@@ -269,9 +287,7 @@ export default {
           sim.notifyGainChange();
         },
       });
-    const kpSlider = gainSlider('Kp', 'kp', 5, 0.1);
-    const kiSlider = gainSlider('Ki', 'ki', 2, 0.05);
-    const kdSlider = gainSlider('Kd', 'kd', 1, 0.05);
+    const gainSliders = { kp: gainSlider('Kp', 'kp', 5, 0.1), ki: gainSlider('Ki', 'ki', 2, 0.05), kd: gainSlider('Kd', 'kd', 1, 0.05) };
     const pidReadouts = ui.readoutGrid(pidGroup);
     const pOut = ui.readout(pidReadouts, { label: 'Suku P', value: '-' });
     const iOut = ui.readout(pidReadouts, { label: 'Suku I', value: '-' });
@@ -291,8 +307,9 @@ export default {
     const reachOut = ui.readout(resultGrid, { label: 'Waktu mencapai target', value: '-' });
     const resultRow = ui.el('div', { class: 'result-row' });
     resultGroup.append(resultRow);
-    ui.button(resultRow, { label: 'Uji dari diam', icon: 'reset', onClick: () => restartFromStandstill() });
-    const resultNote = ui.el('p', { class: 'ctl-hint result-note', text: 'Uji dari diam mengembalikan mobil ke garis start, lalu mobil melaju lagi dari 0 km/jam.' });
+    ui.button(resultRow, { label: 'Uji dari diam', icon: 'reset', onClick: restart });
+    const DEFAULT_NOTE = 'Uji dari diam mengembalikan mobil ke garis start, lalu mobil melaju lagi dari 0 km/jam.';
+    const resultNote = ui.el('p', { class: 'ctl-hint result-note', text: DEFAULT_NOTE });
     resultRow.append(resultNote);
 
     // Grafik
@@ -313,7 +330,7 @@ export default {
       label: 'Kecepatan',
       series: [
         { label: 'kecepatan', color: COLORS.accent },
-        { label: 'target', color: COLORS.warn },
+        { label: 'acuan', color: COLORS.warn },
       ],
       span: 12,
       min: 0,
@@ -332,10 +349,14 @@ export default {
         { value: 'semua', label: 'Seluruh lintasan' },
       ],
       value: camera,
-      onChange: (v) => setCamera(v),
+      onChange: (v) => {
+        camera = v;
+        view.fit(v === 'semua' ? overviewBounds : null, OVERVIEW_PAD);
+      },
     });
     ui.legend(viewGroup, [
       { color: COLORS.path, label: 'jalur acuan', shape: 'line' },
+      { color: ZONE_COLOR, label: `zona bundaran (maks ${fmt(CFG.zoneKmh, 0)} km/jam)`, shape: 'line' },
       { color: CIRCLE_COLOR, label: 'lingkaran Ld', shape: 'dot' },
       { color: COLORS.target, label: 'titik tujuan', shape: 'dot' },
       { color: ARC_COLOR, label: 'busur setir', shape: 'line' },
@@ -343,6 +364,12 @@ export default {
       { color: TRAIL_COLORS.warn, label: '0,3 sampai 1 m', shape: 'line' },
       { color: TRAIL_COLORS.danger, label: '> 1 m', shape: 'line' },
     ]);
+    viewGroup.append(
+      ui.el('p', {
+        class: 'ctl-hint',
+        text: 'Peta: © Kontributor OpenStreetMap. Jalur acuan mengikuti tengah jalur satu arah boulevard, dihaluskan sedikit. Lebar jalan adalah perkiraan.',
+      }),
+    );
 
     // HUD di atas kanvas
     const ldChip = ui.hudChip(ctx.hud, { label: 'Ld', color: CIRCLE_COLOR });
@@ -362,82 +389,47 @@ export default {
       sim.notifyTrackingChange();
     }
 
-    function setLd(ld) {
-      set.ld = ld;
-      ldSlider.set(ld);
-      sim.notifyTrackingChange();
-    }
-
-    function setTarget(kmh) {
-      if (set.targetKmh === kmh) return;
-      set.targetKmh = kmh;
-      targetSlider.set(kmh);
-      sim.notifyTargetChange();
-    }
-
-    function setCurveSlow(on) {
-      set.curveSlow = on;
-      curveToggle.set(on);
-      sim.notifyTrackingChange();
-    }
-
-    function setGains({ kp, ki, kd }) {
-      Object.assign(set, { kp, ki, kd });
-      kpSlider.set(kp);
-      kiSlider.set(ki);
-      kdSlider.set(kd);
-      sim.notifyGainChange();
-    }
-
-    function setCamera(v) {
-      camera = v;
-      if (v === 'semua') view.fit(overviewBounds, OVERVIEW_PAD);
-      else view.fit(null);
-    }
-
-    function clearCharts() {
+    // Uji dari diam dan tombol Ulangi: mobil kembali ke garis start dan melaju dari diam
+    function restart() {
+      sim.reset();
       chartTick = 0;
       cteChart.clear();
       speedChart.clear();
-    }
-
-    function restartFromStandstill() {
-      sim.reset();
-      clearCharts();
       stepStart = 0;
       lastTakeoverCount = 0;
       loop.resetTime();
-      for (const k of Object.keys(holds)) holds[k] = 0;
+      holds = {};
       ctx.resume();
       refreshPanels(0);
     }
 
     // ---------- deteksi tugas ----------
     const weaving = () => sim.swingSummary(6, 0.3);
-    const cuttingInside = () => {
-      const k = st.curvatureHere;
-      return Math.abs(k) > 0.01 && Math.sign(k) === Math.sign(st.cte) && Math.abs(st.cte) >= 0.6;
-    };
     const recentTakeover = () => {
       const t = st.lastTakeover;
       return !!t && st.time - t.at < 5 && t.at >= stepStart && t.ld <= 3 + 1e-6 && t.targetKmh >= 40 && t.kmh >= 30;
     };
-    const episodeCounts = (ep) => !!ep && ep.valid && !ep.stale && ep.t0 >= stepStart && ep.step >= MIN_STEP_KMH * KMH - 1e-6;
+    // pengemudi cadangan mengambil alih karena mobil memotong tikungan dengan Ld panjang
+    const recentCutTakeover = () => {
+      const t = st.lastTakeover;
+      return !!t && t.inside && st.time - t.at < 4 && t.at >= stepStart && t.ld >= 15 - 1e-6 && t.kmh >= 15;
+    };
+    const episodeCounts = (ep) => !!ep && ep.valid && !ep.stale && ep.t0 >= stepStart && ep.step >= MIN_STEP;
 
     const TASK_CHECKS = {
       'lookahead-small': {
         hold: 0.2,
-        test: () => st.ldEff <= 3 + 1e-6 && set.targetKmh >= 40 && ((weaving().swings >= 2 && sim.ego.speed >= 30 * KMH) || recentTakeover()),
+        test: () => st.ldEff <= 3 + 1e-6 && set.targetKmh >= 40 && ((weaving().swings >= 2 && sim.ego.speed >= kmhToMs(30)) || recentTakeover()),
       },
       'lookahead-large': {
-        hold: 0.6,
-        test: () => st.ldEff >= 15 - 1e-6 && !st.takeover && sim.ego.speed >= 15 * KMH && cuttingInside(),
+        hold: 0.4,
+        test: () => st.ldEff >= 15 - 1e-6 && ((!st.takeover && sim.ego.speed >= kmhToMs(15) && cuttingInside(st)) || recentCutTakeover()),
       },
       tuned: {
         hold: 0,
         test: () => {
           const lap = st.lastLap;
-          return !!lap && lap.endTime > stepStart && !lap.takeover && lap.rms < 0.3 && lap.avgKmh >= 29.5;
+          return !!lap && lap.endTime > stepStart && !lap.takeover && lap.rms < 0.3 && lap.settings.targetKmh >= 40;
         },
       },
       'pid-overshoot': { hold: 0, test: () => episodeCounts(st.episode) && st.episode.overshoot > 0.1 },
@@ -445,33 +437,32 @@ export default {
         hold: 0,
         test: () => {
           const ep = st.episode;
-          return episodeCounts(ep) && ep.reachedAt != null && ep.settledSince != null && st.time - ep.settledSince >= 3 && ep.overshoot < 0.05;
+          return episodeCounts(ep) && ep.done && ep.reachedAt != null && ep.overshoot < 0.05;
         },
       },
     };
 
     function checkTasks(realDt) {
       const taskId = ctx.lesson.steps[ctx.currentStep()]?.taskId;
-      if (!taskId || ctx.isTaskDone(taskId)) return;
       const check = TASK_CHECKS[taskId];
-      if (!check) return;
-      holds[taskId] = check.test() ? (holds[taskId] || 0) + realDt : 0;
-      if (check.test() && holds[taskId] >= check.hold) ctx.completeTask(taskId);
+      if (!check || ctx.isTaskDone(taskId)) return;
+      const ok = check.test();
+      holds[taskId] = ok ? (holds[taskId] || 0) + realDt : 0;
+      if (ok && holds[taskId] >= check.hold) ctx.completeTask(taskId);
     }
 
     // ---------- pembaruan panel (sekitar 8 kali per detik) ----------
     let lastPanel = 0;
     function refreshPanels(realDt) {
       const ego = sim.ego;
-      const kmh = ego.speed * 3.6;
       const ld = st.ldEff;
-      const deg = (ego.steer * 180) / Math.PI;
+      const lat = Math.abs(st.latAccel);
 
       ldOut.set(set.adaptive ? `${fmtLd(ld)} (adaptif)` : fmtLd(ld));
-      steerOut.set(`${fmtSigned(deg, 1)}°`);
-      speedOut.set(fmt(kmh, 0, 'km/jam'));
-      latOut.set(fmt(Math.abs(st.latAccel), 1, 'm/s²'));
-      latOut.setTone(Math.abs(st.latAccel) > 7 ? 'danger' : Math.abs(st.latAccel) > 4.5 ? 'warn' : '');
+      steerOut.set(`${fmtSigned((ego.steer * 180) / Math.PI, 1)}°`);
+      speedOut.set(fmtSpeed(ego.speed));
+      latOut.set(fmt(lat, 1, 'm/s²'));
+      latOut.setTone(lat > 7 ? 'danger' : lat > 4.5 ? 'warn' : '');
 
       const terms = sim.pid.terms;
       pOut.set(fmtSigned(terms.p, 2));
@@ -482,20 +473,14 @@ export default {
 
       // hasil putaran
       const lap = st.lastLap;
-      if (lap) {
-        rmsOut.set(fmt(lap.rms, 2, 'm'));
-        rmsOut.setTone(lap.takeover ? 'off' : lap.rms < 0.3 ? 'ok' : lap.rms < 1 ? 'warn' : 'danger');
-        maxOut.set(fmt(lap.max, 2, 'm'));
-        maxOut.setTone(lap.takeover ? 'off' : '');
-        avgOut.set(fmt(lap.avgKmh, 0, 'km/jam'));
-        avgOut.setTone(lap.takeover ? 'off' : '');
-      } else {
-        rmsOut.set('-');
-        maxOut.set('-');
-        avgOut.set('-');
-        for (const r of [rmsOut, maxOut, avgOut]) r.setTone('');
-      }
-      lapOut.set(st.takeover ? 'diambil alih' : `${fmt(sim.lapProgress() * 100, 0)}%`);
+      const lapTone = lap?.takeover ? 'off' : '';
+      rmsOut.set(lap ? fmt(lap.rms, 2, 'm') : '-');
+      rmsOut.setTone(lap && !lap.takeover ? errorTone(lap.rms) : lapTone);
+      maxOut.set(lap ? fmt(lap.max, 2, 'm') : '-');
+      maxOut.setTone(lapTone);
+      avgOut.set(lap ? fmt(lap.avgKmh, 0, 'km/jam') : '-');
+      avgOut.setTone(lapTone);
+      lapOut.set(st.takeover ? 'diambil alih' : fmtPercent(sim.lapProgress()));
       lapOut.setTone(st.takeover ? 'warn' : '');
 
       // hasil uji kecepatan
@@ -503,27 +488,29 @@ export default {
       let epNote = '';
       if (ep) {
         const measured = ep.valid;
-        osOut.set(measured ? `${fmt(ep.overshoot * 100, 1)}%` : 'tidak diukur');
+        osOut.set(measured ? fmtPercent(ep.overshoot, 1) : 'tidak diukur');
         osOut.setTone(!measured || ep.stale ? 'off' : ep.reachedAt == null ? '' : ep.overshoot > 0.1 ? 'danger' : ep.overshoot >= 0.05 ? 'warn' : 'ok');
         // waktu mencapai target tetap berarti untuk lonjakan turun, selama uji tidak terganggu
         reachOut.set(ep.spoiled ? '-' : ep.reachedAt != null ? fmt(ep.reachedAt, 1, 'detik') : 'belum');
         reachOut.setTone(ep.spoiled || ep.stale ? 'off' : '');
         if (ep.spoiled === 'tikungan') epNote = 'Overshoot tidak diukur karena Pelan di tikungan sempat menyala. Matikan sakelarnya, lalu tekan Uji dari diam.';
+        else if (ep.spoiled === 'bundaran') epNote = 'Overshoot tidak diukur karena mobil sudah harus melambat untuk bundaran sebelum kecepatannya tenang. Tekan Uji dari diam.';
         else if (ep.spoiled) epNote = 'Overshoot tidak diukur karena pengemudi cadangan sempat mengambil alih.';
         else if (ep.dir < 0) epNote = 'Overshoot hanya diukur saat kecepatan target naik, misalnya dengan Uji dari diam.';
         else if (ep.stale) epNote = 'Nilai Kp, Ki, atau Kd berubah. Tekan Uji dari diam untuk mengukur lagi.';
-        else if (ep.step < MIN_STEP_KMH * KMH - 1e-6) epNote = 'Lonjakan kecepatan kurang dari 10 km/jam, terlalu kecil untuk tugas.';
+        else if (ep.step < MIN_STEP) epNote = 'Lonjakan kecepatan kurang dari 10 km/jam, terlalu kecil untuk tugas.';
+        else if (ep.done) epNote = 'Uji selesai: kecepatan sudah tenang di dekat target selama 3 detik.';
       }
       let lapNote = '';
       if (lap?.takeover && !st.takeover) lapNote = 'Putaran terakhir tidak dihitung karena pengemudi cadangan sempat mengambil alih.';
-      const noteText = [lapNote, epNote].filter(Boolean).join(' ') || 'Uji dari diam mengembalikan mobil ke garis start, lalu mobil melaju lagi dari 0 km/jam.';
+      const noteText = [lapNote, epNote].filter(Boolean).join(' ') || DEFAULT_NOTE;
       if (resultNote.textContent !== noteText) resultNote.textContent = noteText;
 
       // HUD
       ldChip.set(set.adaptive ? `${fmtLd(ld)} adaptif` : fmtLd(ld));
-      speedChip.set(`${fmt(kmh, 0)} / ${fmt(st.vRef * 3.6, 0)} km/jam`);
+      speedChip.set(`${fmt(msToKmh(ego.speed))} / ${fmtSpeed(st.vRef)}`);
       cteChip.set(fmtSigned(st.cte, 2, 'm'));
-      const tone = Math.abs(st.cte) < 0.3 ? 'ok' : Math.abs(st.cte) < 1 ? 'warn' : 'danger';
+      const tone = errorTone(st.cte);
       cteChip.setTone(tone);
       cteChip.el.style.setProperty('--tone', TRAIL_COLORS[tone]);
       takeoverChip.show(!!st.takeover);
@@ -534,7 +521,7 @@ export default {
         const now = performance.now();
         if (now - takeoverToastAt > 20000) {
           takeoverToastAt = now;
-          ctx.toast('Mobil berayun terlalu keras. Pengemudi cadangan mengambil alih sebentar.', { tone: 'warn', duration: 3500 });
+          ctx.toast(`${takeoverText(st.lastTakeover)} Pengemudi cadangan mengambil alih sebentar.`, { tone: 'warn', duration: 3500 });
         }
       }
 
@@ -543,21 +530,31 @@ export default {
     }
 
     // ---------- baris status ----------
+    /** Jarak (m) dari posisi mobil ke awal zona bundaran berikutnya. */
+    const distanceToNextZone = () => Math.min(...track.zones.map((z) => (((z.s0 - st.s) % track.length) + track.length) % track.length));
+
     function updateStatus() {
-      const kmh = sim.ego.speed * 3.6;
+      const kmh = msToKmh(sim.ego.speed);
       const ld = fmtLd(st.ldEff);
       const sw = weaving();
+      const inZone = !!zoneAt(track, st.s);
       let text;
       if (st.takeover) {
-        text = 'Mobil berayun terlalu keras. Pengemudi cadangan mengambil alih dan membawanya pelan-pelan kembali ke tengah lajur.';
+        text = `${takeoverText(st.takeover)} Pengemudi cadangan mengambil alih dan membawanya kembali ke tengah lajur.`;
       } else if (kmh < 1 && sim.ego.speed < st.vRef) {
-        text = `Mobil mulai melaju dari garis start menuju ${fmt(st.vRef * 3.6, 0)} km/jam.`;
+        text = `Mobil mulai melaju dari garis start menuju ${fmtSpeed(st.vRef)}.`;
       } else if (sw.swings >= 2) {
         text = `Mobil berayun kiri kanan ${fmt(sw.frequency, 1)} kali per detik (simpangan ${fmt(sw.amplitude, 1)} m). Ld ${ld} terlalu pendek untuk ${fmt(kmh, 0)} km/jam.`;
-      } else if (cuttingInside() && st.ldEff >= 10) {
+      } else if (cuttingInside(st) && st.ldEff >= 10) {
         text = `Mobil memotong tikungan ${fmt(Math.abs(st.cte), 1)} m ke sisi dalam karena titik tujuannya terlalu jauh.`;
+      } else if (inZone) {
+        text = `Mobil di bundaran, melaju ${fmt(kmh, 0)} km/jam dengan Ld ${ld}. Galat lintasan ${fmt(Math.abs(st.cte), 2)} m.`;
+      } else if (st.zoneLimited) {
+        text = `Mobil melambat ke ${fmt(CFG.zoneKmh, 0)} km/jam karena bundaran tinggal ${fmt(distanceToNextZone(), 0)} m lagi.`;
       } else {
-        text = `Mobil melaju ${fmt(kmh, 0)} km/jam dengan Ld ${ld}. Galat lintasan ${fmt(Math.abs(st.cte), 2)} m${Math.abs(st.cte) >= 0.005 ? (st.cte > 0 ? ' ke kanan' : ' ke kiri') : ''}.`;
+        const side = Math.abs(st.cte) >= 0.005 ? (st.cte > 0 ? ' ke kanan' : ' ke kiri') : '';
+        const zoneHint = st.ldEff >= 15 ? ` Bundaran berikutnya ${fmt(distanceToNextZone(), 0)} m lagi.` : '';
+        text = `Mobil melaju ${fmt(kmh, 0)} km/jam dengan Ld ${ld}. Galat lintasan ${fmt(Math.abs(st.cte), 2)} m${side}.${zoneHint}`;
       }
       ctx.setStatus(text);
     }
@@ -580,7 +577,10 @@ export default {
       view.centerOn(ra.x + camOffset.x, ra.y + camOffset.y);
     }
 
-    /** Letak penunjuk setir, peta mini, dan skala jarak (piksel CSS) untuk ukuran kanvas sekarang. */
+    /**
+     * Letak penunjuk setir, peta mini, skala jarak, dan lencana atribusi (piksel CSS) untuk ukuran
+     * kanvas sekarang. Lencana atribusi duduk tepat di atas kotak di pojok kanan bawah.
+     */
     function overlayLayout() {
       const W = view.width;
       const H = view.height;
@@ -595,12 +595,15 @@ export default {
         // skala jarak di atas kotak kiri bawah
         scaleAt = { x: m + 4, y: H - (narrow ? gauge.h : mini.h) - m - 12 };
       }
+      const rightBox = [gaugeRect, miniRect].find((r) => r && r.x + r.w >= W - m - 1);
+      const attribY = rightBox.y - ATTRIB_H - 4;
+      const attrib = { corner: 'bottom-right', margin: m, offsetY: H - m - ATTRIB_H - attribY };
+      const attribRect = { x: W - m - ATTRIB_W, y: attribY, w: ATTRIB_W, h: ATTRIB_H };
       const scaleRect = { x: scaleAt.x - 2, y: scaleAt.y - 16, w: 140, h: 20 };
-      return { gaugeRect, miniRect, scaleAt, avoid: [gaugeRect, miniRect, scaleRect, hudRect].filter(Boolean) };
+      return { gaugeRect, miniRect, scaleAt, attrib, avoid: [gaugeRect, miniRect, scaleRect, attribRect, hudRect].filter(Boolean) };
     }
 
     // Kotak gabungan chip HUD yang terlihat (piksel CSS relatif ke kanvas), diukur bersama panel.
-    let hudRect = null;
     function measureHud() {
       const chips = [...ctx.hud.children].filter((c) => !c.hidden);
       if (!chips.length || !view.canvas) {
@@ -608,26 +611,14 @@ export default {
         return;
       }
       const cr = view.canvas.getBoundingClientRect();
-      let x0 = Infinity;
-      let y0 = Infinity;
-      let x1 = -Infinity;
-      let y1 = -Infinity;
-      for (const c of chips) {
-        const r = c.getBoundingClientRect();
-        x0 = Math.min(x0, r.left);
-        y0 = Math.min(y0, r.top);
-        x1 = Math.max(x1, r.right);
-        y1 = Math.max(y1, r.bottom);
-      }
+      const rs = chips.map((c) => c.getBoundingClientRect());
+      const x0 = Math.min(...rs.map((r) => r.left));
+      const y0 = Math.min(...rs.map((r) => r.top));
+      const x1 = Math.max(...rs.map((r) => r.right));
+      const y1 = Math.max(...rs.map((r) => r.bottom));
       hudRect = { x: x0 - cr.left - 4, y: y0 - cr.top - 4, w: x1 - x0 + 8, h: y1 - y0 + 8 };
       // tinggi HUD berubah (misalnya chip pengemudi cadangan muncul): atur ulang tampilan seluruh lintasan
       if (camera === 'semua' && Math.abs(hudRect.y + hudRect.h - fitHudBottom) > 2) view.fit(overviewBounds, OVERVIEW_PAD);
-    }
-
-    function overlays(g, layout) {
-      scene.drawGauge(g, view, sim, layout.gaugeRect);
-      if (layout.miniRect) scene.drawMinimap(g, view, sim, layout.miniRect);
-      drawScaleBar(g, view, layout.scaleAt);
     }
 
     function render() {
@@ -636,16 +627,22 @@ export default {
       lastFrame = now;
       placeCamera(ctx.paused ? 0 : realDt);
       const layout = overlayLayout();
-      const g = view.begin(COLORS.ground);
-      scene.draw(g, { view, sim, overview: camera === 'semua', labels, avoid: layout.avoid });
+      const g = view.begin();
+      scene.draw(g, { view, sim, overview: camera === 'semua', labels, avoid: layout.avoid, zoneKmh: CFG.zoneKmh });
       labels.draw(g, view);
-      overlays(g, layout);
+      scene.drawGauge(g, view, sim, layout.gaugeRect);
+      if (layout.miniRect) scene.drawMinimap(g, view, sim, layout.miniRect);
+      drawScaleBar(g, view, layout.scaleAt);
+      // atribusi OpenStreetMap paling akhir supaya tidak tertutup apa pun
+      scene.drawAttribution(g, view, layout.attrib);
 
       if (now - lastPanel > 120) {
         refreshPanels(lastPanel ? Math.min(0.5, (now - lastPanel) / 1000) : 0);
         measureHud();
         lastPanel = now;
-        view.setLabel(`Lintasan uji dari atas. Mobil otonom melaju ${fmt(sim.ego.speed * 3.6, 0)} km/jam dengan lookahead ${fmtLd(st.ldEff)}, galat lintasan ${fmt(Math.abs(st.cte), 1)} m.`);
+        view.setLabel(
+          `Peta boulevard Villa Puncak Tidar dari atas (© Kontributor OpenStreetMap). Mobil otonom melaju ${fmtSpeed(sim.ego.speed)} dengan lookahead ${fmtLd(st.ldEff)}, galat lintasan ${fmt(Math.abs(st.cte), 1)} m.`,
+        );
       }
     }
 
@@ -657,29 +654,31 @@ export default {
       onStep(i) {
         const p = STEP_PRESETS[i];
         if (!p) return;
-        if (p.adaptive != null) setMode(p.adaptive);
-        if (p.ld != null) setLd(p.ld);
-        if (p.targetKmh != null) setTarget(p.targetKmh);
-        if (p.curveSlow != null) setCurveSlow(p.curveSlow);
-        if (p.gains) setGains(p.gains);
+        setMode(false);
+        set.ld = p.ld;
+        ldSlider.set(p.ld);
+        if (set.targetKmh !== 40) {
+          set.targetKmh = 40;
+          targetSlider.set(40);
+          sim.notifyTargetChange();
+        }
+        set.curveSlow = false;
+        curveToggle.set(false);
+        if (p.gains) {
+          for (const [k, v] of Object.entries(p.gains)) {
+            set[k] = v;
+            gainSliders[k].set(v);
+          }
+          sim.notifyGainChange();
+        }
         st.lastLap = null;
         sim.notifyTrackingChange();
-        if (p.restart) restartFromStandstill();
+        if (p.restart) restart();
         stepStart = st.time;
-        for (const k of Object.keys(holds)) holds[k] = 0;
+        holds = {};
         refreshPanels(0);
       },
-      reset() {
-        sim.reset();
-        clearCharts();
-        stepStart = 0;
-        lastTakeoverCount = 0;
-        for (const k of Object.keys(holds)) holds[k] = 0;
-        refreshPanels(0);
-      },
-      destroy() {
-        // Kanvas, loop, dan listener dibersihkan otomatis oleh ctx.
-      },
+      reset: restart,
     };
   },
 };

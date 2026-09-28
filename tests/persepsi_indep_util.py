@@ -1,4 +1,4 @@
-"""Alat bantu QA mandiri untuk pelajaran Persepsi (port 8133)."""
+"""Alat bantu QA mandiri untuk pelajaran Persepsi (port bawaan 8243, bisa diganti dengan --port P)."""
 import json
 import sys
 import time
@@ -7,8 +7,9 @@ from playwright.sync_api import sync_playwright
 
 CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-arm64/"
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
-BASE = "http://127.0.0.1:8133/"
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/persepsi-qa/"
+PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8243"
+BASE = f"http://127.0.0.1:{PORT}/"
+SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/persepsi-malang/"
 ROUTE = "#/pelajaran/persepsi"
 
 

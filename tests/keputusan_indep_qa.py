@@ -1,9 +1,10 @@
-"""QA independen pelajaran Pengambilan Keputusan, lewat UI seperti pelajar.
+"""QA independen pelajaran Pengambilan Keputusan (Jalan Kawi, Malang), lewat UI seperti pelajar.
 
-Pemakaian: python3 tests/keputusan_indep_qa.py [--mobile] [--port 8137]
-Memeriksa: tugas tidak selesai sendiri, keempat tugas lewat klik/tombol keyboard, kedua cabang
-dilema kuning, Jeda/Ulangi/kecepatan, maju mundur langkah, ringkasan, masuk keluar 5 kali
-(loop, kanvas, style, dan listener keyboard tidak bocor), dan konsol bersih.
+Pemakaian: python3 tests/keputusan_indep_qa.py [--mobile] [--port 8247]
+Memeriksa: tugas tidak selesai sendiri, keempat tugas lewat klik/tombol keyboard (P dan A), permintaan
+pejalan kaki yang ditunda karena mobil sudah terlalu dekat, kedua cabang dilema kuning,
+Jeda/Ulangi/kecepatan, maju mundur langkah, ringkasan, masuk keluar 5 kali (loop, kanvas, style,
+kait uji, dan listener keyboard tidak bocor), penghitung perisai tetap 0, dan konsol bersih.
 """
 import json
 import re
@@ -14,9 +15,9 @@ from playwright.sync_api import sync_playwright
 
 CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-arm64/"
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
-PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8137"
+PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8247"
 BASE = f"http://127.0.0.1:{PORT}/"
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/keputusan-qa/"
+SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/keputusan-malang/"
 MOBILE = "--mobile" in sys.argv
 TAG = "m" if MOBILE else "d"
 
@@ -156,19 +157,24 @@ def main():
         if res["red-stop"] is None:
             fail("red-stop tidak selesai")
 
-        # ---------- 4. tugas langkah 2: pejalan kaki lewat tombol keyboard J (desktop) ----------
+        # ---------- 4. tugas langkah 2: pejalan kaki lewat tombol keyboard P (desktop) ----------
         go_step(1)
-        # pelajar membaca teks dulu: tekan J setelah mobil melewati zebra cross pertama (2x)
+        # pelajar membaca teks dulu: tekan P saat mobil sudah melewati zebra cross (2x). Permintaan
+        # harus ditunda dengan penjelasan, lalu pejalan kaki muncul saat mobil datang lagi dari awal ruas.
         page.wait_for_timeout(6500)
         if MOBILE:
             btn("Munculkan pejalan kaki")
         else:
             page.locator("body").click(position={"x": 5, "y": 300})
-            page.keyboard.press("j")
+            page.keyboard.press("p")
         page.wait_for_timeout(400)
-        res["pedLogAfterSpawn"] = [t for t in log_items() if "Pejalan kaki muncul" in t]
+        res["pedQueuedNote"] = [t for t in log_items() if "muncul saat mobil datang lagi" in t]
+        if len(res["pedQueuedNote"]) != 1:
+            fail(f"permintaan pejalan kaki yang terlambat tidak dijelaskan: {log_items()[:3]}")
+        spawned = wait_until(lambda: [t for t in log_items() if "muncul di tepi zebra cross" in t], 40)
+        res["pedLogAfterSpawn"] = spawned or []
         if len(res["pedLogAfterSpawn"]) != 1:
-            fail(f"J/tombol memunculkan {len(res['pedLogAfterSpawn'])} pejalan kaki, harusnya 1")
+            fail(f"P/tombol memunculkan {len(res['pedLogAfterSpawn'])} pejalan kaki, harusnya 1")
         page.wait_for_timeout(1200)
         top()
         shot("2-pejalan-jauh")
@@ -217,14 +223,14 @@ def main():
         if "TERUS" not in res["yellowGo"]:
             fail("cabang terus tidak tampil")
 
-        # ---------- 6. tugas langkah 4: mobil mogok lewat tombol M (desktop) ----------
+        # ---------- 6. tugas langkah 4: angkot ngetem lewat tombol A (desktop) ----------
         go_step(3)
         page.wait_for_timeout(500)
         if MOBILE:
-            btn("Taruh mobil mogok")
+            btn("Taruh angkot ngetem")
         else:
             page.locator("body").click(position={"x": 5, "y": 300})
-            page.keyboard.press("m")
+            page.keyboard.press("a")
         res["observeSeen"] = bool(wait_until(lambda: "mengamati apakah" in status(), 60, 50))
         res["statusObserve"] = status()
         res["waitSeen"] = bool(wait_until(lambda: "MENUNGGU CELAH" in status(), 60))
@@ -233,13 +239,13 @@ def main():
         top()
         shot("4-celah")
         res["status4a"] = status()
-        res["gapReadout4a"] = readout("Mobil lawan tiba")
+        res["gapReadout4a"] = readout("Kendaraan lawan tiba")
         inz = wait_until(lambda: "zona salip" in status(), 25, 50)
         if inz:
             top()
             shot("4-celah-zona")
             res["statusInZone"] = status()
-            res["gapReadoutInZone"] = readout("Mobil lawan tiba")
+            res["gapReadoutInZone"] = readout("Kendaraan lawan tiba")
         res["salipSeen"] = bool(wait_until(lambda: "MENYALIP" in status(), 90))
         page.wait_for_timeout(900)
         top()
@@ -303,14 +309,18 @@ def main():
         top()
         shot("6-ringkasan", full=True)
         res["summary"] = page.locator(".step-card").first.inner_text()[:400]
-        res["progress"] = page.evaluate("() => localStorage.getItem('simotonom.progress.v1')")
+        res["progress"] = page.evaluate("() => localStorage.getItem('liveshuttle.progress.v1')")
+        res["shield"] = page.evaluate("() => window.__keputusan && window.__keputusan.counters")
+        if not res["shield"] or res["shield"]["redRuns"] or res["shield"]["pedContacts"] or res["shield"]["clamps"]:
+            fail(f"penghitung perisai tidak 0: {res['shield']}")
 
         # ---------- 9. masuk keluar 5 kali ----------
         for _ in range(5):
             page.evaluate("() => { location.hash = '#/'; }")
             page.wait_for_timeout(500)
-            page.keyboard.press("j")
-            page.keyboard.press("m")
+            page.keyboard.press("p")
+            page.keyboard.press("a")
+            res.setdefault("hookOnHome", []).append(page.evaluate("() => typeof window.__keputusan"))
             page.evaluate("() => { location.hash = '#/pelajaran/keputusan'; }")
             page.wait_for_function("() => window.__simotonom.lessonStatus === 'ready'", timeout=8000)
             page.wait_for_timeout(500)
@@ -323,11 +333,13 @@ def main():
         go_step(1)
         page.wait_for_timeout(300)
         page.locator("body").click(position={"x": 5, "y": 300})
-        page.keyboard.press("j")
+        page.keyboard.press("p")
         page.wait_for_timeout(400)
-        res["leak"]["pedsAfterOneJ"] = len([t for t in log_items() if "Pejalan kaki muncul" in t])
-        if res["leak"]["activeLoops"] != 1 or res["leak"]["canvases"] != 1 or res["leak"]["styles"] != 1 or res["leak"]["pedsAfterOneJ"] != 1:
+        res["leak"]["pedsAfterOneP"] = len([t for t in log_items() if "muncul di tepi zebra cross" in t])
+        if res["leak"]["activeLoops"] != 1 or res["leak"]["canvases"] != 1 or res["leak"]["styles"] != 1 or res["leak"]["pedsAfterOneP"] != 1:
             fail(f"bocor: {res['leak']}")
+        if any(h != "undefined" for h in res["hookOnHome"]):
+            fail(f"kait uji tertinggal di beranda: {res['hookOnHome']}")
         page.evaluate("() => { location.hash = '#/'; }")
         page.wait_for_timeout(600)
         res["homeStyles"] = page.evaluate("() => document.querySelectorAll('style[data-lesson]').length")

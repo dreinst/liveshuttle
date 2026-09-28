@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <title>Galeri toolkit Malang (uji situs)</title>
+    <link rel="stylesheet" href="../css/style.css" />
+    <link rel="icon" href="../favicon.svg" />
+    <style>
+      body { padding: 16px; background: #0b1220; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .cell { position: relative; height: 420px; border: 1px solid #24314f; border-radius: 12px; overflow: hidden; }
+      .cell.tall { height: 560px; }
+      .cap { position: absolute; left: 8px; top: 6px; z-index: 5; color: #e2e8f0; font: 600 12px system-ui; background: rgba(11,18,32,.8); padding: 2px 6px; border-radius: 6px; }
+      #log { color: #94a3b8; font: 12px ui-monospace, monospace; white-space: pre-wrap; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="grid">
+      <div class="cell" id="c1"><span class="cap">machung ikhtisar</span></div>
+      <div class="cell" id="c2"><span class="cap">machung skala jalan + rute A*</span></div>
+      <div class="cell" id="c3"><span class="cap">malang-roads + lampu asli + rute waktu</span></div>
+      <div class="cell" id="c4"><span class="cap">malang-center skala jalan</span></div>
+      <div class="cell" id="c5"><span class="cap">kendaraan Malang</span></div>
+      <div class="cell" id="c6"><span class="cap">LiDAR tenang</span></div>
+    </div>
+    <div class="controls" id="w" style="margin-top:12px"></div>
+    <div id="log"></div>
+    <script type="module">
+      import { View } from '../js/engine/canvas.js';
+      import { COLORS } from '../js/engine/theme.js';
+      import * as D from '../js/engine/draw.js';
+      import * as O from '../js/engine/osm2d.js';
+      const log = (s) => (document.getElementById('log').textContent += s + '\n');
+      window.__gallery = { done: false, errors: [] };
+      try {
+        const t0 = performance.now();
+        const [mc, mr, ct] = await Promise.all([O.loadMap('machung'), O.loadMap('malang-roads'), O.loadMap('malang-center')]);
+        log(`load ${Math.round(performance.now() - t0)} ms; machung roads ${mc.roads.length} bld ${mc.buildings.length}; malang roads ${mr.roads.length} nodes ${mr.nodes.length} signals ${mr.signals.length}; center bld ${ct.buildings.length} signals ${ct.signals.length}`);
+
+        // 1: ikhtisar machung
+        {
+          const v = new View(document.getElementById('c1'), { bounds: mc.bounds, padding: 0 });
+          const r = O.createMapRenderer(mc, { layers: { places: true } });
+          const g = v.begin();
+          r.draw(g, v);
+          log(`c1 scale ${v.camera.scale.toFixed(2)}`);
+        }
+        // 2: skala jalan machung dengan rute
+        {
+          const v = new View(document.getElementById('c2'), { bounds: mc.boundsAround(mc.campus.x, mc.campus.y, 160, 110), padding: 0 });
+          const r = O.createMapRenderer(mc);
+          const graph = mc.graph({ cost: 'time' });
+          const a = graph.nearestNode(mc.campus.x - 140, mc.campus.y + 80).id;
+          const b = graph.nearestNode(mc.campus.x + 150, mc.campus.y - 90).id;
+          const t1 = performance.now();
+          const res = graph.findRoute(a, b, { algorithm: 'astar' });
+          const res2 = graph.findRoute(a, b, { algorithm: 'dijkstra' });
+          log(`c2 A* found ${res.found} cost ${res.cost?.toFixed(1)} exp ${res.expanded}; dijkstra cost ${res2.cost?.toFixed(1)} exp ${res2.expanded}; ${Math.round(performance.now() - t1)} ms`);
+          const pts = graph.routePoints(res.path, { keepLeft: true, smooth: 4 });
+          const g = v.begin();
+          r.draw(g, v);
+          O.highlightRoad(g, v, pts, { color: COLORS.accent, width: 4 });
+          const path = graph.routePath(res.path, { keepLeft: true, smooth: 4 });
+          const p = path.sample(path.length * 0.4);
+          D.drawShuttle(g, { ...p }, { view: v, ego: true, minPx: 18 });
+          const hit = mc.nearestRoad(mc.campus.x, mc.campus.y + 60);
+          D.drawMarker(g, hit.x, hit.y, { view: v });
+          D.drawLabel(g, v, hit.x, hit.y, O.shortStreetName(hit.road.name || hit.road.classLabel), { dy: -16 });
+          log(`c2 nearestRoad ${hit.road.name} ${hit.road.cls} dist ${hit.dist.toFixed(1)} w ${hit.road.width}`);
+        }
+        // 3: jaringan Malang
+        {
+          const v = new View(document.getElementById('c3'), { bounds: mr.bounds, padding: 0 });
+          const r = O.createMapRenderer(mr, { layers: { markings: false } });
+          const graph = mr.graph({ cost: 'time' });
+          const start = graph.nearestNode(0, 0).id;
+          const alun = mr.toMap ? ct.project(-7.9826, 112.6308) : null;
+          const goalXY = mr.project(-7.9826, 112.6308);
+          const goal = graph.nearestNode(goalXY.x, goalXY.y).id;
+          const t1 = performance.now();
+          const s = graph.search(start, goal, { algorithm: 'astar' });
+          let n = 0;
+          for (const _ of s.steps()) n++;
+          const ms = Math.round(performance.now() - t1);
+          const g = v.begin();
+          r.draw(g, v, { attribution: false });
+          O.drawSignalDots(g, v, mr.signals);
+          if (s.found) O.highlightRoad(g, v, graph.routePoints(s.path), { color: COLORS.accent, width: 3 });
+          r.drawAttribution(g, v);
+          log(`c3 graph nodes ${graph.nodes.size}; A* time found ${s.found} ${Math.round(s.cost)} s, ${(graph.routeLength(s.path) / 1000).toFixed(2)} km, expanded ${n} in ${ms} ms`);
+        }
+        // 4: pusat kota
+        {
+          const v = new View(document.getElementById('c4'), { bounds: ct.boundsAround(0, 0, 170, 120), padding: 0 });
+          const r = O.createMapRenderer(ct, { layers: { places: true } });
+          const g = v.begin();
+          r.draw(g, v);
+          for (const sgl of ct.signals) {
+            const near = ct.nearestRoad(sgl.x, sgl.y, { drivable: true });
+            D.drawTrafficSignal(g, { x: sgl.x, y: sgl.y, heading: (near?.heading ?? 0) + Math.PI, state: 'red' }, { view: v, arm: 0, minPx: 14 });
+          }
+          const tall = ct.buildings.filter((b) => b.heightFromOsm).length;
+          for (const [name, m, bounds] of [['center', ct, ct.boundsAround(0, 0, 170, 120)], ['machung', mc, mc.boundsAround(40, 150, 220, 140)], ['malang-all', mr, mr.bounds], ['malang-street', mr, mr.boundsAround(3500, 2000, 200, 130)]]) {
+            v.fit(bounds, 0);
+            const t0 = performance.now();
+            for (let k = 0; k < 5; k++) O.drawMap(v.begin(), v, m);
+            log(`paint ${name} scale ${v.camera.scale.toFixed(2)}: ${((performance.now() - t0) / 5).toFixed(1)} ms`);
+          }
+          v.fit(ct.boundsAround(0, 0, 170, 120), 0);
+          r.draw(v.begin(), v);
+          log(`c4 center: buildings with OSM height ${tall}`);
+        }
+        // 5: kendaraan
+        {
+          const v = new View(document.getElementById('c5'), { bounds: { minX: -14, minY: -9, maxX: 14, maxY: 9 }, padding: 0 });
+          const g = v.begin(COLORS.asphalt);
+          D.drawAngkot(g, { x: -9, y: -5, heading: 0, code: 'AL' }, { view: v });
+          D.drawAngkot(g, { x: -9, y: 0, heading: 0, code: 'ADL', braking: true }, { view: v, doorOpen: true });
+          D.drawMotor(g, { x: -2, y: -6, heading: 0 }, { view: v, helmet: COLORS.helmets[2] });
+          D.drawMotor(g, { x: -2, y: -3.5, heading: 0.3, passenger: true }, { view: v, braking: true });
+          D.drawCityCar(g, { x: 3, y: -5, heading: 0, color: '#94a3b8' }, { view: v });
+          D.drawMPV(g, { x: 9, y: -5, heading: 0, color: '#e2e8f0' }, { view: v });
+          D.drawBus(g, { x: 5, y: 0.5, heading: 0, length: 7.5, width: 2.2, code: 'Shuttle' }, { view: v, braking: true });
+          D.drawShuttle(g, { x: -1, y: 1, heading: Math.PI, braking: true }, { view: v, ego: true });
+          const vars = ['default', 'hijab', 'backpack', 'umbrella'];
+          vars.forEach((variant, i) => D.drawPedestrian(g, { x: -10 + i * 2, y: 6, heading: -Math.PI / 2 }, { view: v, variant, minPx: 16 }));
+          D.drawHalteSign(g, { x: 0, y: 6, label: 'Halte Ma Chung' }, { view: v });
+          ['red', 'yellow', 'green'].forEach((state, i) => D.drawTrafficSignal(g, { x: 5 + i * 3, y: 7, heading: -Math.PI / 2, state }, { view: v, arm: 2.5, minPx: 18, simulated: i === 0 }));
+        }
+        // 6: LiDAR tenang
+        {
+          const v = new View(document.getElementById('c6'), { bounds: { minX: -30, minY: -20, maxX: 30, maxY: 20 }, padding: 0 });
+          const trail = D.createLidarTrail({ fade: 1.5 });
+          const origin = { x: 0, y: 0 };
+          for (let k = 0; k < 10; k++) {
+            const pts = [];
+            for (let i = 0; i < 360; i += 2) {
+              const a = (i * Math.PI) / 180;
+              const r = 12 + 4 * Math.sin(a * 3) + (k % 3) * 0.1;
+              pts.push({ x: Math.cos(a) * r - k * 0.3, y: Math.sin(a) * r });
+            }
+            trail.add(pts, k * 0.1);
+          }
+          const g = v.begin();
+          D.drawLidarRange(g, origin, 20, COLORS.lidar, { view: v });
+          D.drawLidarSweep(g, origin, D.lidarSweepAngle(3), 20);
+          trail.draw(g, 1.0, COLORS.lidar, { view: v });
+          D.drawShuttle(g, { x: 0, y: 0, heading: 0 }, { view: v, ego: true });
+          log(`c6 trail points ${trail.count}`);
+        }
+        // widget: grafik dengan celah dan skala log, note.setTone, hudChip.setLabel, holdButton.setDisabled, slider.setHint
+        {
+          const ui = await import('../js/engine/ui.js');
+          const w = document.getElementById('w');
+          const g1 = ui.group(w, { title: 'Grafik' });
+          const ch = ui.timeChart(g1, { label: 'celah', series: [{ label: 'a', color: COLORS.lidar }, { label: 'b', color: COLORS.radar }], span: 10 });
+          const ch2 = ui.timeChart(g1, { label: 'log', series: [{ label: 'galat', color: COLORS.warn }], span: 10, scale: 'log', unit: 'm' });
+          for (let i = 0; i <= 100; i++) {
+            const t = i / 10;
+            ch.push(t, t > 3 && t < 6 ? NaN : Math.sin(t), Math.cos(t) * 0.5);
+            ch2.push(t, 0.05 * Math.pow(1.6, t));
+          }
+          ch.draw();
+          ch2.draw();
+          const g2 = ui.group(w, { title: 'Widget' });
+          const n = ui.note(g2, 'Catatan awal', { tone: 'info' });
+          n.setTone('warn');
+          n.setHtml('Catatan <strong>berubah</strong>');
+          const sl = ui.slider(g2, { label: 'Slider', min: 0, max: 10, step: 1, value: 3 });
+          sl.setHint('Petunjuk baru');
+          sl.setRange(0, 20);
+          const hb = ui.holdButton(g2, { label: 'Tahan' });
+          hb.setActive(true);
+          hb.setDisabled(true);
+          const seg = ui.segmented(g2, { label: 'Segmen', options: [{ value: 1, label: 'Satu' }, { value: 2, label: 'Dua' }] });
+          const hud = document.createElement('div');
+          hud.className = 'hud';
+          hud.style.position = 'relative';
+          g2.append(hud);
+          const chip = ui.hudChip(hud, {});
+          chip.set('12 m');
+          chip.setLabel('Jarak');
+          log(`widgets: hold active after disable ${hb.active}, disabled ${hb.el.disabled}, note class ${n.className}, hint ${sl.el.querySelector('.ctl-note')?.textContent}, max ${sl.input.max}, chip ${chip.el.textContent}`);
+        }
+        window.__gallery.done = true;
+      } catch (err) {
+        window.__gallery.errors.push(String(err && err.stack || err));
+        log('ERROR ' + (err && err.stack || err));
+        window.__gallery.done = true;
+      }
+    </script>
+  </body>
+</html>

@@ -16,7 +16,7 @@ CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-
 MOBILE = "--mobile" in sys.argv
 PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8114"
 BASE = f"http://127.0.0.1:{PORT}/"
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/lokalisasi/"
+SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/lokalisasi-malang/lama/"
 TAG = "m" if MOBILE else "d"
 os.makedirs(SHOTS, exist_ok=True)
 
@@ -148,7 +148,7 @@ with sync_playwright() as pw:
     # kemudi dengan estimasi Peta: mobil harus tetap di lajur
     toggle(page, "Kemudikan dengan estimasi")
     page.wait_for_timeout(6000)
-    results["steer-map"] = {"keluar": readout(page, "Keluar lajur"), "ambil": readout(page, "Diambil alih"), "simpangan": readout(page, "Simpangan lajur")}
+    results["steer-map"] = {"keluar": readout(page, "Keluar lajur"), "ambil": readout(page, "Diambil alih"), "simpangan": readout(page, "Jarak ke tengah lajur")}
     top(page)
     shot(page, "5b-kemudi-peta", full=True)
 
@@ -173,7 +173,7 @@ with sync_playwright() as pw:
     results["summaryStep"] = hook(page)["stepIndex"]
     top(page)
     shot(page, "6-ringkasan")
-    prog = page.evaluate("() => JSON.parse(localStorage.getItem('simotonom.progress.v1'))")
+    prog = page.evaluate("() => JSON.parse(localStorage.getItem('liveshuttle.progress.v1'))")
     results["progress"] = prog["lessons"].get("lokalisasi") if prog else None
 
     # navigasi berulang: tidak boleh ada loop, kanvas, atau style yang tertinggal

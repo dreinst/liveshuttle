@@ -1,7 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <rect x="1" y="1" width="30" height="30" rx="9" fill="#0d2826" stroke="#2dd4bf" stroke-opacity=".4"/>
-  <path d="M8.5 12.2a10 10 0 0 1 15 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".5"/>
-  <path d="M11.2 15a6 6 0 0 1 9.6 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".9"/>
-  <rect x="12.2" y="16.6" width="7.6" height="11" rx="2.6" fill="#2dd4bf"/>
-  <rect x="13.5" y="18.5" width="5" height="2.4" rx=".8" fill="#042f2e"/>
+  <path d="M8.5 11.6a10 10 0 0 1 15 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".45"/>
+  <path d="M11.2 14.4a6 6 0 0 1 9.6 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".85"/>
+  <rect x="10.2" y="16" width="11.6" height="11.6" rx="4" fill="#2dd4bf"/>
+  <rect x="12" y="17.7" width="8" height="2.6" rx="1" fill="#042f2e"/>
+  <rect x="12" y="24" width="8" height="1.9" rx=".8" fill="#042f2e" opacity=".75"/>
+  <circle cx="16" cy="22.1" r="1.15" fill="#042f2e"/>
 </svg>

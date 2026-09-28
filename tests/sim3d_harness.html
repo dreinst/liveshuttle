@@ -3,17 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Harness Simulator 3D</title>
+  <title>Harness Shuttle 3D Ma Chung</title>
   <link rel="icon" href="data:," />
-  <script>
-    // Muat css/style.css bila diminta lewat ?css=1 (hanya bila berkasnya ada).
-    if (new URLSearchParams(location.search).get('css') === '1') {
-      const l = document.createElement('link');
-      l.rel = 'stylesheet';
-      l.href = '../css/style.css';
-      document.head.append(l);
-    }
-  </script>
+  <link rel="stylesheet" href="../css/style.css" />
   <style>
     html,
     body {
@@ -22,7 +14,7 @@
       background: #0b1220;
     }
     .hdr {
-      height: var(--header-h, 56px);
+      height: var(--header-h, 60px);
       display: flex;
       align-items: center;
       padding: 0 16px;
@@ -32,12 +24,12 @@
       box-sizing: border-box;
     }
     #host {
-      height: calc(100dvh - var(--header-h, 56px));
+      height: calc(100dvh - var(--header-h, 60px));
     }
   </style>
 </head>
 <body>
-  <div class="hdr">SimOtonom, halaman uji simulator 3D</div>
+  <div class="hdr">LiveShuttle, halaman uji Shuttle 3D Ma Chung</div>
   <main id="host"></main>
   <script type="module">
     import { mount } from '../js/sim3d/index.js';
@@ -46,7 +38,7 @@
     let inst = null;
     window.__harness = {
       async mount(mode) {
-        inst = await mount(host, { mode: mode || q.get('mode') || 'tutorial', navigate: (h) => (window.__navigated = h) });
+        inst = await mount(host, { mode: mode || q.get('mode') || 'panduan', navigate: (h) => (window.__navigated = h) });
         return true;
       },
       destroy() {

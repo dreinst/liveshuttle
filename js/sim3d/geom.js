@@ -24,6 +24,60 @@ export class Poly {
       this.cum[i] = L;
     }
     this.len = L;
+    // Arah di tiap titik sudut (rata-rata dua ruas di sekitarnya) supaya arah bisa diinterpolasi mulus.
+    this.hv = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      if (n < 2) break;
+      if (i === 0) this.hv[i] = this.h[0];
+      else if (i === n - 1) this.hv[i] = this.h[n - 2];
+      else {
+        const a = this.h[i - 1];
+        let d = this.h[i] - a;
+        if (d > Math.PI) d -= Math.PI * 2;
+        if (d < -Math.PI) d += Math.PI * 2;
+        this.hv[i] = a + d / 2;
+      }
+    }
+    let x0 = Infinity;
+    let z0 = Infinity;
+    let x1 = -Infinity;
+    let z1 = -Infinity;
+    for (let i = 0; i < n; i++) {
+      if (this.x[i] < x0) x0 = this.x[i];
+      if (this.x[i] > x1) x1 = this.x[i];
+      if (this.z[i] < z0) z0 = this.z[i];
+      if (this.z[i] > z1) z1 = this.z[i];
+    }
+    this.bb = [x0, z0, x1, z1];
+  }
+
+  /** Indeks ruas yang memuat jarak s (pencarian biner). */
+  seg(s) {
+    let lo = 0;
+    let hi = this.n - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (this.cum[mid] <= s) lo = mid;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  /** Seperti at(), tetapi arahnya diinterpolasi di antara titik sudut (tidak melompat). */
+  atSmooth(s, out = {}) {
+    const n = this.n;
+    if (s <= 0 || s >= this.len || n < 3) return this.at(s, out);
+    const i = this.seg(s);
+    const L = this.cum[i + 1] - this.cum[i] || 1;
+    const t = (s - this.cum[i]) / L;
+    out.x = this.x[i] + (this.x[i + 1] - this.x[i]) * t;
+    out.z = this.z[i] + (this.z[i + 1] - this.z[i]) * t;
+    const a = this.hv[i];
+    let d = this.hv[i + 1] - a;
+    if (d > Math.PI) d -= Math.PI * 2;
+    if (d < -Math.PI) d += Math.PI * 2;
+    out.h = a + d * t;
+    return out;
   }
 
   /** Titik pada jarak s dari awal. Hasil ditulis ke out {x, z, h}. */

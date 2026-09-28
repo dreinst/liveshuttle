@@ -1,4 +1,4 @@
-"""Tangkapan layar kartu langkah pelajaran Persepsi (desktop), satu per langkah."""
+"""Tangkapan layar kartu langkah pelajaran Persepsi (desktop), satu per langkah. Server: python3 tests/serve.py 8243"""
 import sys
 sys.path.insert(0, "/Users/mcdonny/Downloads/ndur/driverless-sim/tests")
 from persepsi_util import Session, dump  # noqa: E402

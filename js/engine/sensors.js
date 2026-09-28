@@ -14,7 +14,7 @@
 // Setiap deteksi menyimpan `targetId` dan `target` (objek aslinya). Keduanya adalah
 // "kunci jawaban" untuk tampilan pelajaran, bukan sesuatu yang benar-benar diketahui sensor.
 
-import { castRay, lineOfSight, rayShape, boundingRadius } from './geometry.js';
+import { castRay, lineOfSight, rayShape, boundingRadius, shapeCenter } from './geometry.js';
 import { Rng, wrapAngle, degToRad, angleDiff, TAU, clamp } from './math.js';
 import { COLORS } from './theme.js';
 
@@ -72,7 +72,7 @@ export function weatherEffect(type, weather = 'cerah') {
 
 /**
  * Seberapa kuat pantulan radar dari tiap jenis objek, dipakai sebagai pengali jangkauan radar.
- * Logam besar memantul kuat, manusia lebih lemah, kardus hampir tembus gelombang radar.
+ * Logam besar memantul kuat, manusia dan pohon lebih lemah.
  */
 export const RADAR_REFLECTIVITY = Object.freeze({
   car: 1,
@@ -88,7 +88,6 @@ export const RADAR_REFLECTIVITY = Object.freeze({
   pedestrian: 0.5,
   tree: 0.4,
   cone: 0.35,
-  cardboard: 0.2,
 });
 
 /** Nilai bawaan tiap jenis sensor. Jangkauan dipendekkan agar muat di layar simulasi. */
@@ -190,16 +189,17 @@ export class Sensor {
 
   /** Titik yang dicoba untuk garis pandang: tengah objek dan dua sisi terluarnya. */
   _visiblePoint(o, pose, objects, vehicle) {
-    const dx = o.x - pose.x;
-    const dy = o.y - pose.y;
+    const c = centerOf(o);
+    const dx = c.x - pose.x;
+    const dy = c.y - pose.y;
     const d = Math.hypot(dx, dy) || 1e-6;
     const br = Math.min(boundingRadius(o), 3) * 0.8;
     const px = -dy / d;
     const py = dx / d;
     const candidates = [
-      { x: o.x, y: o.y },
-      { x: o.x + px * br, y: o.y + py * br },
-      { x: o.x - px * br, y: o.y - py * br },
+      { x: c.x, y: c.y },
+      { x: c.x + px * br, y: c.y + py * br },
+      { x: c.x - px * br, y: c.y - py * br },
     ];
     for (const p of candidates) {
       const rel = angleDiff(Math.atan2(p.y - pose.y, p.x - pose.x), pose.heading);
@@ -219,8 +219,9 @@ export class Sensor {
   }
 
   _roughlyInView(o, pose, range) {
-    const dx = o.x - pose.x;
-    const dy = o.y - pose.y;
+    const c = centerOf(o);
+    const dx = c.x - pose.x;
+    const dy = c.y - pose.y;
     const d = Math.hypot(dx, dy);
     const br = boundingRadius(o);
     if (d - br > range) return false;
@@ -271,7 +272,7 @@ export class Sensor {
 
   _lidar({ vehicle, objects, pose, fx, rng }) {
     const range = this.range * fx.range;
-    const candidates = objects.filter((o) => !this._skip(o, vehicle) && Math.hypot(o.x - pose.x, o.y - pose.y) - boundingRadius(o) <= range);
+    const candidates = objects.filter((o) => !this._skip(o, vehicle) && distToCenter(o, pose) - (o._br ?? boundingRadius(o)) <= range);
     const points = [];
     const byTarget = new Map();
     const n = this.rays;
@@ -395,7 +396,7 @@ export class Sensor {
 
   _ultrasonic({ vehicle, objects, pose, fx, rng }) {
     const range = this.range * fx.range;
-    const candidates = objects.filter((o) => !this._skip(o, vehicle) && Math.hypot(o.x - pose.x, o.y - pose.y) - boundingRadius(o) <= range);
+    const candidates = objects.filter((o) => !this._skip(o, vehicle) && distToCenter(o, pose) - (o._br ?? boundingRadius(o)) <= range);
     let best = null;
     const n = this.rays;
     for (let i = 0; i < n; i++) {
@@ -425,6 +426,17 @@ export class Sensor {
 }
 
 const defaultRng = new Rng(20240611);
+
+/** Pusat objek: (x, y) bila ada, selain itu titik berat poligon (poligon polos tanpa x, y). */
+function centerOf(o) {
+  return Number.isFinite(o.x) && Number.isFinite(o.y) ? o : shapeCenter(o);
+}
+
+/** Jarak dari pose ke pusat objek. */
+function distToCenter(o, pose) {
+  const c = centerOf(o);
+  return Math.hypot(c.x - pose.x, c.y - pose.y);
+}
 
 /**
  * Delapan sensor ultrasonik: empat di bemper depan, empat di bemper belakang.

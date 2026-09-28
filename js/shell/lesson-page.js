@@ -58,7 +58,7 @@ export function renderLesson(main, id, hooks) {
         <p class="eyebrow">Pelajaran ${index + 1} dari ${LESSONS.length}</p>
         <h1 class="fallback-title" tabindex="-1">${esc(entry.title)}</h1>
         <p class="fallback-lead">Pelajaran ini sedang disiapkan.</p>
-        <p class="muted">${esc(entry.summary)} Sementara menunggu, kamu bisa membuka pelajaran lain atau mencoba Simulator 3D.</p>
+        <p class="muted">${esc(entry.summary)} Sementara menunggu, kamu bisa membuka pelajaran lain atau mencoba Shuttle 3D Ma Chung.</p>
         <div class="fallback-actions">
           ${nextL ? `<a class="btn btn-primary" href="#/pelajaran/${nextL.id}">${icon('arrowRight')}<span>Pelajaran berikutnya</span></a>` : ''}
           <a class="btn btn-secondary" href="#/pelajaran">${icon('book')}<span>Daftar pelajaran</span></a>
@@ -217,9 +217,40 @@ function buildLesson(page, lesson, entry, index, hooks) {
       speedCtl?.setDisabled(!hasLoop);
       speedCtl?.set(speed, true);
     }
-    badge.hidden = !(paused && hasLoop);
+    const show = paused && hasLoop;
+    if (badge.hidden === show) {
+      badge.hidden = !show;
+      if (show) placeBadge();
+    }
     hooks.setState({ paused, speed });
   }
+
+  // Lencana Dijeda ada di pojok kanan atas. Bila chip HUD (baris chip di kiri atas yang bisa
+  // melebar sampai kanan, terutama di ponsel) masuk ke pojok itu, lencana turun tepat di bawah
+  // baris chip tersebut. Chip HUD sendiri tidak pernah bergeser. --stage-badge-top dari pelajaran menang.
+  function placeBadge() {
+    if (badge.hidden) return;
+    const s = stage.getBoundingClientRect();
+    const bw = badge.offsetWidth || 96;
+    const bh = badge.offsetHeight || 30;
+    const limit = s.right - 10 - bw - 8;
+    let top = 10;
+    for (const chip of hud.children) {
+      const r = chip.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      const cTop = r.top - s.top;
+      if (r.right > limit && cTop < top + bh + 4) top = Math.max(top, Math.round(r.bottom - s.top + 6));
+    }
+    stage.style.setProperty('--stage-badge-auto', `${top}px`);
+  }
+  const mo = new MutationObserver(() => placeBadge());
+  mo.observe(hud, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['hidden', 'class', 'style'] });
+  const ro = new ResizeObserver(() => placeBadge());
+  ro.observe(stage);
+  abort.signal.addEventListener('abort', () => {
+    mo.disconnect();
+    ro.disconnect();
+  });
 
   function setPaused(p) {
     paused = !!p;
@@ -403,6 +434,15 @@ function buildLesson(page, lesson, entry, index, hooks) {
     },
     currentStep: () => stepIndex,
     goToStep: (i) => goTo(i),
+    /** Langkah yang dibuka lagi saat pelajaran ini dimasuki berikutnya (0 sampai stepCount - 1). */
+    get lastStep() {
+      return clamp(progress.lesson(id).lastStep || 0, 0, Math.max(0, N - 1));
+    },
+    /** Simpan langkah untuk kunjungan berikutnya tanpa berpindah langkah sekarang. */
+    setLastStep(i) {
+      if (!hasSteps) return;
+      progress.setLastStep(id, clamp(Math.round(i), 0, N - 1));
+    },
     setStatus(text) {
       text = String(text ?? '');
       if (text === lastStatus) return;
@@ -411,7 +451,12 @@ function buildLesson(page, lesson, entry, index, hooks) {
     },
     toast: (text, opts) => toast(text, opts),
     isTaskDone: (taskId) => taskDone(taskId),
-    completeTask(taskId) {
+    /**
+     * Tandai tugas selesai. Bawaan: hanya tugas langkah yang sedang dibuka.
+     * opts.anyStep = true mengizinkan tugas dari langkah lain (misalnya kuis yang dinilai di akhir).
+     * opts.toast = false menyembunyikan notifikasi bawaan shell.
+     */
+    completeTask(taskId, { anyStep = false, toast: showToast = true } = {}) {
       const t = taskSteps.find((x) => x.id === taskId);
       if (!t) {
         if (!warned.has(taskId)) {
@@ -420,17 +465,21 @@ function buildLesson(page, lesson, entry, index, hooks) {
         }
         return false;
       }
-      if (taskDone(taskId) || t.step !== stepIndex) return false;
+      if (taskDone(taskId) || (!anyStep && t.step !== stepIndex)) return false;
       progress.markTask(id, taskId);
       updateLessonProgress();
-      const box = card?.querySelector('[data-el="task"]');
+      const box = t.step === stepIndex ? card?.querySelector('[data-el="task"]') : null;
       if (box) {
         box.outerHTML = taskBoxHtml(steps[t.step].task);
         card.querySelector('[data-el="task"]')?.classList.add('just-done');
-        card.querySelector('.step-meta').innerHTML = `<span class="step-count">Langkah ${stepIndex + 1} dari ${N}</span>${dotsHtml()}`;
       }
-      const all = taskSteps.every((x) => taskDone(x.id));
-      toast(all ? 'Semua tugas selesai. Pelajaran ini tuntas!' : 'Tugas selesai. Lanjutkan ke langkah berikutnya.', { tone: 'ok' });
+      if (card && stepIndex === N) renderCard();
+      else if (card) card.querySelector('.step-meta').innerHTML = `<span class="step-count">Langkah ${stepIndex + 1} dari ${N}</span>${dotsHtml()}`;
+      if (showToast) {
+        const all = taskSteps.every((x) => taskDone(x.id));
+        const nextText = t.step === stepIndex && stepIndex < N - 1 ? 'Tugas selesai. Lanjutkan ke langkah berikutnya.' : 'Tugas selesai.';
+        toast(all ? 'Semua tugas selesai. Pelajaran ini tuntas!' : nextText, { tone: 'ok' });
+      }
       return true;
     },
     completeLesson() {
@@ -479,6 +528,15 @@ function buildLesson(page, lesson, entry, index, hooks) {
     pause: () => setPaused(true),
     resume: () => setPaused(false),
     rng: (seed = 1) => new Rng(seed),
+    /**
+     * Muat peta OSM ('machung', 'malang-roads', 'malang-center') dengan ctx.signal. Janji ditolak
+     * dengan AbortError bila pelajaran ditinggalkan sebelum peta selesai dimuat.
+     */
+    async loadMap(mapId) {
+      const { loadMap } = await import('../engine/osm2d.js');
+      if (abort.signal.aborted) throw new DOMException('Dibatalkan', 'AbortError');
+      return loadMap(mapId, { signal: abort.signal });
+    },
   };
 
   // ---------- mount ----------
@@ -497,8 +555,10 @@ function buildLesson(page, lesson, entry, index, hooks) {
           if (!abort.signal.aborted) finishMount(inst);
         },
         (err) => {
+          // pelajaran ditinggalkan saat masih memuat (misalnya loadMap dengan ctx.signal): bukan galat
+          if (abort.signal.aborted) return;
           console.error(err);
-          if (!abort.signal.aborted) showError('Simulasi gagal dimuat. Coba muat ulang halaman.');
+          showError('Simulasi gagal dimuat. Coba muat ulang halaman.');
         },
       );
     } else finishMount(result);

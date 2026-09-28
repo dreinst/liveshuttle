@@ -17,41 +17,57 @@ import { SIZES } from './theme.js';
  * @param {boolean} [o.twoWay=true] false = jalan satu arah (semua lajur dir = 1)
  * @param {number} [o.sidewalk=0] lebar trotoar di tiap sisi (m), 0 = tanpa trotoar
  * @param {number} [o.trimStart=0] @param {number} [o.trimEnd=0] panjang tanpa marka di awal/akhir (untuk persimpangan)
- * @returns {Road} { id, points, path, length, width, laneWidth, lanes, leftEdge, rightEdge, polygon, sidewalkPolygon, markings }
+ * @param {boolean} [o.closed=false] jalan melingkar (titik akhir tersambung ke titik awal, misalnya lintasan uji).
+ *        Lajur, tepi, dan marka menjadi cincin tertutup dan path lajur memakai Path closed.
+ * @returns {Road} { id, points, path, length, width, laneWidth, lanes, leftEdge, rightEdge, polygon, sidewalkPolygon, markings, closed }
  */
 export function makeRoad(o) {
-  const { id = 'jalan', points, lanesPerDir = 1, laneWidth = SIZES.laneWidth, twoWay = true, sidewalk = 0, trimStart = 0, trimEnd = 0 } = o;
-  const path = new Path(points);
+  const { id = 'jalan', lanesPerDir = 1, laneWidth = SIZES.laneWidth, twoWay = true, sidewalk = 0, trimStart = 0, trimEnd = 0, closed = false } = o;
+  let points = o.points;
+  if (closed) {
+    const a = points[0];
+    const b = points[points.length - 1];
+    if (Math.hypot(a.x - b.x, a.y - b.y) < 1e-9) points = points.slice(0, -1);
+  }
+  const path = new Path(points, { closed });
   const lanesTotal = twoWay ? lanesPerDir * 2 : lanesPerDir;
   const width = lanesTotal * laneWidth;
   const half = width / 2;
   const reversed = [...points].reverse();
+  // geser polyline; untuk jalan melingkar sambungan di titik awal juga memakai miter yang benar
+  const off = (pts, d) => {
+    if (!closed) return offsetPolyline(pts, d);
+    const n = pts.length;
+    const ext = [pts[n - 1], ...pts, pts[0], pts[1]];
+    return offsetPolyline(ext, d).slice(1, n + 2);
+  };
+  const lanePath = (ring) => (closed ? new Path(ring.slice(0, -1), { closed: true }) : new Path(ring));
 
   const lanes = [];
   for (let i = 0; i < lanesPerDir; i++) {
-    const off = twoWay ? (lanesPerDir - i - 0.5) * laneWidth : (lanesPerDir / 2 - i - 0.5) * laneWidth;
-    const fwd = offsetPolyline(points, off);
-    lanes.push({ id: `${id}:f${i}`, dir: 1, index: i, offset: off, points: fwd, path: new Path(fwd) });
+    const offv = twoWay ? (lanesPerDir - i - 0.5) * laneWidth : (lanesPerDir / 2 - i - 0.5) * laneWidth;
+    const fwd = off(points, offv);
+    lanes.push({ id: `${id}:f${i}`, dir: 1, index: i, offset: offv, points: fwd, path: lanePath(fwd) });
     if (twoWay) {
-      const back = offsetPolyline(reversed, off);
-      lanes.push({ id: `${id}:b${i}`, dir: -1, index: i, offset: -off, points: back, path: new Path(back) });
+      const back = off(reversed, offv);
+      lanes.push({ id: `${id}:b${i}`, dir: -1, index: i, offset: -offv, points: back, path: lanePath(back) });
     }
   }
 
-  const leftEdge = offsetPolyline(points, half);
-  const rightEdge = offsetPolyline(points, -half);
+  const leftEdge = off(points, half);
+  const rightEdge = off(points, -half);
   const polygon = [...leftEdge, ...[...rightEdge].reverse()];
   let sidewalkPolygon = null;
   if (sidewalk > 0) {
-    const l = offsetPolyline(points, half + sidewalk);
-    const r = offsetPolyline(points, -half - sidewalk);
+    const l = off(points, half + sidewalk);
+    const r = off(points, -half - sidewalk);
     sidewalkPolygon = [...l, ...[...r].reverse()];
   }
 
-  // marka jalan (dipotong di ujung yang masuk persimpangan)
-  const s0 = trimStart;
-  const s1 = path.length - trimEnd;
-  const trimmed = (off) => slicePolyline(offsetPolyline(points, off), s0, s1);
+  // marka jalan (dipotong di ujung yang masuk persimpangan; jalan melingkar tidak dipotong)
+  const s0 = closed ? 0 : trimStart;
+  const s1 = closed ? Infinity : path.length - trimEnd;
+  const trimmed = (d) => (closed ? off(points, d) : slicePolyline(offsetPolyline(points, d), s0, s1));
   const markings = [];
   if (s1 > s0) {
     if (twoWay) {
@@ -78,6 +94,7 @@ export function makeRoad(o) {
     lanesTotal,
     twoWay,
     sidewalk,
+    closed,
     lanes,
     leftEdge,
     rightEdge,

@@ -29,7 +29,7 @@ export default {
   title: 'Kuis Akhir',
   layout: 'full',
   intro:
-    '<p>Kuis ini menguji pemahamanmu tentang semua pelajaran, dari level otomasi sampai shuttle otonom, ditambah alur kerja mobil di Simulator 3D.</p>',
+    '<p>Kuis ini menguji pemahamanmu tentang semua pelajaran, dari level otomasi sampai shuttle otonom, ditambah Shuttle 3D Ma Chung yang berkeliling jalan asli di sekitar kampus.</p>',
   steps: [
     {
       title: 'Jawab semua soal',
@@ -49,12 +49,12 @@ export default {
     },
   ],
   summary:
-    '<p>Kamu sudah menempuh seluruh materi SimOtonom. Mobil otonom bekerja dalam siklus yang terus berulang:</p>' +
+    '<p>Kamu sudah menempuh seluruh materi LiveShuttle. Mobil otonom bekerja dalam siklus yang terus berulang:</p>' +
     '<ul><li>Sensor seperti kamera, LiDAR, radar, dan ultrasonik mengumpulkan data tentang sekitar mobil.</li>' +
     '<li>Persepsi mengubah data itu menjadi daftar objek, dan lokalisasi menentukan posisi mobil di peta.</li>' +
     '<li>Perencanaan memilih rute dan tindakan yang aman sesuai aturan lalu lintas.</li>' +
     '<li>Kontrol menggerakkan setir, gas, dan rem supaya mobil mengikuti jalur yang direncanakan.</li></ul>' +
-    '<p>Untuk melihat semuanya bekerja bersamaan, buka <a href="#/simulator/bebas">Simulator 3D dalam Mode Bebas</a>.</p>',
+    '<p>Untuk melihat semuanya bekerja bersamaan di jalan sekitar Universitas Ma Chung, buka <a href="#/shuttle-3d/jelajah">Shuttle 3D Ma Chung dalam mode Jelajah</a>.</p>',
 
   // Gaya khusus pelajaran ini, selalu diawali .lesson-kuis.
   styles: `
@@ -475,7 +475,7 @@ export default {
         `<p class="kz-rev-ans ${ok ? 'is-ok' : 'is-bad'}">${icon(ok ? 'check' : 'close')}<span>Jawabanmu: <strong>${esc(chosen.text)}</strong>${ok ? ' (benar)' : ' (kurang tepat)'}</span></p>` +
         (ok ? '' : `<p class="kz-rev-ans is-ok">${icon('check')}<span>Jawaban yang benar: <strong>${esc(right.text)}</strong></span></p>`) +
         `<p class="kz-rev-exp">${it.q.explain}</p>` +
-        `<a class="kz-rev-link" href="${t.href}">${icon(t.id === 'simulator' ? 'cube' : 'book')}<span>${esc(t.linkText)}: ${esc(t.title)}</span></a>` +
+        `<a class="kz-rev-link" href="${t.href}">${icon(t.id === 'shuttle-3d' ? 'cube' : 'book')}<span>${esc(t.linkText)}: ${esc(t.title)}</span></a>` +
         `</div>`;
       return li;
     }

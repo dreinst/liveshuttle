@@ -16,7 +16,7 @@ CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
 PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8134"
 BASE = f"http://127.0.0.1:{PORT}/"
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/lokalisasi-qa/"
+SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/lokalisasi-malang/lama-qa/"
 os.makedirs(SHOTS, exist_ok=True)
 msgs = []
 

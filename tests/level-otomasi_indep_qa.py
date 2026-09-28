@@ -326,7 +326,7 @@ with S() as s:
         s.page.wait_for_timeout(600)
         s.full_shot("15-summary")
         h = s.hook()
-        prog = s.page.evaluate("() => localStorage.getItem('simotonom.progress.v1')")
+        prog = s.page.evaluate("() => localStorage.getItem('liveshuttle.progress.v1')")
         T["final"] = {"done": h["completedTasks"], "step": h["stepIndex"], "progress": json.loads(prog) if prog else None}
         R["tasks"] = T
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Uji asap (smoke test) SimOtonom dengan Playwright.
+"""Uji asap (smoke test) LiveShuttle dengan Playwright.
 
 Pemakaian:
   python3 tests/smoke.py --port 8100 --route "#/pelajaran/sensor" --out tests/shots/nama/sensor
@@ -12,7 +12,7 @@ Yang diperiksa:
 
 Keluaran: ringkasan JSON di stdout. Kode keluar 0 bila lolos, 1 bila ada masalah.
 Server statis harus sudah berjalan, misalnya:
-  python3 -m http.server 8100 --bind 127.0.0.1 --directory <root proyek>
+  python3 tests/serve.py 8100
 """
 
 import argparse
@@ -100,7 +100,7 @@ def variance(pixels):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Smoke test SimOtonom")
+    ap = argparse.ArgumentParser(description="Smoke test LiveShuttle")
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--route", default="#/", help='hash rute, misalnya "#/pelajaran/sensor"')
@@ -120,7 +120,7 @@ def main():
     # pesan driver WebGL yang muncul karena uji ini sendiri membaca piksel kanvas (bukan dari aplikasi)
     builtin_ignore = [r"GPU stall due to ReadPixels"]
     ignore = [re.compile(p) for p in builtin_ignore + args.ignore]
-    use_webgl = args.webgl or args.route.startswith("#/simulator")
+    use_webgl = args.webgl or args.route.startswith(("#/simulator", "#/shuttle-3d"))
 
     errors, warnings, page_errors = [], [], []
     summary = {"route": args.route, "url": url, "mobile": args.mobile, "screenshot": shot}

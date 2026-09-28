@@ -3,11 +3,12 @@
 // Semua di sini penyederhanaan yang jujur dan disebutkan di teks pelajaran:
 //   - Ketiga sensor dibaca bersamaan 10 kali per detik. Di mobil sungguhan tiap sensor punya
 //     jadwal sendiri, jadi fusi juga harus menyamakan waktu pengukurannya.
-//   - Kamera: kelas objek benar, sudut cukup tepat, jarak ditebak dari gambar sehingga galatnya
-//     membesar dengan jarak. Poster orang di papan iklan halte bisa dikira pejalan kaki.
+//   - Kamera: kelas objek benar (mobil, angkot, sepeda motor, pesepeda, pejalan kaki), sudut cukup
+//     tepat, jarak ditebak dari gambar sehingga galatnya membesar dengan jarak. Poster orang di
+//     papan iklan halte bisa dikira pejalan kaki.
 //   - LiDAR: awan titik dari raycast engine. Detektor klaster memperkirakan pusat objek dengan
-//     tepat, tetapi tidak tahu kelasnya. Titik di gedung, pohon, dan halte dianggap latar
-//     (disaring dengan peta) sehingga tidak menjadi objek.
+//     tepat, tetapi tidak tahu kelasnya. Titik di gedung (dari OpenStreetMap) dan halte dianggap
+//     latar (disaring dengan peta) sehingga tidak menjadi objek.
 //   - Radar: jarak tepat, sudut kurang tepat (posisi ke samping berderau), kecepatan relatif
 //     dari efek Doppler. Tutup gorong-gorong dari logam kadang memberi pantulan hantu.
 //   - Fusi: asosiasi tetangga terdekat di dalam gerbang Mahalanobis, rata-rata berbobot
@@ -31,22 +32,26 @@ export const LIDAR = { forward: -0.2, range: 45, rays: 720 };
 export const RADAR = { forward: 2.25, fov: degToRad(24), range: 90, rangeSd: 0.25, bearingSd: degToRad(1.6), speedSd: 0.15 };
 
 /** Pengali jangkauan radar dan kuat pantulan per jenis objek (logam besar memantul kuat). */
-const REFLECT = { car: 1, cyclist: 0.6, pedestrian: 0.5 };
-/** Kamera lebih mudah mengenali mobil daripada pejalan kaki atau pesepeda yang kecil. */
-const CLASS_FACTOR = { car: 1, cyclist: 0.9, pedestrian: 0.86 };
+const REFLECT = { car: 1, angkot: 1, motor: 0.7, cyclist: 0.6, pedestrian: 0.5 };
+/** Kamera lebih mudah mengenali mobil daripada pejalan kaki, pesepeda, atau sepeda motor yang kecil. */
+const CLASS_FACTOR = { car: 1, angkot: 0.97, motor: 0.9, cyclist: 0.9, pedestrian: 0.86 };
 
-export const CLASS_NAMES = { car: 'mobil', pedestrian: 'pejalan kaki', cyclist: 'pesepeda', unknown: 'belum dikenali' };
+export const CLASS_NAMES = { car: 'mobil', angkot: 'angkot', motor: 'sepeda motor', pedestrian: 'pejalan kaki', cyclist: 'pesepeda', unknown: 'belum dikenali' };
 export const CLASS_SIZE = {
   car: { length: 4.5, width: 1.8 },
+  angkot: { length: 4.1, width: 1.62 },
+  motor: { length: 1.9, width: 0.72 },
   pedestrian: { length: 0.8, width: 0.8 },
   cyclist: { length: 1.8, width: 0.7 },
 };
+/** Kelas objek untuk persepsi. Mobil kota dan MPV tetap berkelas mobil. */
+const clsOf = (o) => o.cls || (o.kind === 'city' || o.kind === 'mpv' ? 'car' : o.kind);
 
 const GATE = 13.82; // chi-kuadrat 2 derajat kebebasan, peluang 99,9%
 const TRACK_GATE = 18.42; // gerbang pelacak sedikit lebih longgar (99,99%) agar tahan manuver
 const MAX_ASSOC = 10; // m, batas jarak asosiasi apa pun kovariansnya
 /** Kerapatan spektral derau percepatan (m^2/s^3) untuk model kecepatan konstan. */
-const Q_ACCEL = { car: 0.8, cyclist: 0.6, pedestrian: 0.5, unknown: 0.8 };
+const Q_ACCEL = { car: 0.8, angkot: 0.8, motor: 1.4, cyclist: 0.6, pedestrian: 0.5, unknown: 0.8 };
 const CONFIRM_HITS = 3;
 const MAX_MISSES_CONFIRMED = 10; // jejak terkonfirmasi bertahan sekitar 1 detik tanpa pengukuran (misalnya saat tertutup)
 const MAX_MISSES_TENTATIVE = 2;
@@ -55,7 +60,7 @@ const TRAIL_LEN = 30; // 3 detik jejak
 // ---------- bantuan matriks 2x2 simetris, disimpan sebagai [xx, xy, yy] ----------
 
 /** Kovarians dari simpangan baku searah garis pandang (along) dan melintang (across). */
-export function covFromPolar(bearing, sdAlong, sdAcross) {
+function covFromPolar(bearing, sdAlong, sdAcross) {
   const c = Math.cos(bearing);
   const s = Math.sin(bearing);
   const a = sdAlong * sdAlong;
@@ -87,7 +92,7 @@ export function ellipseOf(cov, k = 1) {
 
 // ---------- geometri sensor ----------
 
-function mountPose(ego, forward) {
+export function mountPose(ego, forward) {
   const c = Math.cos(ego.heading);
   const s = Math.sin(ego.heading);
   return { x: ego.x + c * forward, y: ego.y + s * forward, heading: ego.heading };
@@ -114,7 +119,7 @@ function visibility(objects, ego, from, o) {
 }
 
 /** Keyakinan gabungan dengan anggapan tiap sensor keliru secara terpisah. */
-export function combineConfidence(list) {
+function combineConfidence(list) {
   let miss = 1;
   for (const p of list) miss *= 1 - p;
   return 1 - miss;
@@ -144,7 +149,6 @@ export function createPerception({ seed = 7 } = {}) {
     radar: { pose: null, dets: [] },
     fused: [],
     rejected: [],
-    tentative: [],
   });
   let last = empty();
 
@@ -180,16 +184,16 @@ export function createPerception({ seed = 7 } = {}) {
       const sdB = noise * CAMERA.bearingSd;
       const rm = Math.max(1, r + sdR * arNoise(`k:${o.id}`, 0.3));
       const bm = bearing + sdB * rng.gaussian();
-      const conf = clamp((0.98 - 0.006 * r) * CLASS_FACTOR[o.kind] * (0.5 + 0.5 * vis) + rng.gaussian(0, 0.012), 0.15, 0.97);
+      const cls = clsOf(o);
+      const conf = clamp((0.98 - 0.006 * r) * (CLASS_FACTOR[cls] ?? 0.9) * (0.5 + 0.5 * vis) + rng.gaussian(0, 0.012), 0.15, 0.97);
       dets.push({
+        key: `k:${o.id}`,
         sensor: 'kamera',
         x: pose.x + Math.cos(bm) * rm,
         y: pose.y + Math.sin(bm) * rm,
-        r: rm,
-        bearing: bm,
         cov: covFromPolar(bm, sdR, Math.max(0.05, rm * sdB)),
         conf,
-        cls: o.kind,
+        cls,
         truth: o.id,
         heading: o.heading || 0,
         target: o,
@@ -211,17 +215,15 @@ export function createPerception({ seed = 7 } = {}) {
       const rm = Math.max(1, r + sdR * arNoise(`k:${ad.id}`, 0.3));
       const bm = bearing + sdB * rng.gaussian();
       dets.push({
+        key: `k:${ad.id}`,
         sensor: 'kamera',
         x: pose.x + Math.cos(bm) * rm,
         y: pose.y + Math.sin(bm) * rm,
-        r: rm,
-        bearing: bm,
         cov: covFromPolar(bm, sdR, Math.max(0.05, rm * sdB)),
         conf: clamp(0.33 + 0.06 * arNoise(`fp:${ad.id}`, 0.85), 0.2, 0.45),
         cls: 'pedestrian',
         truth: null,
-        fake: 'iklan',
-        heading: -Math.PI / 2,
+        heading: ad.facing - Math.PI / 2,
         target: null,
       });
     }
@@ -254,16 +256,15 @@ export function createPerception({ seed = 7 } = {}) {
       // pusat klaster diperkirakan dengan menempelkan kotak ke titik-titiknya
       const sd = noise * (0.06 + 0.002 * r) * (1 + 1.5 / d.points);
       dets.push({
+        key: `l:${o.id}`,
         sensor: 'lidar',
         x: o.x + rng.gaussian(0, sd),
         y: o.y + rng.gaussian(0, sd),
-        r,
         cov: [sd * sd, 0, sd * sd],
         conf: 1 - Math.exp(-d.points / 5),
         cls: null,
         truth: o.id,
         heading: o.heading || 0,
-        points: d.points,
         box: boxes.get(o.id) || null,
         target: o,
       });
@@ -299,8 +300,6 @@ export function createPerception({ seed = 7 } = {}) {
         sensor: 'radar',
         x: pose.x + Math.cos(bm) * rm,
         y: pose.y + Math.sin(bm) * rm,
-        r: rm,
-        bearing: bm,
         cov: covFromPolar(bm, sdR, Math.max(0.1, rm * sdB)),
         relSpeed: rel + noise * RADAR.speedSd * rng.gaussian(),
         cls: null,
@@ -308,9 +307,10 @@ export function createPerception({ seed = 7 } = {}) {
     };
     for (const o of relevant) {
       const v = inView(o.x, o.y);
-      if (!v.ok || v.r < 1.5 || v.r > RADAR.range * REFLECT[o.kind]) continue;
+      const refl = REFLECT[clsOf(o)] ?? 0.6;
+      if (!v.ok || v.r < 1.5 || v.r > RADAR.range * refl) continue;
       if (visibility(objects, ego, pose, o) <= 0) continue;
-      dets.push({ ...measure(o.x, o.y, o.vx || 0, o.vy || 0, `r:${o.id}`), conf: 0.3 + 0.45 * REFLECT[o.kind], truth: o.id, heading: o.heading || 0, target: o });
+      dets.push({ ...measure(o.x, o.y, o.vx || 0, o.vy || 0, `r:${o.id}`), key: `r:${o.id}`, conf: 0.3 + 0.45 * refl, truth: o.id, heading: o.heading || 0, target: o });
     }
     // pantulan hantu yang muncul sendiri sesekali dari tutup gorong-gorong di depan
     for (const m of manholes) {
@@ -323,7 +323,7 @@ export function createPerception({ seed = 7 } = {}) {
     for (const g of ghosts) {
       const v = inView(g.x, g.y);
       if (!v.ok || v.r > 60) continue;
-      dets.push({ ...measure(g.x, g.y, 0, 0, `r:${g.id}`), conf: 0.62, truth: null, ghost: true, manual: g.manual, heading: 0, target: null, source: g });
+      dets.push({ ...measure(g.x, g.y, 0, 0, `r:${g.id}`), key: `r:${g.id}`, conf: 0.62, truth: null, ghost: true, manual: g.manual, heading: 0, target: null, source: g });
     }
     return { pose, dets };
   }
@@ -351,11 +351,10 @@ export function createPerception({ seed = 7 } = {}) {
     const rad = g.members.find((d) => d.sensor === 'radar');
     g.cls = cam ? cam.cls : 'unknown';
     g.truth = lid ? lid.truth : cam ? cam.truth : rad ? rad.truth : null;
-    g.fake = !lid && cam && cam.fake ? cam.fake : null;
     g.heading = lid ? lid.heading : cam ? cam.heading : 0;
     const t = (lid || cam || rad)?.target;
     g.size = CLASS_SIZE[g.cls] || (t && t.length ? { length: t.length, width: t.width } : { length: 1.2, width: 1.2 });
-    g.relSpeed = rad ? rad.relSpeed : null;
+    g.key = `f:${(lid || cam || rad).key}`;
     return g;
   }
 
@@ -425,13 +424,9 @@ export function createPerception({ seed = 7 } = {}) {
     // Supaya objek nyata tidak ikut terbuang karena satu kali gagal dipasangkan, deteksi baru
     // ditolak setelah muncul di dua siklus berturut-turut.
     const rejected = [];
-    const tentative = [];
     const nextCands = [];
     for (const g of radarOnly) {
-      if (!coveredByOthers(world, g)) {
-        tentative.push(g);
-        continue;
-      }
+      if (!coveredByOthers(world, g)) continue;
       let prev = null;
       let best = 2.5;
       for (const c of candidates) {
@@ -454,7 +449,7 @@ export function createPerception({ seed = 7 } = {}) {
       nextCands.push(cand);
     }
     candidates = nextCands;
-    return { fused, rejected, tentative };
+    return { fused, rejected };
   }
 
   // ---------- pelacakan (filter Kalman kecepatan konstan) ----------
@@ -478,7 +473,6 @@ export function createPerception({ seed = 7 } = {}) {
       confirmed: false,
       trail: [{ x: f.x, y: f.y }],
       truth: f.truth,
-      fake: f.fake,
       heading: f.heading,
       size: f.size,
       last: f,
@@ -570,7 +564,6 @@ export function createPerception({ seed = 7 } = {}) {
       if (f.cls !== 'unknown') t.cls = f.cls;
       t.conf += 0.4 * (f.conf - t.conf);
       t.truth = f.truth;
-      t.fake = f.fake;
       t.heading = f.heading;
       t.size = CLASS_SIZE[t.cls] || f.size;
       t.last = f;
@@ -625,9 +618,6 @@ export function createPerception({ seed = 7 } = {}) {
     get ghosts() {
       return ghosts;
     },
-    get noise() {
-      return noise;
-    },
     setNoise(v) {
       noise = clamp(Number(v) || 1, 0.25, 4);
     },
@@ -676,6 +666,16 @@ export function createPerception({ seed = 7 } = {}) {
     /** Pantulan hantu buatan pelajar yang sedang ditolak fusi, atau null. */
     manualGhostRejected() {
       return last.rejected.find((g) => g.manual) || null;
+    },
+
+    /** Mulai lagi di tempat lain (misalnya putaran baru): jejak dan pantulan dihapus, statistik tetap. */
+    restart() {
+      ar.clear();
+      tick = 0;
+      ghosts = [];
+      candidates = [];
+      tracks.length = 0;
+      last = empty();
     },
 
     reset() {
@@ -736,33 +736,51 @@ export function predictAt(t, tau) {
   };
 }
 
-/** Deretan titik prediksi dari 0 sampai `horizon` detik. */
-export function predictTrack(t, horizon = HORIZON, step = 0.25) {
+/**
+ * Deretan titik prediksi dari 0 sampai `horizon` detik. tau0 = detik sejak pengukuran terakhir,
+ * supaya gambar prediksi dimulai dari posisi perkiraan saat ini (bidang t tetap 0 sampai horizon).
+ */
+export function predictTrack(t, horizon = HORIZON, step = 0.25, tau0 = 0) {
   const out = [];
-  for (let tau = 0; tau <= horizon + 1e-9; tau += step) out.push(predictAt(t, tau));
+  for (let tau = 0; tau <= horizon + 1e-9; tau += step) {
+    const p = predictAt(t, tau0 + tau);
+    p.t = tau;
+    out.push(p);
+  }
   return out;
 }
 
 /**
  * Cari objek yang diprediksi masuk koridor jalur rencana mobil otonom.
- * corridor: { x0, x1, y, half } (lajur lurus ke arah +x).
+ * corridor (jalan lengkung, kerangka Frenet): { frenet(x, y, hint) -> { s, d }, heading(s), s0, s1, d, half, egoSpeed }.
  * objects: [{ track, cls, halfWidth }] yang sudah lolos ambang keyakinan.
  * Hasil: { track, cls, tau (detik, 0 bila sudah di dalam), inPath, x, y } paling awal, atau null.
  */
 export function findConflict(objects, corridor, horizon = HORIZON) {
+  const { frenet, s0, s1, d: dc } = corridor;
+  const egoSpeed = corridor.egoSpeed ?? Infinity;
   let best = null;
   for (const o of objects) {
     const t = o.track;
     const half = corridor.half + o.halfWidth;
-    const inside = (x, y) => x >= corridor.x0 && x <= corridor.x1 && Math.abs(y - corridor.y) <= half;
-    // hanya objek yang bergerak MELINTANG menuju jalur (misalnya menyeberang) yang diperiksa.
-    // Kendaraan yang melaju sejajar di lajur sebelah tidak dianggap memotong jalur.
+    const inside = (f) => f.s >= s0 && f.s <= s1 && Math.abs(f.d - dc) <= half;
+    const f0 = frenet(t.x[0], t.x[1], (s0 + s1) / 2);
+    if (!f0) continue;
+    // kecepatan diuraikan menjadi searah jalan (vs) dan melintang (vd, positif ke kiri)
+    const h = corridor.heading(f0.s);
     const vx = t.x[2];
     const vy = t.x[3];
-    const toward = Math.sign(corridor.y - t.x[1]) * vy;
-    const crossing = toward > 0.3 && Math.abs(vy) >= Math.abs(vx) * Math.tan((20 * Math.PI) / 180);
-    if (inside(t.x[0], t.x[1])) {
+    const vs = vx * Math.cos(h) + vy * Math.sin(h);
+    const vd = vx * Math.sin(h) - vy * Math.cos(h);
+    // hanya objek yang jelas bergerak MELINTANG menuju jalur (misalnya menyeberang) yang diperiksa.
+    // Kendaraan yang melaju sejajar di lajur sebelah dan pejalan kaki yang sedikit bergoyang di
+    // trotoar (derau pelacakan) tidak dianggap memotong jalur.
+    const toward = Math.sign(dc - f0.d) * vd;
+    const crossing = toward > 0.6 && Math.abs(vd) >= Math.abs(vs) * Math.tan((25 * Math.PI) / 180);
+    if (inside(f0)) {
       if (Math.hypot(vx, vy) < 0.5) continue;
+      // kendaraan searah yang menjauh (misalnya sepeda motor yang baru menyalip) bukan konflik
+      if (o.cls !== 'pedestrian' && vs > egoSpeed - 0.5) continue;
       const hit = { track: t, cls: o.cls, tau: 0, inPath: true, x: t.x[0], y: t.x[1] };
       if (!best || !best.inPath || best.tau > 0) best = hit;
       continue;
@@ -770,7 +788,8 @@ export function findConflict(objects, corridor, horizon = HORIZON) {
     if (!crossing) continue;
     for (let tau = 0.1; tau <= horizon + 1e-9; tau += 0.1) {
       const p = predictAt(t, tau);
-      if (inside(p.x, p.y)) {
+      const f = frenet(p.x, p.y, f0.s);
+      if (f && inside(f)) {
         if (!best || (!best.inPath && tau < best.tau)) best = { track: t, cls: o.cls, tau, inPath: false, x: p.x, y: p.y };
         break;
       }

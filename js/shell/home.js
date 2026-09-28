@@ -11,40 +11,40 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 const PIPELINE = [
   {
     title: 'Sensor',
-    verb: 'Melihat',
+    verb: 'mengukur',
     color: 'var(--kamera)',
     icon: 'sensor',
-    text: 'Kamera, LiDAR, radar, dan ultrasonik mengumpulkan data tentang keadaan di sekitar mobil.',
+    text: 'Kamera, LiDAR, radar, dan ultrasonik mencatat posisi dan gerak benda di sekitar kendaraan.',
     lessons: ['sensor'],
   },
   {
     title: 'Persepsi',
-    verb: 'Memahami',
+    verb: 'memahami',
     color: 'var(--lidar)',
     icon: 'brain',
-    text: 'Data mentah diolah menjadi daftar objek beserta posisi dan arah geraknya. Mobil juga menentukan posisinya sendiri.',
+    text: 'Data sensor digabung menjadi daftar objek, misalnya angkot atau pejalan kaki. Kendaraan juga menaksir posisinya sendiri di peta.',
     lessons: ['persepsi', 'lokalisasi'],
   },
   {
     title: 'Perencanaan',
-    verb: 'Memutuskan',
+    verb: 'memilih',
     color: 'var(--radar)',
     icon: 'route',
-    text: 'Mobil memilih rute dan tindakan, misalnya berhenti di lampu merah atau menyalip mobil yang mogok.',
+    text: 'Rute dipilih di jaringan jalan, lalu tindakan di tiap saat, misalnya menunggu lampu hijau atau memberi jalan kepada penyeberang.',
     lessons: ['rute', 'keputusan'],
   },
   {
     title: 'Kontrol',
-    verb: 'Bergerak',
+    verb: 'menjalankan',
     color: 'var(--ultrasonik)',
     icon: 'steering',
-    text: 'Setir, gas, dan rem diatur supaya mobil mengikuti rencana dengan mulus dan tetap berjarak aman.',
+    text: 'Setir, gas, dan rem diatur supaya kendaraan mengikuti rencana dengan halus dan tetap menjaga jarak aman.',
     lessons: ['kontrol', 'jarak-aman'],
   },
 ];
 
-/** Ilustrasi kota isometrik untuk kartu simulator 3D (SVG buatan kode). */
-function isoCity() {
+/** Ilustrasi isometrik untuk kartu Shuttle 3D: jalan kampus, bundaran, halte, dan shuttle (SVG buatan kode). */
+function isoCampus() {
   const P = (x, y, z = 0) => [160 + (x - y) * 14, 34 + (x + y) * 7 - z * 14];
   const pts = (arr) => arr.map((p) => P(...p).map((v) => v.toFixed(1)).join(',')).join(' ');
   const poly = (arr, fill, extra = '') => `<polygon points="${pts(arr)}" fill="${fill}" ${extra}/>`;
@@ -53,11 +53,15 @@ function isoCity() {
     poly([[x1, y0, 0], [x1, y1, 0], [x1, y1, h], [x1, y0, h]], right) +
     poly([[x0, y0, h], [x1, y0, h], [x1, y1, h], [x0, y1, h]], top);
   let s = '';
+  // lingkaran di bidang tanah (bundaran), didekati dengan poligon
+  const disc = (cx, cy, r, fill) => poly(Array.from({ length: 28 }, (_, i) => [cx + r * Math.cos((i / 28) * 2 * Math.PI), cy + r * Math.sin((i / 28) * 2 * Math.PI)]), fill);
   s += poly([[0, 0], [10, 0], [10, 10], [0, 10]], '#13261f');
   s += poly([[0, 4.3], [10, 4.3], [10, 5.7], [0, 5.7]], '#2b3240');
   s += poly([[4.3, 0], [5.7, 0], [5.7, 10], [4.3, 10]], '#2b3240');
-  for (let x = 0.4; x < 10; x += 1.1) if (x < 4 || x > 5.9) s += `<line x1="${P(x, 5)[0]}" y1="${P(x, 5)[1]}" x2="${P(x + 0.5, 5)[0]}" y2="${P(x + 0.5, 5)[1]}" stroke="#facc15" stroke-width="1.2" stroke-opacity=".8"/>`;
-  for (let y = 0.4; y < 10; y += 1.1) if (y < 4 || y > 5.9) s += `<line x1="${P(5, y)[0]}" y1="${P(5, y)[1]}" x2="${P(5, y + 0.5)[0]}" y2="${P(5, y + 0.5)[1]}" stroke="#facc15" stroke-width="1.2" stroke-opacity=".8"/>`;
+  s += disc(5, 5, 1.55, '#2b3240');
+  s += disc(5, 5, 0.75, '#1d4a33');
+  for (let x = 0.4; x < 10; x += 1.1) if (x < 3.2 || x > 6.8) s += `<line x1="${P(x, 5)[0]}" y1="${P(x, 5)[1]}" x2="${P(x + 0.5, 5)[0]}" y2="${P(x + 0.5, 5)[1]}" stroke="#e5e7eb" stroke-width="1.1" stroke-opacity=".55"/>`;
+  for (let y = 0.4; y < 10; y += 1.1) if (y < 3.2 || y > 6.8) s += `<line x1="${P(5, y)[0]}" y1="${P(5, y)[1]}" x2="${P(5, y + 0.5)[0]}" y2="${P(5, y + 0.5)[1]}" stroke="#e5e7eb" stroke-width="1.1" stroke-opacity=".55"/>`;
   const buildings = [
     [0.6, 0.6, 3.6, 3.4, 3.2],
     [6.4, 0.5, 9.3, 2.2, 4.6],
@@ -66,29 +70,32 @@ function isoCity() {
     [2.8, 6.4, 3.8, 8.0, 3.8],
     [6.5, 6.6, 9.2, 9.2, 2.8],
   ].sort((a, b) => a[0] + a[1] - (b[0] + b[1]));
-  const car = (x0, y0, x1, y1, color, dark) => box(x0, y0, x1, y1, 0.32, color, dark, dark);
-  // lingkaran LiDAR di sekitar mobil otonom
-  const [cx, cy] = P(2.9, 4.72, 0.35);
-  let rings = '';
-  [1.3, 2.3, 3.3].forEach((r, i) => {
-    rings += `<ellipse cx="${cx}" cy="${cy}" rx="${(r * 19.8).toFixed(1)}" ry="${(r * 9.9).toFixed(1)}" fill="none" stroke="#2dd4bf" stroke-width="1.3" stroke-opacity="${(0.7 - i * 0.2).toFixed(2)}" stroke-dasharray="${i ? '4 5' : ''}"/>`;
-  });
-  s += rings;
+  const car = (x0, y0, x1, y1, color, dark, h = 0.32) => box(x0, y0, x1, y1, h, color, dark, dark);
+  // satu cincin jangkauan LiDAR yang diam dan samar di sekitar shuttle
+  const [cx, cy] = P(2.55, 4.72, 0.35);
+  s += `<ellipse cx="${cx}" cy="${cy}" rx="${(2.6 * 19.8).toFixed(1)}" ry="${(2.6 * 9.9).toFixed(1)}" fill="rgba(34,211,238,0.05)" stroke="#22d3ee" stroke-width="1.1" stroke-opacity=".35" stroke-dasharray="3 5"/>`;
   for (const [x0, y0, x1, y1, h] of buildings) {
     if (x0 + y0 > 9) continue;
     s += box(x0, y0, x1, y1, h, '#334766', '#1e293b', '#26344d');
   }
-  s += car(2.4, 4.45, 3.4, 5.0, '#2dd4bf', '#0f766e');
-  s += car(7.1, 5.05, 8.1, 5.55, '#7d8fb0', '#4f6283');
-  s += car(4.5, 7.2, 5.0, 8.2, '#8d9ab3', '#56607a');
+  // halte: tiang dan pelat biru di trotoar
+  const [hx, hy] = P(2.1, 3.95, 0);
+  const [tx, ty] = P(2.1, 3.95, 1.25);
+  s += `<line x1="${hx}" y1="${hy}" x2="${tx}" y2="${ty}" stroke="#94a3b8" stroke-width="1.4"/><rect x="${(tx - 5).toFixed(1)}" y="${(ty - 7).toFixed(1)}" width="10" height="9" rx="2" fill="#2563eb" stroke="#f8fafc" stroke-width="1"/>`;
+  // shuttle otonom: kapsul putih dengan kaca gelap dan modul sensor toska di atap
+  s += car(1.75, 4.36, 3.35, 4.98, '#e2e8f0', '#94a3b8', 0.62);
+  s += poly([[1.85, 4.44, 0.63], [3.25, 4.44, 0.63], [3.25, 4.9, 0.63], [1.85, 4.9, 0.63]], '#0f172a');
+  s += poly([[2.35, 4.55, 0.66], [2.75, 4.55, 0.66], [2.75, 4.79, 0.66], [2.35, 4.79, 0.66]], '#2dd4bf');
+  s += car(7.1, 5.05, 8.0, 5.55, '#6cc3ea', '#3b8fb4', 0.42);
+  s += car(4.5, 7.3, 4.75, 7.9, '#64748b', '#334155', 0.22);
   for (const [x0, y0, x1, y1, h] of buildings) {
     if (x0 + y0 <= 9) continue;
     s += box(x0, y0, x1, y1, h, '#334766', '#1e293b', '#26344d');
   }
-  // titik LiDAR yang mengenai dinding gedung terdekat
+  // titik LiDAR lembut yang mengenai dinding gedung terdekat
   const hits = [[3.6, 1.6, 1.2], [3.6, 2.4, 0.8], [3.6, 3.0, 1.4], [2.0, 6.4, 0.9], [1.4, 6.4, 1.6], [3.3, 6.4, 0.6]];
-  s += hits.map(([x, y, z]) => `<circle cx="${P(x, y, z)[0].toFixed(1)}" cy="${P(x, y, z)[1].toFixed(1)}" r="1.8" fill="#22d3ee"/>`).join('');
-  return `<svg class="iso-city" viewBox="0 8 320 172" role="img" aria-label="Ilustrasi kota 3D dengan mobil otonom yang memindai sekitarnya">${s}</svg>`;
+  s += hits.map(([x, y, z]) => `<circle cx="${P(x, y, z)[0].toFixed(1)}" cy="${P(x, y, z)[1].toFixed(1)}" r="1.7" fill="#22d3ee" fill-opacity=".8"/>`).join('');
+  return `<svg class="iso-city" viewBox="0 8 320 172" role="img" aria-label="Ilustrasi shuttle otonom di jalan kampus dekat bundaran dan halte">${s}</svg>`;
 }
 
 function lessonStatus(l) {
@@ -107,12 +114,12 @@ export function renderHome(main, { reducedMotion = false, scrollTo = null } = {}
   page.innerHTML = `
     <section class="hero">
       <div class="hero-copy">
-        <p class="eyebrow">Simulator Kendaraan Otonom</p>
-        <h1 class="hero-title" tabindex="-1">Belajar cara mobil tanpa pengemudi <span class="text-accent">melihat, berpikir, dan bergerak.</span></h1>
-        <p class="hero-lead">Kendaraan otonom mengemudi sendiri dengan bantuan sensor dan perangkat lunak. Di sini kamu mempelajari cara kerjanya lewat simulasi kecil yang bisa kamu atur sendiri, lalu mencobanya di kota 3D.</p>
+        <p class="eyebrow">LiveShuttle</p>
+        <h1 class="hero-title" tabindex="-1">Pelajari teknologi transportasi tanpa pengemudi, <span class="text-accent">lalu lihat shuttle otonom beraksi di jalanan sekitar Universitas Ma Chung.</span></h1>
+        <p class="hero-lead">Setiap pelajaran berisi penjelasan singkat dan simulasi kecil yang bisa kamu atur sendiri. Petanya diambil dari jalanan Malang, mulai dari kampus Ma Chung sampai sekitar Alun-alun Merdeka.</p>
         <div class="hero-actions">
           <a class="btn btn-primary btn-lg" href="#/pelajaran/${next.id}" data-el="start">${icon('play')}<span>${started ? 'Lanjutkan belajar' : 'Mulai belajar'}</span></a>
-          <a class="btn btn-secondary btn-lg" href="#/simulator/tutorial">${icon('cube')}<span>Buka Simulator 3D</span></a>
+          <a class="btn btn-secondary btn-lg" href="#/shuttle-3d/panduan">${icon('cube')}<span>Buka Shuttle 3D</span></a>
         </div>
         <p class="hero-meta">${LESSONS.length} pelajaran interaktif. Progres tersimpan otomatis di browser ini.</p>
       </div>
@@ -120,37 +127,38 @@ export function renderHome(main, { reducedMotion = false, scrollTo = null } = {}
         <div class="ambient-frame">
           <div class="ambient-bar">
             <span class="live-dot" aria-hidden="true"></span>
-            <span>Kota mini, tampak atas</span>
+            <span>Villa Puncak Tidar, selatan kampus Ma Chung</span>
             <span class="ambient-keys" aria-hidden="true">
-              <span class="key-dot" style="--c: var(--accent)"></span>Mobil otonom
+              <span class="key-dot" style="--c: var(--accent)"></span>Shuttle otonom
               <span class="key-dot" style="--c: var(--lidar)"></span>Titik LiDAR
             </span>
           </div>
           <div class="ambient-stage" data-el="ambient"></div>
         </div>
+        <p class="ambient-note">Peta dari OpenStreetMap. Gerakan kendaraannya hanya ilustrasi.</p>
       </div>
     </section>
 
     <section class="section about">
       <div class="about-text">
         <h2 class="section-title">Apa itu transportasi tanpa pengemudi?</h2>
-        <p>Transportasi tanpa pengemudi memakai kendaraan, misalnya mobil, bus, atau shuttle, yang bisa berjalan tanpa manusia memegang kemudi. Komputer di dalamnya membaca data sensor, mengenali keadaan di sekitar, memilih tindakan yang aman, lalu menggerakkan setir, gas, dan rem.</p>
-        <p class="muted">Tingkat kemandiriannya dibagi menjadi level 0 sampai 5 menurut standar SAE J3016. Kamu akan mengenalnya di pelajaran pertama.</p>
+        <p>Kendaraan tanpa pengemudi, misalnya mobil, bus, atau shuttle kampus, berjalan tanpa manusia yang memegang kemudi. Komputernya membaca sensor, mengenali keadaan jalan, memilih tindakan yang aman, lalu mengatur setir, gas, dan rem.</p>
+        <p class="muted">Tingkat kemandirian kendaraan dibagi menjadi level 0 sampai 5 menurut standar SAE J3016. Pelajaran pertama dimulai dari situ.</p>
       </div>
       <div class="about-howto">
         <h2 class="section-title">Cara belajar di sini</h2>
         <ol class="howto-list">
-          <li><span class="howto-num">1</span><span>Pilih pelajaran. Urutannya mengikuti alur kerja mobil otonom, tetapi kamu boleh melompat.</span></li>
-          <li><span class="howto-num">2</span><span>Baca penjelasan tiap langkah, lalu coba langsung di simulasinya.</span></li>
-          <li><span class="howto-num">3</span><span>Kerjakan tugas di tiap langkah. Tugas tercentang otomatis saat kamu melakukannya.</span></li>
-          <li><span class="howto-num">4</span><span>Uji pemahamanmu di Simulator Kota 3D dan Kuis Akhir.</span></li>
+          <li><span class="howto-num">1</span><span>Pilih pelajaran. Urutannya mengikuti alur kerja kendaraan otonom, tetapi kamu boleh melompat.</span></li>
+          <li><span class="howto-num">2</span><span>Baca langkahnya, lalu coba langsung di simulasi. Latarnya jalanan di sekitar Malang.</span></li>
+          <li><span class="howto-num">3</span><span>Kerjakan tugas di tiap langkah. Tugas tercentang sendiri begitu kamu melakukannya.</span></li>
+          <li><span class="howto-num">4</span><span>Ikuti shuttle di Shuttle 3D Ma Chung, lalu uji dirimu di Kuis Akhir.</span></li>
         </ol>
       </div>
     </section>
 
     <section class="section">
       <div class="section-head">
-        <h2 class="section-title">Alur kerja mobil otonom</h2>
+        <h2 class="section-title">Alur kerja kendaraan otonom</h2>
         <p class="section-sub">Setiap pelajaran membahas satu bagian dari alur ini.</p>
       </div>
       <ol class="pipeline">
@@ -172,24 +180,24 @@ export function renderHome(main, { reducedMotion = false, scrollTo = null } = {}
     <section class="section">
       <div class="sim-card">
         <div class="sim-card-copy">
-          <p class="eyebrow">Simulator Kota 3D</p>
-          <h2 class="sim-card-title">Uji mobil otonom di kota virtual</h2>
-          <p>Lihat bagaimana mobil otonom membaca sekitarnya dan bereaksi terhadap lalu lintas di kota 3D. Pilih Mode Tutorial untuk dipandu langkah demi langkah, atau Mode Bebas untuk bereksperimen sendiri.</p>
+          <p class="eyebrow">Shuttle 3D Ma Chung</p>
+          <h2 class="sim-card-title">Ikuti shuttle otonom keliling kampus</h2>
+          <p>Shuttle tanpa pengemudi melaju di jalan sekitar Universitas Ma Chung. Jalannya dibuat dari data OpenStreetMap. Pilih Panduan kalau ingin ditemani langkah demi langkah, atau Jelajah kalau ingin berkeliling sendiri.</p>
           <div class="sim-card-actions">
-            <a class="mode-btn is-primary" href="#/simulator/tutorial">
+            <a class="mode-btn is-primary" href="#/shuttle-3d/panduan">
               <span class="mode-icon">${icon('book')}</span>
-              <span class="mode-text"><span class="mode-title">Mode Tutorial</span><span class="mode-sub">Dipandu langkah demi langkah</span></span>
+              <span class="mode-text"><span class="mode-title">Panduan</span><span class="mode-sub">Ditemani langkah demi langkah</span></span>
               ${icon('arrowRight')}
             </a>
-            <a class="mode-btn" href="#/simulator/bebas">
-              <span class="mode-icon">${icon('sparkle')}</span>
-              <span class="mode-text"><span class="mode-title">Mode Bebas</span><span class="mode-sub">Coba skenario sendiri</span></span>
+            <a class="mode-btn" href="#/shuttle-3d/jelajah">
+              <span class="mode-icon">${icon('route')}</span>
+              <span class="mode-text"><span class="mode-title">Jelajah</span><span class="mode-sub">Berkeliling dengan caramu sendiri</span></span>
               ${icon('arrowRight')}
             </a>
           </div>
-          <p class="sim-card-note">${icon('info')}<span>Simulator ini memakai WebGL. Di ponsel lama, gerakannya bisa terasa lambat.</span></p>
+          <p class="sim-card-note">${icon('info')}<span>Butuh WebGL. Di ponsel lama gerakannya bisa terasa lambat. Peta © Kontributor OpenStreetMap.</span></p>
         </div>
-        <div class="sim-card-art">${isoCity()}</div>
+        <div class="sim-card-art">${isoCampus()}</div>
       </div>
     </section>
 
@@ -208,8 +216,8 @@ export function renderHome(main, { reducedMotion = false, scrollTo = null } = {}
     </section>
 
     <footer class="app-footer">
-      <div class="footer-brand"><strong>SimOtonom</strong><span>Simulator Kendaraan Otonom</span></div>
-      <p>Materi disederhanakan untuk keperluan belajar. Progres hanya tersimpan di browser ini, tanpa akun.</p>
+      <div class="footer-brand"><strong>LiveShuttle</strong><span>Belajar transportasi tanpa pengemudi</span></div>
+      <p>Materi disederhanakan untuk belajar. Data peta © Kontributor OpenStreetMap (ODbL). Progres hanya tersimpan di browser ini, tanpa akun.</p>
     </footer>`;
   main.append(page);
 

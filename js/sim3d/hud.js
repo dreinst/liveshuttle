@@ -1,712 +1,503 @@
-// Panel HUD di atas kanvas 3D. Di desktop panel berada di kolom kiri (tutorial) dan kanan.
-// Di ponsel semua panel pindah ke lembar bawah (bottom sheet) dengan tab.
-import { el, fmt, kmh } from './util.js';
-import { CLASSES } from './perception.js';
+// Panel di atas kanvas 3D. Desktop: bar atas, Panduan di kiri, peta rute di kiri bawah, Perisai
+// dan Kendali di kanan, Lapisan otonomi di bawah, kontrol waktu kecil di pojok. Ponsel: panel pindah
+// ke lembar bawah bertab (ketuk tab yang aktif untuk mengecilkannya) dengan tombol besar.
+import * as THREE from '../vendor/three.bundle.min.js';
+import { el } from './util.js';
 import { CAMERA_MODES, CAMERA_LABEL } from './cameras.js';
-import { WEATHER_LABEL } from './weather.js';
-import { OBSTACLE_TYPES } from './scenarios.js';
-import { TIMING } from './signals.js';
+import { WEATHER_LABEL, WEATHER_ORDER } from './weather.js';
+import { OBSTACLE_LABEL } from './obstacles.js';
+import { RouteMap } from './routemap.js';
 
-const TABS = [
-  ['tutorial', 'Tutorial'],
-  ['persepsi', 'Persepsi'],
-  ['rencana', 'Rencana'],
-  ['kontrol', 'Kontrol'],
-  ['uji', 'Uji'],
-  ['kota', 'Kota'],
-  ['tampilan', 'Tampilan'],
+const SPEEDS = [1, 2, 4];
+const NUM_WORD = ['nol', 'satu', 'dua', 'tiga', 'empat', 'lima', 'enam'];
+const DENSITY = [
+  ['Sepi', 20],
+  ['Sedang', 42],
+  ['Ramai', 64],
 ];
-const BEHAVIOR_TONE = {
-  Melaju: 'ok',
-  Mengikuti: 'info',
-  'Berhenti di lampu': 'warn',
-  'Memberi jalan': 'warn',
-  Menyalip: 'accent',
-  'Pindah lajur': 'accent',
-  'Menunggu celah': 'warn',
-  'Rem darurat': 'danger',
-  Manual: 'info',
+const LAYERS = [
+  ['indra', 'Indra', 'sensor'],
+  ['pahami', 'Pahami', 'persepsi'],
+  ['rencana', 'Rencana', 'perencanaan'],
+  ['gerak', 'Gerak', 'kendali'],
+];
+const TOOL_HINT = {
+  parkir: 'Klik lajur di tampilan 3D atau di peta rute untuk menaruh kendaraan parkir.',
+  galian: 'Klik lajur di tampilan 3D atau di peta rute untuk memasang galian jalan.',
+  tutup: 'Klik ruas jalan di tampilan 3D atau di peta rute untuk menutupnya. Klik lagi untuk membukanya.',
 };
-const SPEED_STEPS = [0.25, 0.5, 1, 2, 4];
+const WHY = {
+  'bukan-jalan': 'Klik tepat di jalan.',
+  'bukan-lajur': 'Klik tepat di lajur jalan.',
+  'ada-halte': 'Jalan ini punya halte, jadi tidak bisa ditutup.',
+  bundaran: 'Penghalang tidak bisa dipasang di bundaran.',
+  'tepi-peta': 'Terlalu dekat dengan tepi peta.',
+  'satu-lajur': 'Jalan ini hanya punya satu lajur searah, kendaraan lain tidak bisa lewat.',
+  'dekat-simpang': 'Terlalu dekat dengan persimpangan.',
+  penuh: 'Sudah ada 6 penghalang. Angkat dulu salah satunya.',
+  'dekat-zebra': 'Terlalu dekat dengan zebra cross.',
+  'dekat-halte': 'Terlalu dekat dengan halte.',
+  'dekat-penghalang': 'Terlalu dekat dengan penghalang lain.',
+  'ada-kendaraan': 'Ada kendaraan di tempat itu.',
+  'terlalu-dekat': 'Ada kendaraan yang terlalu dekat untuk berhenti dengan nyaman.',
+  'ada-pejalan': 'Ada pejalan kaki di tempat itu.',
+  manual: 'Serahkan dulu kemudi ke autopilot.',
+  'di-halte': 'Shuttle sedang berhenti di halte. Tunggu ia berangkat, atau klik jalan di tampilan 3D.',
+  'tidak-ada-tempat': 'Belum ada tempat yang aman di depan shuttle. Coba lagi sebentar.',
+};
+
+function signalNote(signals) {
+  const names = [];
+  for (const sg of signals) for (const a of sg.arms) if (a.name && !names.includes(a.name)) names.push(a.name);
+  const n = signals.length;
+  const where = names.length ? ` di ${names.length > 1 ? `${names.slice(0, -1).join(', ')} dan ${names[names.length - 1]}` : names[0]}` : '';
+  return `Lampu lalu lintas. Data OSM di area ini tidak punya lampu, jadi lampu di ${NUM_WORD[n] || n} persimpangan${where} adalah lampu simulasi, dengan waktu tetap dan fase khusus untuk pejalan kaki.`;
+}
+
+function mmss(sec) {
+  const s = Math.max(0, Math.ceil(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function set(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+const WEATHER_ICON = {
+  cerah: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5" fill="currentColor"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.2 5.2l1.8 1.8M17 17l1.8 1.8M5.2 18.8 7 17M17 7l1.8-1.8"/></g></svg>',
+  hujan: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 15a4.5 4.5 0 1 1 1.3-8.8A5.5 5.5 0 0 1 18.5 9 3.5 3.5 0 0 1 17.5 15z" fill="currentColor"/><g stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 18l-1 2.5M12 18l-1 2.5M16 18l-1 2.5"/></g></svg>',
+  kabut: '<svg viewBox="0 0 24 24" aria-hidden="true"><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8h13M6 12h14M3 16h12M8 20h10"/></g></svg>',
+  malam: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 3.5a8.5 8.5 0 1 0 5 13.9A7 7 0 0 1 15.5 3.5z" fill="currentColor"/></svg>',
+};
 
 export class Hud {
   constructor(app) {
     this.app = app;
     this.d = app.disposer;
-    this.tab = app.mode === 'tutorial' ? 'tutorial' : 'persepsi';
-    this.sheetOpen = true;
-    this.toasts = [];
+    this.logShown = '';
+    this.sheetTab = 'peta';
+    this.tool = null;
     this.build();
   }
 
-  on(target, type, fn, opts) {
-    this.d.on(target, type, fn, opts);
+  on(t, type, fn, opts) {
+    this.d.on(t, type, fn, opts);
   }
 
-  button(text, cls, onClick, attrs = {}) {
-    const b = el('button', { type: 'button', class: `s3d-btn ${cls || ''}`.trim(), ...attrs }, text);
+  button(content, cls, onClick, attrs = {}) {
+    const b = el('button', { type: 'button', class: `s3d-btn ${cls || ''}`.trim(), ...attrs }, content);
     if (onClick) this.on(b, 'click', onClick);
     return b;
   }
 
-  kbd(k) {
-    return el('kbd', {}, k);
-  }
-
-  /** Kelompok tombol pilihan (segmented control). */
-  seg(label, options, onPick, cls = '') {
-    const wrap = el('div', { class: `s3d-seg ${cls}`.trim(), role: 'group', 'aria-label': label });
-    const btns = new Map();
-    for (const [value, text, key] of options) {
-      const b = el('button', { type: 'button', class: 's3d-seg-btn', 'aria-pressed': 'false', dataset: { value } }, text, key ? el('span', { class: 's3d-key', 'aria-hidden': 'true' }, key) : null);
-      if (key) b.setAttribute('aria-keyshortcuts', key);
-      this.on(b, 'click', () => onPick(value));
-      wrap.append(b);
-      btns.set(value, b);
+  /** Kelompok tombol pilihan (aria-pressed). Mengembalikan [wadah, Map nilai ke tombol]. */
+  seg(label, items, onPick, cls = 's3d-speed') {
+    const box = el('div', { class: 's3d-seg', role: 'group', 'aria-label': label });
+    const map = new Map();
+    for (const [v, t, attrs] of items) {
+      const b = el('button', { type: 'button', class: cls, 'aria-pressed': 'false', ...attrs }, t);
+      this.on(b, 'click', () => onPick(v));
+      box.append(b);
+      map.set(v, b);
     }
-    return {
-      el: wrap,
-      set(v) {
-        for (const [val, b] of btns) b.setAttribute('aria-pressed', String(val === v));
-      },
-    };
-  }
-
-  toggle(text, key, onClick) {
-    const b = el('button', { type: 'button', class: 's3d-toggle', 'aria-pressed': 'true' }, el('span', { class: 's3d-toggle-dot', 'aria-hidden': 'true' }), text, key ? el('span', { class: 's3d-key', 'aria-hidden': 'true' }, key) : null);
-    if (key) b.setAttribute('aria-keyshortcuts', key);
-    this.on(b, 'click', onClick);
-    return b;
-  }
-
-  bar(label, centered = false) {
-    const fill = el('span', { class: 's3d-bar-fill' });
-    const val = el('span', { class: 's3d-bar-val' }, '0%');
-    const track = el('span', { class: `s3d-bar-track${centered ? ' is-centered' : ''}` }, centered ? el('span', { class: 's3d-bar-mid' }) : null, fill);
-    const row = el('div', { class: 's3d-bar' }, el('span', { class: 's3d-bar-label' }, label), track, val);
-    return { el: row, fill, val };
-  }
-
-  panel(id, title, ...children) {
-    const body = el('div', { class: 's3d-panel-body', id: `s3d-body-${id}` }, ...children);
-    const head = el('button', { type: 'button', class: 's3d-panel-head', 'aria-expanded': 'true', 'aria-controls': `s3d-body-${id}` }, el('span', {}, title), el('span', { class: 's3d-chev', 'aria-hidden': 'true' }));
-    const sec = el('section', { class: 's3d-panel', dataset: { tab: id }, 'aria-label': title }, head, body);
-    this.on(head, 'click', () => {
-      if (this.mobile) return;
-      const open = head.getAttribute('aria-expanded') !== 'true';
-      head.setAttribute('aria-expanded', String(open));
-      sec.classList.toggle('is-collapsed', !open);
-    });
-    return sec;
-  }
-
-  setCollapsed(sec, collapsed) {
-    const head = sec.querySelector('.s3d-panel-head');
-    head.setAttribute('aria-expanded', String(!collapsed));
-    sec.classList.toggle('is-collapsed', collapsed);
+    return [box, map];
   }
 
   build() {
-    const { app } = this;
-    const root = el('div', { class: 's3d', dataset: { mode: app.mode, layout: 'desktop' } });
+    const app = this.app;
+    const root = el('div', { class: 's3d', dataset: { mode: app.mode, layout: 'desktop', sheet: 'besar', mapBig: 'false' } });
     this.root = root;
-    const stage = el('div', { class: 's3d-stage' });
-    this.stage = stage;
-    this.labels = el('div', { class: 's3d-labels', 'aria-hidden': 'true' });
+    this.stage = el('div', { class: 's3d-stage' });
+    root.append(this.stage);
 
     // ===== bar atas =====
-    this.modeTabs = new Map();
-    const modes = el('div', { class: 's3d-modes', role: 'tablist', 'aria-label': 'Mode simulator' });
-    for (const [m, t] of [
-      ['tutorial', 'Mode Tutorial'],
-      ['bebas', 'Mode Bebas'],
-    ]) {
-      const b = el('button', { type: 'button', role: 'tab', class: 's3d-mode', dataset: { mode: m }, 'aria-selected': String(app.mode === m) }, el('span', { class: 's3d-long' }, 'Mode '), t.replace('Mode ', ''));
-      this.on(b, 'click', () => app.setMode(m));
-      modes.append(b);
-      this.modeTabs.set(m, b);
-    }
-    this.camSeg = this.seg(
-      'Sudut kamera',
-      CAMERA_MODES.map((m, i) => [m, CAMERA_LABEL[m], String(i + 1)]),
+    const [modes, modeBtns] = this.seg('Mode', [['panduan', 'Panduan'], ['jelajah', 'Jelajah']], (m) => app.setMode(m), 's3d-mode');
+    modes.className = 's3d-modes';
+    this.modeBtns = modeBtns;
+    const [cams, camBtns] = this.seg(
+      'Kamera',
+      CAMERA_MODES.map((m, i) => [m, [el('span', { class: 's3d-key', 'aria-hidden': 'true' }, String(i + 1)), CAMERA_LABEL[m]], { 'aria-keyshortcuts': String(i + 1), title: `Kamera ${CAMERA_LABEL[m]} (tombol ${i + 1})` }]),
       (m) => app.setCamera(m),
+      's3d-cam',
     );
-    this.camGroup = el('div', { class: 's3d-group', dataset: { hl: 'kamera' } }, el('span', { class: 's3d-glabel' }, 'Kamera'), this.camSeg.el);
-    this.wxSeg = this.seg(
-      'Cuaca',
-      Object.entries(WEATHER_LABEL).map(([k, v]) => [k, v]),
-      (w) => app.setWeather(w),
+    cams.className = 's3d-cams';
+    this.camBtns = camBtns;
+    this.wxIcon = el('span', { class: 's3d-wx-icon' });
+    this.wxName = el('span', { class: 's3d-wx-name' });
+    this.wxNext = el('span', { class: 's3d-wx-next' });
+    this.weather = el(
+      'div',
+      { class: 's3d-weather', title: 'Cuaca berganti sendiri tiap 5 menit waktu simulasi. Saat dijeda hitungan berhenti, saat dipercepat pergantian datang lebih cepat.' },
+      this.wxIcon,
+      el('span', { class: 's3d-wx-text' }, this.wxName, this.wxNext),
     );
-    this.wxGroup = el('div', { class: 's3d-group', dataset: { hl: 'cuaca' } }, el('span', { class: 's3d-glabel' }, 'Cuaca'), this.wxSeg.el);
-    this.topMid = el('div', { class: 's3d-topmid' }, this.camGroup, this.wxGroup);
+    this.aboutBtn = this.button([el('span', { class: 's3d-long' }, 'Tentang peta'), el('span', { class: 's3d-short', 'aria-hidden': 'true' }, 'i')], 's3d-ghost s3d-about-btn', () => this.showAbout(true), { 'aria-label': 'Tentang peta' });
+    this.helpBtn = this.button('?', 's3d-icon s3d-help-btn', () => app.toggleHelp(), { 'aria-label': 'Bantuan pintasan papan ketik', 'aria-keyshortcuts': '?', title: 'Bantuan (tombol ?)' });
+    this.top = el(
+      'header',
+      { class: 's3d-top' },
+      el('div', { class: 's3d-brand' }, el('span', { class: 's3d-logo', 'aria-hidden': 'true' }), el('span', {}, 'Shuttle 3D Ma Chung')),
+      modes,
+      cams,
+      el('div', { class: 's3d-top-right' }, this.weather, this.aboutBtn, this.helpBtn),
+    );
+    root.append(this.top);
 
-    this.pauseText = el('span', { class: 's3d-pt' }, 'Jeda');
-    this.pauseBtn = this.button([el('span', { class: 's3d-pi', 'aria-hidden': 'true' }), this.pauseText], 's3d-pause', () => app.togglePause(), { 'aria-keyshortcuts': 'Space P', title: 'Jeda atau lanjutkan (Spasi atau P)', 'aria-pressed': 'false' });
-    this.slowBtn = this.button('−', 's3d-icon', () => app.changeSpeed(-1), { 'aria-label': 'Perlambat simulasi', title: 'Perlambat ([ atau -)' });
-    this.speedOut = el('output', { class: 's3d-speed', 'aria-live': 'off' }, '1x');
-    this.fastBtn = this.button('+', 's3d-icon', () => app.changeSpeed(1), { 'aria-label': 'Percepat simulasi', title: 'Percepat (] atau +)' });
-    const time = el('div', { class: 's3d-time', role: 'group', 'aria-label': 'Waktu simulasi' }, this.pauseBtn, this.slowBtn, this.speedOut, this.fastBtn);
-    this.qualSel = el('select', { class: 's3d-select', 'aria-label': 'Kualitas grafis' }, el('option', { value: 'hemat' }, 'Hemat'), el('option', { value: 'standar' }, 'Standar'), el('option', { value: 'tinggi' }, 'Tinggi'));
-    this.on(this.qualSel, 'change', () => app.setQuality(this.qualSel.value));
-    this.qualLabel = el('label', { class: 's3d-quality' }, el('span', {}, 'Kualitas'), this.qualSel);
-    this.helpBtn = this.button('?', 's3d-icon s3d-help-btn', () => app.toggleHelp(), { 'aria-label': 'Bantuan pintasan papan ketik', 'aria-keyshortcuts': 'H', title: 'Pintasan papan ketik (H atau ?)' });
-    this.topRight = el('div', { class: 's3d-topright' }, time, this.qualLabel, this.helpBtn);
-    this.top = el('header', { class: 's3d-top' }, modes, this.topMid, this.topRight);
+    // ===== Lapisan otonomi =====
+    this.layerText = {};
+    this.layers = el('section', { class: 's3d-layers', 'aria-label': 'Lapisan otonomi', dataset: { tab: 'otonomi' } });
+    LAYERS.forEach(([k, t, sub], i) => {
+      this.layerText[k] = el('p', {});
+      this.layers.append(el('div', { class: 's3d-layer', dataset: { k } }, el('h3', {}, el('span', { class: 's3d-layer-n' }, String(i + 1)), t, el('small', {}, ` ${sub}`)), this.layerText[k]));
+    });
+    root.append(this.layers);
 
-    // ===== panel tutorial =====
-    this.tut = {};
-    this.tut.step = el('span', { class: 's3d-tut-step' });
-    this.tut.min = this.button('', 's3d-icon s3d-tut-min', () => this.toggleTutMin(), { 'aria-label': 'Perkecil kartu tutorial', 'aria-expanded': 'true' });
-    this.tut.dots = el('ol', { class: 's3d-dots', 'aria-label': 'Kemajuan tutorial' });
-    this.tut.title = el('h2', { class: 's3d-tut-title', tabindex: '-1' });
-    this.tut.body = el('div', { class: 's3d-tut-body' });
-    this.tut.actions = el('div', { class: 's3d-tut-actions' });
-    this.tut.taskText = el('p', { class: 's3d-task-text' });
-    this.tut.taskState = el('span', { class: 's3d-task-state' });
-    this.tut.task = el('div', { class: 's3d-task', dataset: { done: 'false' } }, el('span', { class: 's3d-task-icon', 'aria-hidden': 'true' }), el('div', {}, el('span', { class: 's3d-task-label' }, 'Tugas'), this.tut.taskText, this.tut.taskState));
-    this.tut.note = el('p', { class: 's3d-tut-note', hidden: true, role: 'note' }, 'Autopilot sedang mati, jadi mobil tidak mengemudi sendiri. Nyalakan lagi dengan tombol Autopilot di panel Kontrol (atau tekan M).');
-    this.tut.prev = this.button('Sebelumnya', 's3d-ghost', () => app.tutorial.prev());
-    this.tut.next = this.button('Lanjut', 's3d-primary', () => app.tutorial.next());
-    this.tut.pill = this.button('', 's3d-tut-pill', () => this.toggleTutMin(false));
-    const tutInner = el('div', { class: 's3d-tut-inner' }, el('div', { class: 's3d-tut-head' }, this.tut.step, this.tut.min), this.tut.dots, this.tut.title, this.tut.body, this.tut.actions, this.tut.task, this.tut.note, el('div', { class: 's3d-tut-nav' }, this.tut.prev, this.tut.next));
-    this.tutPanel = el('section', { class: 's3d-panel s3d-tut', dataset: { tab: 'tutorial' }, 'aria-label': 'Tutorial' }, tutInner, this.tut.pill);
-
-    // ===== panel persepsi =====
-    this.lidarTg = this.toggle('LiDAR', 'L', () => app.toggleLidar());
-    this.boxTg = this.toggle('Kotak deteksi', 'K', () => app.toggleBoxes());
-    this.fovTg = this.toggle('Bidang kamera', null, () => app.toggleFov());
-    this.sensLine = el('p', { class: 's3d-muted s3d-small' });
-    this.objList = el('ul', { class: 's3d-objs', 'aria-label': 'Objek terdekat' });
-    this.objRows = [];
-    for (let i = 0; i < 5; i++) {
-      const dot = el('span', { class: 's3d-dot' });
-      const name = el('span', { class: 's3d-obj-name' });
-      const dist = el('span', { class: 's3d-obj-dist' });
-      const rel = el('span', { class: 's3d-obj-rel' });
-      const li = el('li', { hidden: true }, dot, name, dist, rel);
-      this.objList.append(li);
-      this.objRows.push({ li, dot, name, dist, rel });
-    }
-    this.objEmpty = el('p', { class: 's3d-muted s3d-small' }, 'Belum ada objek terdeteksi di sekitar mobil.');
-    this.counts = el('div', { class: 's3d-chips', 'aria-label': 'Jumlah objek per kelas' });
-    this.limiter = el('dd', {});
-    this.lightDot = el('span', { class: 's3d-dot s3d-light' });
-    this.lightText = el('span', {});
-    this.pPersepsi = this.panel(
-      'persepsi',
-      'Apa yang dilihat mobil',
-      el('div', { class: 's3d-toggles' }, this.lidarTg, this.boxTg, this.fovTg),
-      this.sensLine,
-      el('h3', { class: 's3d-sub' }, 'Objek terdekat'),
-      this.objList,
-      this.objEmpty,
-      this.counts,
-      el('dl', { class: 's3d-dl' }, el('dt', {}, 'Objek pembatas'), this.limiter, el('dt', {}, 'Lampu lalu lintas berikutnya'), el('dd', {}, this.lightDot, this.lightText)),
+    // ===== Perisai keselamatan =====
+    this.redOut = el('span', { class: 's3d-inv-val' }, '0');
+    this.pedOut = el('span', { class: 's3d-inv-val' }, '0');
+    this.intOut = el('strong', {}, '0');
+    this.npcOut = el('span', {}, '0');
+    this.logList = el('ol', { class: 's3d-log', 'aria-label': 'Intervensi terakhir' });
+    this.logEmpty = el('p', { class: 's3d-muted s3d-small' }, 'Belum ada intervensi. Perisai diam selama rencana sudah aman.');
+    this.pShield = el(
+      'section',
+      { class: 's3d-card s3d-shield', 'aria-labelledby': 's3d-shield-title', dataset: { tab: 'perisai' } },
+      el('h2', { id: 's3d-shield-title' }, 'Perisai keselamatan'),
+      el(
+        'div',
+        { class: 's3d-inv' },
+        el('div', { class: 's3d-inv-cell' }, this.redOut, el('span', { class: 's3d-inv-label' }, 'Terobos lampu merah')),
+        el('div', { class: 's3d-inv-cell' }, this.pedOut, el('span', { class: 's3d-inv-label' }, 'Kontak dengan pejalan kaki')),
+      ),
+      el('p', { class: 's3d-small' }, 'Intervensi pada shuttle: ', this.intOut, el('span', { class: 's3d-muted' }, ', pada mobil, motor, dan angkot: ', this.npcOut)),
+      this.logList,
+      this.logEmpty,
     );
 
-    // ===== panel perencanaan =====
-    this.behBadge = el('span', { class: 's3d-badge' }, 'Melaju');
-    this.behWhy = el('p', { class: 's3d-why' });
-    this.laneOut = el('dd', {});
-    this.routeOut = el('dd', {});
-    this.pathTg = this.toggle('Jalur rencana', null, () => app.togglePath());
-    this.pRencana = this.panel(
-      'rencana',
-      'Perencanaan',
-      el('div', { class: 's3d-beh' }, el('span', { class: 's3d-small s3d-muted' }, 'Perilaku'), this.behBadge),
-      this.behWhy,
-      el('dl', { class: 's3d-dl' }, el('dt', {}, 'Pilihan lajur'), this.laneOut, el('dt', {}, 'Rute (A*)'), this.routeOut),
-      el('div', { class: 's3d-toggles' }, this.pathTg),
-      el('p', { class: 's3d-legend s3d-small' }, el('span', { class: 's3d-swatch is-path' }), 'jalur beberapa detik ke depan', el('span', { class: 's3d-swatch is-route' }), 'sisa rute'),
+    // ===== Kendali dan alat =====
+    this.manualBtn = this.button('Ambil kemudi', 's3d-primary', () => app.toggleManual(), { 'aria-keyshortcuts': 'M', 'aria-pressed': 'false', title: 'Ambil kemudi atau serahkan ke autopilot (tombol M)' });
+    const xingBtn = this.button('Pejalan kaki menyeberang', '', () => app.ego.requestCrossing(), { 'aria-keyshortcuts': 'Y', title: 'Pejalan kaki menyeberang di depan shuttle (tombol Y)' });
+    this.raysBtn = this.button('Sinar LiDAR', '', () => app.sensors.setRays(!app.sensors.rays), { 'aria-keyshortcuts': 'L', 'aria-pressed': 'false', title: 'Tampilkan sinar LiDAR (tombol L)' });
+    const [views, viewBtns] = this.seg('Tampilan sensor', [['tenang', 'Tenang'], ['detail', 'Detail']], (v) => app.sensors.setView(v));
+    this.viewBtns = viewBtns;
+    const [dens, densBtns] = this.seg('Kepadatan lalu lintas', DENSITY.map(([t, n]) => [n, t]), (n) => (app.traffic.target = n));
+    this.densBtns = densBtns;
+    this.limitOut = el('output', { for: 's3d-limit' });
+    const limit = el('input', { type: 'range', id: 's3d-limit', min: '10', max: '40', step: '5', value: String(app.ego.speedLimitKmh) });
+    this.on(limit, 'input', () => app.ego.setSpeedLimit(Number(limit.value)));
+    const [tools, toolBtns] = this.seg('Alat jalan', [['parkir', OBSTACLE_LABEL.parkir], ['galian', OBSTACLE_LABEL.galian], ['tutup', 'Tutup jalan']], (t) => this.setTool(this.tool === t ? null : t), 's3d-btn');
+    tools.className = 's3d-ctl-row';
+    this.toolBtns = toolBtns;
+    this.aheadBtn = this.button('Taruh di depan shuttle', 's3d-ghost', () => this.placeAhead());
+    this.toolHint = el('p', { class: 's3d-small s3d-hint' });
+    this.toolBox = el('div', { class: 's3d-toolbox', hidden: true }, this.toolHint, this.aheadBtn);
+    const clearBtn = this.button('Angkat semua penghalang', 's3d-ghost', () => app.obstacles.clear());
+    this.halteSel = el('select', { id: 's3d-halte', 'aria-label': 'Halte' }, app.city.halte.map((h, i) => el('option', { value: String(i) }, h.name)));
+    const callBtn = this.button('Panggil penumpang', '', () => {
+      const i = Number(this.halteSel.value);
+      const k = app.ego.pax.call(i, 3);
+      app.toast(k ? `${k} penumpang menunggu di Halte ${app.city.halte[i].name}.` : `Antrean di Halte ${app.city.halte[i].name} sudah penuh.`);
+    });
+    this.pCtl = el(
+      'section',
+      { class: 's3d-card s3d-ctl', 'aria-labelledby': 's3d-ctl-title', dataset: { tab: 'kendali' } },
+      el('h2', { id: 's3d-ctl-title' }, 'Kendali dan alat'),
+      el('div', { class: 's3d-ctl-row' }, this.manualBtn, xingBtn),
+      el('div', { class: 's3d-ctl-row' }, el('span', { class: 's3d-small' }, 'Tampilan sensor'), views, this.raysBtn),
+      el('label', { class: 's3d-small s3d-limit', for: 's3d-limit' }, 'Batas kecepatan (pengaturan simulator): ', this.limitOut),
+      limit,
+      el('div', { class: 's3d-ctl-row' }, el('span', { class: 's3d-small' }, 'Kepadatan lalu lintas'), dens),
+      el('h3', {}, 'Alat jalan'),
+      tools,
+      this.toolBox,
+      el('div', { class: 's3d-ctl-row' }, clearBtn),
+      el('div', { class: 's3d-ctl-row' }, this.halteSel, callBtn),
     );
+    this.side = el('aside', { class: 's3d-side', 'aria-label': 'Panel simulator' }, this.pShield, this.pCtl);
+    root.append(this.side);
 
-    // ===== panel kontrol =====
-    this.apBtn = el('button', { type: 'button', class: 's3d-switch', role: 'switch', 'aria-checked': 'true', 'aria-keyshortcuts': 'M' }, el('span', { class: 's3d-switch-knob', 'aria-hidden': 'true' }), el('span', { class: 's3d-switch-text' }, 'Autopilot'), el('span', { class: 's3d-key', 'aria-hidden': 'true' }, 'M'));
-    this.on(this.apBtn, 'click', () => app.toggleAutopilot());
-    this.speedIn = el('input', { type: 'range', min: '10', max: '70', step: '5', value: '50', id: 's3d-target', 'aria-describedby': 's3d-target-out' });
-    this.speedOutT = el('output', { id: 's3d-target-out', for: 's3d-target' }, '50 km/jam');
-    this.on(this.speedIn, 'input', () => app.setTargetSpeed(Number(this.speedIn.value)));
-    this.speedBig = el('span', { class: 's3d-bigspeed' }, '0');
-    this.gasBar = this.bar('Gas');
-    this.brakeBar = this.bar('Rem');
-    this.steerBar = this.bar('Kemudi', true);
-    this.gasBar.el.classList.add('is-gas');
-    this.brakeBar.el.classList.add('is-brake');
-    this.steerBar.el.classList.add('is-steer');
-    this.aebBtn = this.button('Rem darurat', 's3d-danger', () => app.emergencyBrake(), { 'aria-keyshortcuts': 'B' });
-    this.aebBtn.append(el('span', { class: 's3d-key', 'aria-hidden': 'true' }, 'B'));
-    this.manualHint = el('p', { class: 's3d-small s3d-muted', hidden: true }, 'Kemudikan dengan tombol panah atau W, A, S, D, atau pakai tombol di bawah layar.');
-    this.manualHintTouch = 'Kemudikan dengan tombol Kiri, Gas, Rem, dan Kanan di layar.';
-    this.manualHintKeys = this.manualHint.textContent;
-    this.pKontrol = this.panel(
-      'kontrol',
-      'Kontrol',
-      el('div', { class: 's3d-row' }, this.apBtn, el('div', { class: 's3d-speedbox' }, this.speedBig, el('span', { class: 's3d-small s3d-muted' }, 'km/jam'))),
-      el('label', { class: 's3d-range', for: 's3d-target' }, el('span', {}, 'Kecepatan target'), this.speedOutT),
-      this.speedIn,
-      this.gasBar.el,
-      this.brakeBar.el,
-      this.steerBar.el,
-      this.aebBtn,
-      this.manualHint,
-    );
+    this.map = new RouteMap(app);
 
-    // ===== panel uji skenario =====
-    const obsBtns = el('div', { class: 's3d-grid3' });
-    this.obsBtns = new Map();
-    for (const [k, def] of Object.entries(OBSTACLE_TYPES)) {
-      const b = this.button(def.label, 's3d-obs', () => app.placeObstacle(k), { dataset: { type: k }, title: `Taruh ${def.label.toLowerCase()} sekitar 40 m di depan` });
-      obsBtns.append(b);
-      this.obsBtns.set(k, b);
-    }
-    this.clickTg = this.toggle('Taruh dengan klik di jalan', null, () => app.armClick());
-    this.clickTg.setAttribute('aria-pressed', 'false');
-    this.clickNote = el('p', { class: 's3d-small s3d-muted s3d-tutonly' }, 'Menaruh dengan klik tersedia di Mode Bebas.');
-    this.jayBtn = this.button('Pejalan kaki menyeberang', 's3d-warnbtn', () => app.jaywalker(), { 'aria-keyshortcuts': 'J' });
-    this.jayBtn.append(el('span', { class: 's3d-key', 'aria-hidden': 'true' }, 'J'));
-    this.clearBtn = this.button('Hapus rintangan', 's3d-ghost', () => app.clearObstacles());
-    this.trafIn = el('input', { type: 'range', min: '0', max: '60', step: '2', value: '30', id: 's3d-traf' });
-    this.trafOut = el('output', { for: 's3d-traf' }, '30 mobil');
-    this.on(this.trafIn, 'input', () => app.setTrafficDensity(Number(this.trafIn.value)));
-    this.pedIn = el('input', { type: 'range', min: '0', max: '80', step: '2', value: '40', id: 's3d-ped' });
-    this.pedOut = el('output', { for: 's3d-ped' }, '40 orang');
-    this.on(this.pedIn, 'input', () => app.setPedDensity(Number(this.pedIn.value)));
-    this.pUji = this.panel(
-      'uji',
-      'Uji skenario',
-      el('p', { class: 's3d-small s3d-muted s3d-keyhint' }, 'Taruh rintangan sekitar 40 m di depan, di lajur mobil (tombol O mengulang pilihan terakhir).'),
-      el('p', { class: 's3d-small s3d-muted s3d-touchhint' }, 'Taruh rintangan sekitar 40 m di depan, di lajur mobil.'),
-      obsBtns,
-      el('div', { class: 's3d-toggles s3d-bebasonly' }, this.clickTg),
-      this.clickNote,
-      el('div', { class: 's3d-row2' }, this.jayBtn, this.clearBtn),
-      el('label', { class: 's3d-range', for: 's3d-traf' }, el('span', {}, 'Kepadatan lalu lintas'), this.trafOut),
-      this.trafIn,
-      el('label', { class: 's3d-range', for: 's3d-ped' }, el('span', {}, 'Kepadatan pejalan kaki'), this.pedOut),
-      this.pedIn,
-    );
-
-    // ===== panel kota pintar =====
-    this.sigSeg = this.seg(
-      'Mode lampu lalu lintas',
-      [
-        ['adaptif', 'Adaptif'],
-        ['tetap', 'Waktu tetap'],
-      ],
-      (m) => app.setSignalMode(m),
-      's3d-seg-wide',
-    );
-    this.sigWhy = el('p', { class: 's3d-small s3d-muted' });
-    this.waitA = el('dd', {});
-    this.waitT = el('dd', {});
-    this.waitNow = el('dd', {});
-    this.nearSig = el('dd', {});
-    this.queueTg = this.toggle('Garis antrean', null, () => app.toggleQueues());
-    this.pKota = this.panel(
-      'kota',
-      'Kota pintar',
-      this.sigSeg.el,
-      this.sigWhy,
-      el('dl', { class: 's3d-dl s3d-dl-grid' }, el('dt', {}, 'Rata-rata tunggu, Adaptif'), this.waitA, el('dt', {}, 'Rata-rata tunggu, Waktu tetap'), this.waitT, el('dt', {}, 'Berhenti di lampu'), this.waitNow, el('dt', {}, 'Lampu di depan'), this.nearSig),
-      el('div', { class: 's3d-toggles' }, this.queueTg),
-    );
-
-    // ===== panel tampilan (khusus ponsel) =====
-    this.tampilBody = el('div', { class: 's3d-tampil' });
-    this.pTampil = this.panel('tampilan', 'Tampilan', this.tampilBody);
-
-    this.panels = [this.pPersepsi, this.pRencana, this.pKontrol, this.pUji, this.pKota];
-    this.left = el('aside', { class: 's3d-left', 'aria-label': 'Tutorial' });
-    this.right = el('aside', { class: 's3d-right', 'aria-label': 'Panel simulator' });
-
-    // ===== indikator keselamatan =====
-    const cell = (label, unit, hint) => {
-      const v = el('span', { class: 's3d-safe-val' }, '0');
-      const c = el('div', { class: 's3d-safe', title: hint }, el('span', { class: 's3d-safe-label' }, label), v, unit ? el('span', { class: 's3d-safe-unit' }, unit) : null);
-      return { c, v };
-    };
-    this.sSpeed = cell('Kecepatan', 'km/jam', 'Kecepatan mobil otonom sekarang');
-    this.sTtc = cell('TTC', '', 'Waktu sampai tabrakan bila tidak ada yang berubah');
-    this.sDev = cell('Simpangan lajur', 'm', 'Jarak titik tengah mobil dari jalur rencana');
-    this.sCol = cell('Tabrakan', '', 'Jumlah tabrakan mobil otonom');
-    this.sAeb = cell('Rem darurat', '', 'Berapa kali rem darurat bekerja');
-    this.sOvt = cell('Menyalip', '', 'Berapa kali mobil menyalip rintangan');
-    this.safety = el('div', { class: 's3d-safety', role: 'group', 'aria-label': 'Indikator keselamatan', dataset: { hl: 'safety' } }, this.sSpeed.c, this.sTtc.c, this.sDev.c, this.sCol.c, this.sAeb.c, this.sOvt.c);
-
-    // ===== tombol mengemudi manual =====
-    this.drive = el('div', { class: 's3d-drive', hidden: true, role: 'group', 'aria-label': 'Kemudi manual' });
-    for (const [key, text] of [
-      ['left', 'Kiri'],
-      ['up', 'Gas'],
-      ['down', 'Rem'],
-      ['right', 'Kanan'],
+    // ===== tombol kemudi di layar (mode manual) =====
+    this.pad = el('div', { class: 's3d-pad', role: 'group', 'aria-label': 'Kemudi manual', hidden: true });
+    for (const [k, t, lab] of [
+      ['up', '▲', 'Gas (panah atas atau W)'],
+      ['left', '◀', 'Belok kiri (panah kiri atau A)'],
+      ['down', '▼', 'Rem dan mundur (panah bawah atau S)'],
+      ['right', '▶', 'Belok kanan (panah kanan atau D)'],
     ]) {
-      const b = el('button', { type: 'button', class: 's3d-btn s3d-drive-btn', dataset: { key } }, text);
-      const set = (v) => (ev) => {
+      const b = el('button', { type: 'button', class: 's3d-btn s3d-pad-btn', dataset: { k }, 'aria-label': lab, title: lab }, t);
+      const hold = (v) => (ev) => {
         ev.preventDefault();
-        app.control.keys[key] = v;
-        b.classList.toggle('is-down', v);
+        app.ego.input[k] = v;
       };
-      this.on(b, 'pointerdown', set(true));
-      this.on(b, 'pointerup', set(false));
-      this.on(b, 'pointerleave', set(false));
-      this.on(b, 'pointercancel', set(false));
-      this.on(b, 'contextmenu', (ev) => ev.preventDefault());
-      this.drive.append(b);
+      this.on(b, 'pointerdown', hold(1));
+      for (const type of ['pointerup', 'pointerleave', 'pointercancel']) this.on(b, type, hold(0));
+      this.pad.append(b);
     }
+    root.append(this.pad);
+    this.shieldBadge = el('div', { class: 's3d-shield-badge', hidden: true, 'aria-hidden': 'true' }, 'Perisai keselamatan mengerem');
+    root.append(this.shieldBadge);
 
+    // ===== kartu Panduan =====
+    this.guideStep = el('span', { class: 's3d-guide-step' });
+    this.guideTitle = el('h2', { class: 's3d-guide-title', tabindex: '-1' });
+    this.guideBody = el('div', { class: 's3d-guide-body' });
+    this.guideLive = el('p', { class: 's3d-live s3d-small' });
+    this.guideTask = el('p', { class: 's3d-task-text' });
+    this.guideTaskBox = el('div', { class: 's3d-task', dataset: { done: 'false' } }, el('span', { class: 's3d-task-label' }, 'Tugas'), this.guideTask);
+    this.guidePrev = this.button('Sebelumnya', 's3d-ghost', () => app.guide.prev());
+    this.guideNext = this.button('Lanjut', 's3d-primary', () => app.guide.next());
+    this.guide = el('section', { class: 's3d-card s3d-guide', 'aria-label': 'Panduan', dataset: { tab: 'panduan' } }, this.guideStep, this.guideTitle, this.guideBody, this.guideLive, this.guideTaskBox, el('div', { class: 's3d-guide-nav' }, this.guidePrev, this.guideNext));
+    this.left = el('div', { class: 's3d-left' }, this.guide, this.map.root);
+    root.append(this.left);
+
+    // ===== kontrol waktu kecil di pojok =====
+    this.pauseBtn = this.button('', 's3d-icon s3d-pause', () => app.togglePause(), { 'aria-label': 'Jeda', 'aria-keyshortcuts': 'Space', title: 'Jeda atau lanjutkan (Spasi)', 'aria-pressed': 'false' });
+    const [speeds, speedBtns] = this.seg('Kecepatan waktu', SPEEDS.map((s) => [s, `${s}x`]), (s) => app.setTimeScale(s));
+    speeds.className = 's3d-speeds';
+    this.speedBtns = speedBtns;
+    this.corner = el('div', { class: 's3d-corner' }, this.pauseBtn, speeds);
+    root.append(this.corner);
+
+    root.append(el('div', { class: 's3d-attrib' }, el('a', { href: 'https://www.openstreetmap.org/copyright', target: '_blank', rel: 'noopener' }, '© Kontributor OpenStreetMap')));
     this.toastBox = el('div', { class: 's3d-toasts', role: 'status', 'aria-live': 'polite' });
-    this.placeHint = el('div', { class: 's3d-placehint', hidden: true }, el('span', {}), this.button('Selesai', 's3d-ghost s3d-small-btn', () => app.armClick(false)));
-    this.pausedBadge = el('div', { class: 's3d-paused', hidden: true }, 'Dijeda');
+    this.paused = el('div', { class: 's3d-paused', hidden: true }, 'Dijeda');
+    this.status = el('p', { class: 's3d-sr', role: 'status', 'aria-live': 'polite' });
+    root.append(this.toastBox, this.paused, this.status);
 
     // ===== lembar bawah (ponsel) =====
-    this.tabBtns = new Map();
-    const tabs = el('div', { class: 's3d-tabs', role: 'tablist', 'aria-label': 'Panel' });
-    for (const [id, text] of TABS) {
-      const b = el('button', { type: 'button', role: 'tab', class: 's3d-tab', dataset: { tab: id }, 'aria-selected': 'false' }, text);
-      this.on(b, 'click', () => this.setTab(id, true));
-      tabs.append(b);
-      this.tabBtns.set(id, b);
-    }
-    this.sheetBtn = this.button('', 's3d-icon s3d-sheet-btn', () => this.toggleSheet(), { 'aria-label': 'Perkecil panel', 'aria-expanded': 'true' });
-    this.sheetHead = el('div', { class: 's3d-sheet-head' }, el('div', { class: 's3d-tabrow' }, tabs, this.sheetBtn));
+    const [tabs, sheetTabs] = this.seg('Panel', [['panduan', 'Panduan'], ['peta', 'Peta'], ['otonomi', 'Otonomi'], ['perisai', 'Perisai'], ['kendali', 'Kendali']], (id) => this.setSheetTab(id, true), 's3d-sheet-tab');
+    tabs.className = 's3d-sheet-tabs';
+    this.sheetTabs = sheetTabs;
     this.sheetBody = el('div', { class: 's3d-sheet-body' });
-    this.sheet = el('div', { class: 's3d-sheet' }, this.sheetHead, this.sheetBody);
+    this.sheet = el('div', { class: 's3d-sheet' }, tabs, this.sheetBody);
+    root.append(this.sheet);
+    this.panels = [this.guide, this.map.root, this.layers, this.pShield, this.pCtl];
 
-    // ===== bantuan =====
+    // ===== dialog bantuan =====
     const keys = [
-      [['1 2 3 4'], 'Pilih kamera Orbit, Kejar, Atas, atau Kokpit'],
-      [['C'], 'Ganti ke kamera berikutnya'],
-      [['Spasi', 'P'], 'Jeda atau lanjutkan simulasi'],
-      [['[', '-'], 'Perlambat waktu (sampai 0,25x)'],
-      [[']', '+'], 'Percepat waktu (sampai 4x)'],
-      [['J'], 'Pejalan kaki menyeberang mendadak'],
-      [['O'], 'Taruh rintangan sekitar 40 m di depan'],
-      [['B'], 'Rem darurat'],
-      [['M'], 'Autopilot nyala atau mati'],
-      [['L'], 'Tampilan LiDAR'],
-      [['K'], 'Kotak deteksi'],
-      [['Panah', 'W A S D'], 'Mengemudi saat autopilot mati'],
-      [['H', '?'], 'Buka atau tutup bantuan ini'],
+      [['1', '2', '3', '4'], 'Kamera Kabin, Drone, Sinematik, atau Peta'],
+      [['Spasi'], 'Jeda atau lanjutkan simulasi'],
+      [['M'], 'Ambil kemudi, atau serahkan lagi ke autopilot'],
+      [['↑', '↓', '←', '→'], 'Mengemudi manual (juga W, S, A, D). Perisai keselamatan tetap aktif'],
+      [['Y'], 'Pejalan kaki menyeberang di depan shuttle'],
+      [['L'], 'Tampilkan atau sembunyikan sinar LiDAR'],
+      [['?'], 'Buka atau tutup bantuan ini'],
+      [['Esc'], 'Tutup jendela yang terbuka, atau lepas alat jalan'],
     ];
     const dl = el('dl', { class: 's3d-keys' });
-    for (const [ks, text] of keys) {
-      dl.append(el('dt', {}, ks.map((k, i) => [i ? el('span', { class: 's3d-or' }, 'atau') : null, this.kbd(k)])), el('dd', {}, text));
-    }
+    for (const [ks, t] of keys) dl.append(el('dt', {}, ks.map((k) => el('kbd', {}, k))), el('dd', {}, t));
     this.helpClose = this.button('Tutup', 's3d-primary', () => app.toggleHelp(false));
-    this.helpCard = el('div', { class: 's3d-help-card' }, el('h2', { id: 's3d-help-title' }, 'Pintasan papan ketik'), el('p', { class: 's3d-muted s3d-small' }, 'Setiap pintasan juga punya tombol di layar. Pintasan tidak aktif saat kamu sedang mengetik. Tombol P selalu menjeda atau melanjutkan simulasi.'), dl, this.helpClose);
-    this.help = el('div', { class: 's3d-help', hidden: true, role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 's3d-help-title' }, this.helpCard);
-    this.on(this.help, 'click', (ev) => {
-      if (ev.target === this.help) app.toggleHelp(false);
+    this.help = this.dialog(
+      's3d-help',
+      'Pintasan papan ketik',
+      el('p', { class: 's3d-muted s3d-small' }, 'Setiap pintasan juga punya tombol di layar. Pintasan tidak aktif saat kamu sedang mengetik.'),
+      dl,
+      el('p', { class: 's3d-small' }, 'Cuaca berganti sendiri tiap 5 menit waktu simulasi. Saat dijeda hitungan berhenti, saat dipercepat pergantian datang lebih cepat.'),
+      this.helpClose,
+    );
+    this.on(this.help, 'click', (ev) => ev.target === this.help && app.toggleHelp(false));
+
+    // ===== dialog tentang peta =====
+    this.aboutClose = this.button('Tutup', 's3d-primary', () => this.showAbout(false));
+    this.about = this.dialog(
+      's3d-about',
+      'Tentang peta',
+      el('p', {}, 'Jalan, bundaran, gedung, dan taman di sini berasal dari OpenStreetMap, peta dunia yang dibuat bersama oleh para kontributornya. Datanya diambil pada 28 September 2026 untuk area sekitar Universitas Ma Chung, Malang, lalu dipotong kira-kira 1 km x 1 km.'),
+      el('p', {}, 'Kendaraan otonom sungguhan memakai peta HD yang mencatat setiap lajur dengan ketelitian sentimeter. OpenStreetMap adalah peta komunitas yang tidak serinci itu, jadi beberapa hal di sini kami perkirakan:'),
+      el(
+        'ul',
+        {},
+        el('li', {}, 'Jumlah dan lebar lajur, dari kelas jalan dan jarak antarjalur di jalan satu arah.'),
+        el('li', {}, 'Garis tengah lajur dan bentuk persimpangan, yang dihaluskan supaya kendaraan bisa berbelok mulus.'),
+        el('li', {}, 'Tinggi gedung. Rumah dibuat 1 sampai 2 lantai, gedung kampus 3 sampai 5 lantai.'),
+        el('li', {}, signalNote(app.city.data.signals)),
+        el('li', {}, 'Trotoar, zebra cross, pohon peneduh, dan halte shuttle.'),
+        el('li', {}, 'Beberapa ujung jalan yang di data berhenti beberapa meter sebelum jalan lain kami sambungkan.'),
+      ),
+      el('p', {}, 'Tanah dibuat datar, padahal aslinya daerah ini berbukit. Kendaraan berjalan di lajur kiri dan bundaran berputar searah jarum jam, sesuai data dan aturan lalu lintas di Indonesia.'),
+      el('p', { class: 's3d-small' }, 'Sumber data: ', el('a', { href: 'https://www.openstreetmap.org/copyright', target: '_blank', rel: 'noopener' }, '© Kontributor OpenStreetMap'), ', lisensi ODbL.'),
+      this.aboutClose,
+    );
+    this.on(this.about, 'click', (ev) => ev.target === this.about && this.showAbout(false));
+
+    // ===== klik jalan di tampilan 3D untuk alat jalan =====
+    this.ray = new THREE.Raycaster();
+    this.ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    this.hit = new THREE.Vector3();
+    this.down = null;
+    this.on(this.stage, 'pointerdown', (ev) => (this.down = { x: ev.clientX, y: ev.clientY }));
+    this.on(this.stage, 'pointerup', (ev) => {
+      const d = this.down;
+      this.down = null;
+      if (!this.tool || !d || Math.hypot(ev.clientX - d.x, ev.clientY - d.y) > 6) return;
+      const r = this.stage.getBoundingClientRect();
+      this.ray.setFromCamera({ x: ((ev.clientX - r.left) / r.width) * 2 - 1, y: -((ev.clientY - r.top) / r.height) * 2 + 1 }, app.camera);
+      if (this.ray.ray.intersectPlane(this.ground, this.hit)) this.applyTool(this.hit.x, this.hit.z);
     });
-
-    this.sr = el('p', { class: 's3d-sr', 'aria-live': 'polite' });
-    stage.append(this.labels, this.top, this.left, this.right, this.safety, this.drive, this.toastBox, this.placeHint, this.pausedBadge);
-    root.append(stage, this.sheet, this.help, this.sr);
-    // Setelah tombol diklik atau diketuk, lepaskan fokusnya. Dengan begitu Spasi kembali menjeda
-    // simulasi dan tidak mengulang aksi tombol. Aktivasi dengan papan ketik (detail 0) tidak diubah.
-    this.on(root, 'click', (ev) => {
-      if (!ev.detail) return;
-      const b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
-      if (b && b === document.activeElement) b.blur();
-    });
-    this.occ = [];
-    this.applyLayout(false);
   }
 
-  /**
-   * Kotak panel di atas kanvas (relatif terhadap panggung). Label 3D yang jatuh di belakang panel
-   * disembunyikan supaya tidak tembus pandang di balik panel kaca.
-   */
-  measureOccluders() {
-    const st = this.stage.getBoundingClientRect();
-    const out = [];
-    const add = (node) => {
-      if (!node || node.hidden) return;
-      const r = node.getBoundingClientRect();
-      if (r.width < 2 || r.height < 2) return;
-      out.push({ l: r.left - st.left, t: r.top - st.top, r: r.right - st.left, b: r.bottom - st.top });
-    };
-    for (const c of this.top.children) {
-      if (c === this.topMid || c === this.topRight) for (const g of c.children) add(g);
-      else add(c);
-    }
-    for (const p of this.left.children) add(p);
-    for (const p of this.right.children) add(p);
-    if (!this.mobile) for (const c of this.safety.children) add(c);
-    add(this.placeHint);
-    add(this.drive);
-    this.occ = out;
+  dialog(cls, title, ...children) {
+    const id = `${cls}-title`;
+    const d = el('div', { class: `s3d-dialog ${cls}`, hidden: true, role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': id }, el('div', { class: 's3d-dialog-card' }, el('h2', { id }, title), ...children));
+    this.root.append(d);
+    return d;
   }
 
-  /** Pindahkan panel antara tata letak desktop dan ponsel. */
-  applyLayout(mobile) {
-    this.mobile = mobile;
-    this.root.dataset.layout = mobile ? 'mobile' : 'desktop';
-    if (mobile) {
-      this.sheetHead.prepend(this.safety);
-      this.tampilBody.append(this.camGroup, this.wxGroup, this.qualLabel);
-      this.sheetBody.append(this.tutPanel, ...this.panels, this.pTampil);
-      for (const p of [...this.panels, this.pTampil]) this.setCollapsed(p, false);
-      this.setTab(this.app.mode === 'bebas' && this.tab === 'tutorial' ? 'persepsi' : this.tab);
-    } else {
-      this.stage.insertBefore(this.safety, this.drive);
-      this.topMid.append(this.camGroup, this.wxGroup);
-      this.topRight.insertBefore(this.qualLabel, this.helpBtn);
-      this.left.append(this.tutPanel);
-      this.right.append(...this.panels);
-      for (const p of [...this.panels, this.tutPanel]) p.classList.remove('is-active');
-      this.setCollapsed(this.pUji, !this.uJiOpen);
-      this.setCollapsed(this.pKota, !this.kotaOpen);
-    }
-  }
-
-  setTab(id, user = false) {
-    if (this.app.mode === 'bebas' && id === 'tutorial') id = 'persepsi';
-    this.tab = id;
-    for (const [t, b] of this.tabBtns) {
-      b.setAttribute('aria-selected', String(t === id));
-      b.tabIndex = t === id ? 0 : -1;
-    }
-    for (const p of [this.tutPanel, ...this.panels, this.pTampil]) p.classList.toggle('is-active', p.dataset.tab === id);
-    if (user && !this.sheetOpen) this.toggleSheet(true);
-    if (this.mobile) this.sheetBody.scrollTop = 0;
-    if (user) this.tabBtns.get(id).classList.remove('is-pulse');
-  }
-
-  toggleSheet(force) {
-    this.sheetOpen = force === undefined ? !this.sheetOpen : force;
-    this.root.classList.toggle('is-sheet-min', !this.sheetOpen);
-    this.sheetBtn.setAttribute('aria-expanded', String(this.sheetOpen));
-    this.sheetBtn.setAttribute('aria-label', this.sheetOpen ? 'Perkecil panel' : 'Perbesar panel');
-  }
-
-  toggleTutMin(force) {
-    const min = force === undefined ? !this.tutPanel.classList.contains('is-min') : force;
-    this.tutPanel.classList.toggle('is-min', min);
-    this.tut.min.setAttribute('aria-expanded', String(!min));
-  }
-
-  setMode(mode) {
-    this.root.dataset.mode = mode;
-    for (const [m, b] of this.modeTabs) b.setAttribute('aria-selected', String(m === mode));
-    this.tabBtns.get('tutorial').hidden = mode !== 'tutorial';
-    if (mode === 'bebas' && this.tab === 'tutorial') this.setTab('persepsi');
-    if (mode === 'tutorial' && this.mobile) this.setTab('tutorial');
-  }
-
-  /** Sorot panel yang sedang dibahas tutorial. */
-  highlight(targets) {
-    const all = [this.pPersepsi, this.pRencana, this.pKontrol, this.pUji, this.pKota, this.safety, this.camGroup, this.wxGroup, this.modeTabs.get('bebas')];
-    for (const x of all) x.classList.remove('is-pulse');
-    for (const b of this.tabBtns.values()) b.classList.remove('is-pulse');
-    const map = { persepsi: this.pPersepsi, rencana: this.pRencana, kontrol: this.pKontrol, uji: this.pUji, kota: this.pKota, safety: this.safety, kamera: this.camGroup, cuaca: this.wxGroup, bebas: this.modeTabs.get('bebas') };
-    const tabOf = { persepsi: 'persepsi', rencana: 'rencana', kontrol: 'kontrol', uji: 'uji', kota: 'kota', kamera: 'tampilan', cuaca: 'tampilan' };
-    for (const t of targets || []) {
-      const x = map[t];
-      if (!x) continue;
-      x.classList.add('is-pulse');
-      if (x.classList.contains('s3d-panel') && !this.mobile) {
-        this.setCollapsed(x, false);
-        if (x === this.pUji) this.uJiOpen = true;
-        if (x === this.pKota) this.kotaOpen = true;
-      }
-      if (this.mobile && tabOf[t]) this.tabBtns.get(tabOf[t]).classList.add('is-pulse');
-    }
-    if (!this.mobile && targets && targets.length) {
-      // panel tambahan yang tidak dibahas dilipat supaya panel yang dibahas terlihat utuh
-      if (!targets.includes('uji')) {
-        this.setCollapsed(this.pUji, true);
-        this.uJiOpen = false;
-      }
-      if (!targets.includes('kota')) {
-        this.setCollapsed(this.pKota, true);
-        this.kotaOpen = false;
-      }
-      const last = map[targets[targets.length - 1]];
-      const first = map[targets[0]];
-      if (last && this.right.contains(last)) last.scrollIntoView({ block: 'nearest' });
-      if (first && this.right.contains(first)) first.scrollIntoView({ block: 'nearest' });
-    }
-  }
-
-  toast(text, kind = 'info') {
-    // pesan yang sama tidak ditumpuk
-    const same = this.toasts.find((x) => x.textContent === text);
-    if (same) {
-      same.remove();
-      this.toasts.splice(this.toasts.indexOf(same), 1);
-    }
-    const t = el('div', { class: `s3d-toast is-${kind}` }, text);
-    this.toastBox.append(t);
-    this.toasts.push(t);
-    while (this.toasts.length > (this.mobile ? 2 : 3)) this.toasts.shift().remove();
-    const timers = this.app.timers;
-    const id = setTimeout(() => {
-      timers.delete(id);
-      t.classList.add('is-out');
-      const id2 = setTimeout(() => {
-        timers.delete(id2);
-        t.remove();
-        const i = this.toasts.indexOf(t);
-        if (i >= 0) this.toasts.splice(i, 1);
-      }, 300);
-      timers.add(id2);
-    }, 3000);
-    timers.add(id);
+  showAbout(open) {
+    this.about.hidden = !open;
+    (open ? this.aboutClose : this.aboutBtn).focus();
   }
 
   showHelp(open) {
     this.help.hidden = !open;
-    if (open) {
-      // mulai dari atas supaya judul dan penjelasan terlihat, terutama di ponsel
-      this.helpCard.scrollTop = 0;
-      this.helpClose.focus({ preventScroll: true });
-    } else this.helpBtn.focus({ preventScroll: true });
+    if (open) this.helpClose.focus();
   }
 
-  // ===== pembaruan berkala =====
+  // ===== alat jalan =====
 
-  update() {
-    const { app } = this;
-    const e = app.ego;
-    this.measureOccluders();
-    const pl = app.planner;
-    const per = app.perception;
-    const sens = app.sensing;
-    const R = sens.ranges();
-    // bar atas
-    this.camSeg.set(app.cameras.mode);
-    this.wxSeg.set(app.weather.name);
-    const ts = app.timeScale;
-    this.speedOut.textContent = `${fmt(ts, ts < 1 ? 2 : 0)}x`;
-    if (ts === 0.5) this.speedOut.textContent = '0,5x';
-    this.pauseText.textContent = app.paused ? 'Lanjutkan' : 'Jeda';
-    this.pauseBtn.setAttribute('aria-label', app.paused ? 'Lanjutkan simulasi' : 'Jeda simulasi');
-    this.pauseBtn.setAttribute('aria-pressed', String(app.paused));
-    this.pausedBadge.hidden = !app.paused;
-    this.slowBtn.disabled = ts <= SPEED_STEPS[0];
-    this.fastBtn.disabled = ts >= SPEED_STEPS[SPEED_STEPS.length - 1];
-    if (this.qualSel.value !== app.quality) this.qualSel.value = app.quality;
+  setTool(t) {
+    this.tool = t;
+    for (const [k, b] of this.toolBtns) b.setAttribute('aria-pressed', String(k === t));
+    this.toolBox.hidden = !t;
+    this.aheadBtn.hidden = t === 'tutup';
+    if (t) this.toolHint.textContent = TOOL_HINT[t];
+    this.root.dataset.tool = t || '';
+  }
 
-    // keselamatan
-    this.sSpeed.v.textContent = fmt(Math.abs(kmh(e.v)), 0);
-    const ttc = pl.ttc;
-    const ttcTxt = ttc < 20 ? `${fmt(ttc, 1)} detik` : 'tidak ada konflik';
-    this.sTtc.v.textContent = ttcTxt;
-    this.sTtc.v.classList.toggle('is-long', ttcTxt.length > 12);
-    this.sTtc.c.dataset.tone = ttc < 1.8 ? 'danger' : ttc < 3.5 ? 'warn' : 'ok';
-    this.sDev.v.textContent = fmt(app.lateralError, 2);
-    this.sCol.v.textContent = fmt(app.counters.collisions, 0);
-    this.sCol.c.dataset.tone = app.counters.collisions ? 'danger' : 'ok';
-    this.sAeb.v.textContent = fmt(app.counters.aebAuto + app.counters.aebManual, 0);
-    this.sAeb.c.dataset.tone = pl.aeb || pl.manualBrakeT > 0 ? 'danger' : '';
-    this.sOvt.v.textContent = fmt(app.counters.overtakes, 0);
+  applyTool(x, z) {
+    const app = this.app;
+    const t = this.tool;
+    if (t === 'tutup') {
+      const id = app.obstacles.roadAt(x, z);
+      const r = id === null ? { ok: false, reason: 'bukan-jalan' } : app.obstacles.toggleRoad(id);
+      if (r.ok) app.toast(`${r.name || 'Ruas jalan'} ${r.closed ? 'ditutup' : 'dibuka lagi'}.`);
+      else app.toast(WHY[r.reason] || r.reason, 'warn');
+    } else if (t) this.placed(t, app.obstacles.placeNear(t, x, z));
+  }
 
-    // persepsi
-    this.lidarTg.setAttribute('aria-pressed', String(sens.showLidar));
-    this.boxTg.setAttribute('aria-pressed', String(per.showBoxes));
-    this.fovTg.setAttribute('aria-pressed', String(sens.showFov));
-    this.sensLine.textContent = `Jangkauan LiDAR ${fmt(R.lidar, 0)} m, kamera ${fmt(R.kamera, 0)} m. ${fmt(sens.pointCount, 0)} titik LiDAR per putaran.`;
-    const sorted = per.list.slice().sort((a, b) => a.dist - b.dist);
-    for (let i = 0; i < this.objRows.length; i++) {
-      const row = this.objRows[i];
-      const t = sorted[i];
-      if (!t) {
-        row.li.hidden = true;
-        continue;
-      }
-      row.li.hidden = false;
-      const cls = t.known ? t.cls : 'objek';
-      row.dot.style.background = CLASSES[cls].color;
-      row.name.textContent = CLASSES[cls].label;
-      row.dist.textContent = `${fmt(per.gap(t), 0)} m`;
-      const rate = t.rate || 0;
-      row.rel.textContent = Math.abs(rate) < 0.3 ? 'jarak tetap' : rate < 0 ? `mendekat ${fmt(-rate, 1)} m/s` : `menjauh ${fmt(rate, 1)} m/s`;
-      row.rel.dataset.tone = rate < -0.3 ? 'warn' : '';
-    }
-    this.objEmpty.hidden = sorted.length > 0;
-    const counts = per.counts();
-    const chips = Object.keys(CLASSES)
-      .filter((k) => counts[k])
-      .map((k) => `<span class="s3d-chip"><span class="s3d-dot" style="background:${CLASSES[k].color}"></span>${CLASSES[k].label} ${counts[k]}</span>`)
-      .join('');
-    if (this.counts.innerHTML !== chips) this.counts.innerHTML = chips;
-    this.limiter.textContent = pl.limiter;
-    const L = per.light;
-    const colName = { red: 'Merah', yellow: 'Kuning', green: 'Hijau' };
-    if (L) {
-      this.lightDot.dataset.color = L.color;
-      this.lightText.textContent = L.color === 'unknown' ? `Belum terbaca, ${fmt(L.dist, 0)} m` : `${colName[L.color]}, ${fmt(L.dist, 0)} m`;
+  placeAhead() {
+    if (this.tool) this.placed(this.tool, this.app.obstacles.placeAhead(this.tool));
+  }
+
+  placed(t, r) {
+    if (r.ok) this.app.toast(`${OBSTACLE_LABEL[t]} dipasang${r.ob.name ? ` di ${r.ob.name}` : ''}.`);
+    else this.app.toast(WHY[r.reason] || r.reason, 'warn');
+  }
+
+  // ===== tata letak =====
+
+  applyLayout(mobile) {
+    this.mobile = mobile;
+    this.root.dataset.layout = mobile ? 'mobile' : 'desktop';
+    if (mobile) {
+      this.sheetBody.append(...this.panels);
+      this.setSheetTab(this.app.mode === 'panduan' ? 'panduan' : 'peta');
     } else {
-      this.lightDot.dataset.color = 'none';
-      const st = pl.stopInfo;
-      this.lightText.textContent = st && !st.signalized ? 'Tidak ada, tikungan tanpa lampu' : 'Tidak ada dalam 150 m';
+      this.side.append(this.pShield, this.pCtl);
+      this.left.append(this.guide, this.map.root);
+      this.root.insertBefore(this.layers, this.corner);
+      for (const p of this.panels) p.hidden = false;
+      this.setMode(this.app.mode);
     }
+  }
 
-    // perencanaan
-    this.behBadge.textContent = pl.behavior;
-    this.behBadge.dataset.tone = BEHAVIOR_TONE[pl.behavior] || 'info';
-    this.behWhy.textContent = pl.reason;
-    this.laneOut.textContent = pl.laneWhy ? `${pl.laneText} (${pl.laneWhy})` : pl.laneText;
-    this.routeOut.textContent = `${pl.routeText}. Tujuan ${fmt(pl.destLeft || 0, 0)} m lagi.`;
-    this.pathTg.setAttribute('aria-pressed', String(pl.showPath));
+  setSheetTab(id, tapped) {
+    // ketuk tab yang sedang aktif untuk mengecilkan atau membesarkan lembar
+    if (tapped && id === this.sheetTab) this.root.dataset.sheet = this.root.dataset.sheet === 'kecil' ? 'besar' : 'kecil';
+    else this.root.dataset.sheet = 'besar';
+    this.sheetTab = id;
+    for (const [k, b] of this.sheetTabs) b.setAttribute('aria-pressed', String(k === id));
+    for (const p of this.panels) p.hidden = p.dataset.tab !== id;
+  }
 
-    // kontrol
-    this.apBtn.setAttribute('aria-checked', String(app.autopilot));
-    this.speedBig.textContent = fmt(Math.abs(kmh(e.v)), 0);
-    const tk = Math.round(kmh(app.targetSpeed));
-    if (Number(this.speedIn.value) !== tk && document.activeElement !== this.speedIn) this.speedIn.value = String(tk);
-    this.speedOutT.textContent = `${fmt(tk, 0)} km/jam`;
-    const c = app.control;
-    this.gasBar.fill.style.width = `${Math.round(c.gas * 100)}%`;
-    this.gasBar.val.textContent = `${Math.round(c.gas * 100)}%`;
-    this.brakeBar.fill.style.width = `${Math.round(c.brake * 100)}%`;
-    this.brakeBar.val.textContent = `${Math.round(c.brake * 100)}%`;
-    const st = e.steer / 0.6;
-    const pct = Math.min(50, Math.abs(st) * 50);
-    this.steerBar.fill.style.left = st < 0 ? `${50 - pct}%` : '50%';
-    this.steerBar.fill.style.width = `${pct}%`;
-    const deg = Math.abs((e.steer * 180) / Math.PI);
-    this.steerBar.val.textContent = deg < 1 ? 'lurus' : `${st < 0 ? 'kiri' : 'kanan'} ${fmt(deg, 0)}°`;
-    this.manualHint.hidden = app.autopilot;
-    const mh = this.mobile ? this.manualHintTouch : this.manualHintKeys;
-    if (this.manualHint.textContent !== mh) this.manualHint.textContent = mh;
-    this.drive.hidden = app.autopilot;
-    if (this.tut.note) {
-      this.tut.note.hidden = app.autopilot || app.mode !== 'tutorial';
-      const nt = this.mobile ? 'Autopilot sedang mati, jadi mobil tidak mengemudi sendiri. Nyalakan lagi dengan tombol Autopilot di tab Kontrol.' : 'Autopilot sedang mati, jadi mobil tidak mengemudi sendiri. Nyalakan lagi dengan tombol Autopilot di panel Kontrol (atau tekan M).';
-      if (this.tut.note.textContent !== nt) this.tut.note.textContent = nt;
+  setMode(mode) {
+    this.root.dataset.mode = mode;
+    for (const [m, b] of this.modeBtns) b.setAttribute('aria-pressed', String(m === mode));
+    this.sheetTabs.get('panduan').hidden = mode !== 'panduan';
+    if (!this.mobile) this.guide.hidden = mode !== 'panduan';
+    else if (mode === 'panduan') this.setSheetTab('panduan');
+    else if (this.sheetTab === 'panduan') this.setSheetTab('peta');
+  }
+
+  setCamera(mode) {
+    for (const [m, b] of this.camBtns) b.setAttribute('aria-pressed', String(m === mode));
+  }
+
+  renderGuide(step, index, total, done) {
+    this.guideStep.textContent = `Langkah ${index + 1} dari ${total}`;
+    this.guideTitle.textContent = step.title;
+    this.guideBody.innerHTML = step.body;
+    this.guideTaskBox.hidden = !step.task;
+    if (step.task) this.guideTask.textContent = step.task;
+    this.guideTaskBox.dataset.done = String(!!done);
+    this.guidePrev.disabled = index === 0;
+    this.guideNext.textContent = index === total - 1 ? 'Ke Jelajah' : 'Lanjut';
+    this.guideLive.hidden = !step.live;
+    this.layers.dataset.focus = step.layer || '';
+    this.step = step;
+  }
+
+  toast(text, kind = '') {
+    const t = el('div', { class: `s3d-toast ${kind}`.trim() }, text);
+    this.toastBox.append(t);
+    const timer = setTimeout(() => t.remove(), 4200);
+    this.app.timers.add(timer);
+    while (this.toastBox.children.length > 3) this.toastBox.firstChild.remove();
+  }
+
+  /** Perbarui teks panel (beberapa kali per detik). */
+  update() {
+    const app = this.app;
+    const w = app.weather;
+    const ego = app.ego;
+    if (this.wxShown !== w.name) {
+      this.wxShown = w.name;
+      this.wxIcon.innerHTML = WEATHER_ICON[w.name] || '';
+      this.weather.dataset.wx = w.name;
+      set(this.wxName, WEATHER_LABEL[w.name]);
     }
-
-    // uji skenario
-    this.clickTg.setAttribute('aria-pressed', String(app.scen.clickArmed));
-    this.trafOut.textContent = `${fmt(app.traffic.target, 0)} mobil`;
-    this.pedOut.textContent = `${fmt(app.peds.target, 0)} orang`;
-    for (const [k, b] of this.obsBtns) b.classList.toggle('is-selected', app.scen.selected === k);
-    this.placeHint.hidden = !app.scen.clickArmed;
-    if (app.scen.clickArmed) this.placeHint.firstChild.textContent = `${this.mobile ? 'Ketuk' : 'Klik'} jalan untuk menaruh ${OBSTACLE_TYPES[app.scen.selected].label.toLowerCase()}.`;
-
-    // kota pintar
-    const sig = app.signals;
-    this.sigSeg.set(sig.mode);
-    this.sigWhy.textContent = sig.mode === 'adaptif' ? `Hijau hanya untuk arah yang antreannya terdeteksi, minimal ${TIMING.minGreen} detik dan maksimal ${TIMING.maxGreen} detik.` : `Setiap arah mendapat hijau ${TIMING.fixedGreen} detik bergiliran, walaupun jalannya kosong.`;
-    const wa = sig.avgWait('adaptif');
-    const wt = sig.avgWait('tetap');
-    this.waitA.textContent = wa === null ? 'belum ada data' : `${fmt(wa, 1)} detik (${fmt(sig.waits.adaptif.count, 0)} kendaraan)`;
-    this.waitT.textContent = wt === null ? 'belum ada data' : `${fmt(wt, 1)} detik (${fmt(sig.waits.tetap.count, 0)} kendaraan)`;
-    this.waitNow.textContent = `${fmt(app.waitingNow, 0)} kendaraan`;
-    const stp = pl.stopInfo;
-    const ctl = stp && stp.signalized ? sig.byNode.get(stp.node.id) : null;
-    this.nearSig.textContent = ctl ? ctl.describe() : 'Tidak ada lampu dekat di rute';
-    this.queueTg.setAttribute('aria-pressed', String(sig.showQueues));
-
-    // status untuk pembaca layar, hanya saat perilaku berubah
-    const status = `${pl.behavior}. ${pl.reason}`;
-    if (status !== this.lastStatus && app.simTime - (this.lastStatusT || -10) > 2.5) {
-      this.lastStatus = status;
+    const nextWx = WEATHER_LABEL[WEATHER_ORDER[(WEATHER_ORDER.indexOf(w.name) + 1) % 4]];
+    // ponsel: teks pendek supaya tidak terpotong
+    set(this.wxNext, this.root.dataset.layout === 'mobile' ? `${nextWx} ${mmss(w.countdown)}` : `${mmss(w.countdown)} lagi jadi ${nextWx}`);
+    set(this.redOut, String(app.invariants.redLight));
+    set(this.pedOut, String(app.invariants.pedContact));
+    this.redOut.dataset.bad = String(app.invariants.redLight > 0);
+    this.pedOut.dataset.bad = String(app.invariants.pedContact > 0);
+    set(this.intOut, String(app.shieldStats.shuttle));
+    set(this.npcOut, String(app.shieldStats.npc));
+    const key = app.shieldLogList.length ? app.shieldLogList[app.shieldLogList.length - 1].id : 0;
+    if (key !== this.logShown) {
+      this.logShown = key;
+      this.logList.textContent = '';
+      for (const l of app.shieldLogList.slice(-3).reverse()) this.logList.append(el('li', {}, el('span', { class: 's3d-log-t' }, mmss(l.t)), l.text));
+      this.logEmpty.hidden = app.shieldLogList.length > 0;
+    }
+    const L = app.sensors.layers();
+    for (const k in this.layerText) set(this.layerText[k], L[k]);
+    this.map.updateText();
+    if (this.step && this.step.live) set(this.guideLive, this.step.live(app));
+    app.guide.check();
+    const manual = ego.mode === 'manual';
+    set(this.manualBtn, manual ? 'Serahkan ke autopilot' : 'Ambil kemudi');
+    this.manualBtn.setAttribute('aria-pressed', String(manual));
+    this.pad.hidden = !manual;
+    this.shieldBadge.hidden = !(ego.shieldT > 0);
+    this.raysBtn.setAttribute('aria-pressed', String(app.sensors.rays));
+    for (const [v, b] of this.viewBtns) b.setAttribute('aria-pressed', String(v === app.sensors.view));
+    for (const [n, b] of this.densBtns) b.setAttribute('aria-pressed', String(n === app.traffic.target));
+    set(this.limitOut, `${ego.speedLimitKmh} km/jam`);
+    this.pauseBtn.setAttribute('aria-pressed', String(app.paused));
+    this.pauseBtn.setAttribute('aria-label', app.paused ? 'Lanjutkan' : 'Jeda');
+    this.pauseBtn.dataset.paused = String(app.paused);
+    this.paused.hidden = !app.paused;
+    for (const [sp, b] of this.speedBtns) b.setAttribute('aria-pressed', String(sp === app.timeScale));
+    const statusText = `${ego.statusText()}. ${WEATHER_LABEL[w.name]}, cuaca berganti dalam ${Math.ceil(w.countdown / 60)} menit.`;
+    if (statusText !== this.status.textContent && (!this.lastStatusT || app.simTime - this.lastStatusT > 8)) {
+      this.status.textContent = statusText;
       this.lastStatusT = app.simTime;
-      this.sr.textContent = `Mobil ${fmt(Math.abs(kmh(e.v)), 0)} km/jam. ${status}`;
     }
   }
 }
+

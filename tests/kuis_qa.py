@@ -257,7 +257,7 @@ def main():
         vis = page.evaluate("() => [...document.querySelectorAll('.kz-rev')].filter(li => !li.hidden).length")
         check(vis == total, "saringan 'Semua' menampilkan semua soal")
         links = page.evaluate("() => [...document.querySelectorAll('.kz-rev-link')].map(a => a.getAttribute('href'))")
-        check(all(l.startswith("#/pelajaran/") or l.startswith("#/simulator/") for l in links), "tautan pelajaran di pembahasan")
+        check(all(l.startswith("#/pelajaran/") or l.startswith("#/shuttle-3d/") for l in links), "tautan pelajaran di pembahasan")
 
         # langkah 2 (sudah terbuka bersama halaman hasil): belum lulus
         h = hook(page)

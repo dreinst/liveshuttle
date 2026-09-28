@@ -10,14 +10,15 @@
 //                   laju roda, dan bias giroskop. Prediksi memakai odometri, koreksi memakai GPS
 //                   dan/atau hasil pencocokan LiDAR dengan peta.
 //                   Ukuran yang terlalu jauh dari prediksi ditolak (uji jarak Mahalanobis).
-//   LidarLandmarks  jarak dan sudut dari LiDAR ke tiang dan rambu di sekitar mobil.
+//   LidarLandmarks  jarak dan sudut dari LiDAR ke landmark peta di sekitar mobil (tiang, rambu, dan
+//                   sudut gedung). Gedung menghalangi pandangan.
 //
 // Penyederhanaan: semuanya di bidang datar dan lintang serta bujur diganti meter. Semua acak memakai Rng berbiji supaya Ulangi memberi hasil yang sama.
 
 import { Rng, wrapAngle } from '../../engine/math.js';
 import { lineOfSight } from '../../engine/geometry.js';
 
-export const GPS_PERIOD = 1; // detik antara dua posisi GPS
+const GPS_PERIOD = 1; // detik antara dua posisi GPS
 export const LIDAR_PERIOD = 0.1; // LiDAR 10 kali per detik
 export const CHI2_95 = 5.991; // chi-kuadrat 2 derajat bebas, 95%
 const GPS_GATE = 13.82; // chi-kuadrat 2 derajat bebas, 99,9%
@@ -149,12 +150,7 @@ export class WheelImu {
 
 export class DeadReckoning {
   constructor() {
-    this.x = 0;
-    this.y = 0;
-    this.h = 0;
-    this.trail = [];
-    this.trailT = 0;
-    this.age = 0;
+    this.init(0, 0, 0);
   }
 
   init(x, y, h) {
@@ -193,14 +189,7 @@ const zeros = () => Array.from({ length: N }, () => new Array(N).fill(0));
 
 export class PoseFilter {
   constructor() {
-    this.s = [0, 0, 0, 1, 0];
-    this.P = zeros();
-    this.gpsCount = 0;
-    this.rejectRun = 0;
-    this.rejected = 0;
-    this.lastGain = null;
-    this.lastGpsAccepted = true;
-    this.lmUsed = 0;
+    this.init(0, 0, 0, 0, 0);
   }
 
   get x() {
@@ -222,12 +211,9 @@ export class PoseFilter {
     this.P[2][2] = sh * sh;
     this.P[3][3] = 0.03 * 0.03; // skala roda belum diketahui, kira-kira 3%
     this.P[4][4] = 0.005 * 0.005; // bias giroskop belum diketahui (rad/s)
-    this.gpsCount = 0;
     this.rejectRun = 0;
-    this.rejected = 0;
     this.lastGain = null;
     this.lastGpsAccepted = true;
-    this.lmUsed = 0;
   }
 
   /** Salin keadaan filter lain, lalu lebarkan ketidakpastian posisinya sedikit. */
@@ -311,7 +297,6 @@ export class PoseFilter {
     if (!res.K) {
       this.rejectRun++;
       if (this.rejectRun < 5) {
-        this.rejected++;
         this.lastGpsAccepted = false;
         return { accepted: false, d2: res.d2, gain: 0 };
       }
@@ -322,7 +307,6 @@ export class PoseFilter {
       res = this.correct(H, yx, yy, R, R, GPS_GATE, true);
     }
     this.rejectRun = 0;
-    this.gpsCount++;
     this.lastGain = (res.K[0][0] + res.K[1][1]) / 2;
     this.lastGpsAccepted = true;
     return { accepted: true, d2: res.d2, gain: this.lastGain };
@@ -378,7 +362,6 @@ export class PoseFilter {
     );
     if (!res.K) return { used: n, accepted: false, pairs };
     this.correctHeading(ph, sh);
-    this.lmUsed = n;
     // filter jelas tidak tersesat, jadi hitungan GPS yang ditolak dimulai dari nol lagi
     this.rejectRun = 0;
     return { used: n, accepted: true, pairs };
@@ -433,7 +416,7 @@ function associate(scan, landmarks, px, py, ph) {
       }
     }
     // vx, vy: titik ukur di kerangka mobil (x ke depan, y ke kanan)
-    return { r: m.r, b: m.b, vx: m.r * Math.cos(m.b), vy: m.r * Math.sin(m.b), lm: best, correct: !!best && best.id === m.id };
+    return { r: m.r, b: m.b, vx: m.r * Math.cos(m.b), vy: m.r * Math.sin(m.b), lm: best };
   });
 }
 
@@ -474,7 +457,8 @@ function register(pairs) {
 
 export class LidarLandmarks {
   /**
-   * landmarks: [{ id, x, y }] benda di peta HD. occluders: gedung yang menghalangi pandangan.
+   * landmarks: [{ id, x, y }] benda di peta HD. occluders: fungsi (x, y, radius) yang mengembalikan
+   * gedung penghalang pandangan di sekitar titik itu.
    * Jangkauan 40 m, galat jarak 5 cm, galat sudut 0,005 rad (sekitar 0,3 derajat).
    * Posisi di peta HD juga tidak sempurna: tiap landmark meleset sekitar 5 cm dari posisi aslinya.
    */
@@ -496,6 +480,7 @@ export class LidarLandmarks {
   /** Ukur semua landmark yang terlihat dari pose sebenarnya mobil. */
   scan(ego) {
     const out = [];
+    const occ = this.occluders(ego.x, ego.y, this.range + 5);
     for (const lm of this.landmarks) {
       const real = this.truth.get(lm.id);
       const dx = real.x - ego.x;
@@ -503,9 +488,8 @@ export class LidarLandmarks {
       const d = Math.hypot(dx, dy);
       if (d > this.range || d < 1.5) continue;
       if (this.rng.chance(this.miss)) continue;
-      if (!lineOfSight(this.occluders, ego.x, ego.y, real.x, real.y)) continue;
+      if (!lineOfSight(occ, ego.x, ego.y, real.x, real.y)) continue;
       out.push({
-        id: lm.id, // kunci jawaban untuk pengecekan, tidak dipakai saat mencocokkan
         r: d + this.rng.gaussian(0, this.rangeSd),
         b: wrapAngle(Math.atan2(dy, dx) - ego.heading + this.rng.gaussian(0, this.bearingSd)),
       });

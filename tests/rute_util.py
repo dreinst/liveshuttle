@@ -1,43 +1,78 @@
-"""Alat bantu uji untuk pelajaran Perencanaan Rute (port 8115)."""
-import sys
+"""Alat bantu uji untuk pelajaran Perencanaan Rute (peta jalan Malang). Server: port 8245.
+
+Jalankan server dulu: python3 tests/serve.py 8245
+"""
+import os
+import time
 
 from playwright.sync_api import sync_playwright
 
 CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-arm64/"
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
-BASE = "http://127.0.0.1:8115/"
+PORT = int(os.environ.get("RUTE_PORT", "8245"))
+BASE = f"http://127.0.0.1:{PORT}/"
 SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/rute/"
-
-COLS, ROWS, CELL = 24, 16, 25
-MAP_W, MAP_H = COLS * CELL, ROWS * CELL
+IGNORE = ("GPU stall due to ReadPixels",)
 
 
 class Session:
-    def __init__(self, mobile=False):
+    def __init__(self, mobile=False, reduced=False, gpu=False, swiftshader=False):
         self.mobile = mobile
+        self.reduced = reduced
+        self.gpu = gpu
+        self.swiftshader = swiftshader
         self.errors = []
 
     def __enter__(self):
+        os.makedirs(SHOTS, exist_ok=True)
         self.pw = sync_playwright().start()
-        self.browser = self.pw.chromium.launch(executable_path=CHROME, headless=True)
+        args = ["--use-angle=metal", "--enable-gpu"] if self.gpu else []
+        if self.swiftshader:
+            # alur perangkat lunak: WebGL lewat SwiftShader, kanvas 2D tanpa akselerasi GPU
+            args = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist", "--disable-gpu", "--disable-accelerated-2d-canvas"]
+        self.browser = self.pw.chromium.launch(executable_path=CHROME, headless=True, args=args)
+        opts = {"reduced_motion": "reduce"} if self.reduced else {}
         if self.mobile:
-            self.ctx = self.browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2, is_mobile=True, has_touch=True)
+            self.ctx = self.browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2, is_mobile=True, has_touch=True, **opts)
         else:
-            self.ctx = self.browser.new_context(viewport={"width": 1366, "height": 900}, device_scale_factor=1)
+            self.ctx = self.browser.new_context(viewport={"width": 1366, "height": 900}, device_scale_factor=1, **opts)
         self.page = self.ctx.new_page()
-        self.page.on("console", lambda m: self.errors.append(f"{m.type}: {m.text}") if m.type in ("error", "warning") else None)
+
+        def on_console(m):
+            if m.type in ("error", "warning") and not any(s in m.text for s in IGNORE):
+                self.errors.append(f"{m.type}: {m.text}")
+
+        self.page.on("console", on_console)
         self.page.on("pageerror", lambda e: self.errors.append(f"pageerror: {e}"))
         return self
 
-    def go(self, route, wait=1200):
+    def __exit__(self, *exc):
+        self.ctx.close()
+        self.browser.close()
+        self.pw.stop()
+
+    # ---------- navigasi ----------
+    def go(self, route="#/pelajaran/rute", wait_ready=True):
         self.page.goto(BASE + route, wait_until="load")
-        self.page.wait_for_timeout(wait)
+        if wait_ready:
+            self.page.wait_for_function("() => window.__simotonom && window.__simotonom.lessonStatus === 'ready' && window.__rute", timeout=20000)
+            self.page.wait_for_timeout(400)
+
+    def goto_step(self, i):
+        self.page.locator(f'.step-dot[data-go="{i}"]').first.click()
+        self.page.wait_for_timeout(300)
 
     def hook(self):
         return self.page.evaluate("() => JSON.parse(JSON.stringify(window.__simotonom))")
 
+    def snap(self):
+        return self.page.evaluate("() => window.__rute.snapshot()")
+
     def status(self):
         return self.page.locator(".sim-status").inner_text()
+
+    def done_tasks(self):
+        return self.hook().get("completedTasks", [])
 
     def shot(self, name, full=False, selector=None):
         path = SHOTS + name + ".png"
@@ -47,99 +82,52 @@ class Session:
             self.page.screenshot(path=path, full_page=full)
         return path
 
-    # ---------- peta ----------
-    def map_transform(self):
-        """Hitung letak peta di kanvas dengan rumus yang sama seperti boundsFor() di rute.js."""
-        box = self.page.locator(".sim-canvas").bounding_box()
-        w, h = box["width"], box["height"]
-        narrow = w / h < 1.2
-        top_px = 58 if narrow else 46
-        bot_px = 70 if narrow else 34
-        side_px = 6 if narrow else 12
-        avail = max(60, h - top_px - bot_px)
-        s = max(0.05, min((w - 2 * side_px) / MAP_W, avail / MAP_H))
-        top = top_px + max(0, (avail - MAP_H * s) / 2)
-        left = (w - MAP_W * s) / 2
-        return {"x": box["x"] + left, "y": box["y"] + top, "s": s, "box": box}
+    # ---------- kontrol ----------
+    def button(self, label):
+        return self.page.locator("button.btn", has_text=label).first
 
-    def cell_xy(self, c, r):
-        t = self.map_transform()
-        return t["x"] + (c + 0.5) * CELL * t["s"], t["y"] + (r + 0.5) * CELL * t["s"]
+    def click_button(self, label, required=True):
+        b = self.button(label)
+        if not required and (b.count() == 0 or not b.is_enabled()):
+            return False
+        b.scroll_into_view_if_needed()
+        b.click()
+        self.page.wait_for_timeout(150)
+        return True
 
-    def tap_cell(self, c, r):
-        x, y = self.cell_xy(c, r)
+    def seg(self, label):
+        b = self.page.locator(".seg-btn", has_text=label).first
+        b.scroll_into_view_if_needed()
+        b.click()
+        self.page.wait_for_timeout(120)
+
+    def select(self, which, value):
+        sel = self.page.locator("select.rute-select").nth(0 if which == "start" else 1)
+        sel.scroll_into_view_if_needed()
+        sel.select_option(value)
+        self.page.wait_for_timeout(200)
+
+    def canvas_box(self):
+        return self.page.locator(".sim-canvas").first.bounding_box()
+
+    def tap_canvas(self, pt):
+        """pt = {x, y} relatif kanvas (dari window.__rute.routePoint dan sejenisnya)."""
+        box = self.canvas_box()
+        x, y = box["x"] + pt["x"], box["y"] + pt["y"]
         if self.mobile:
             self.page.touchscreen.tap(x, y)
         else:
             self.page.mouse.click(x, y)
+        self.page.wait_for_timeout(200)
+
+    def scroll_stage(self):
+        self.page.locator(".stage").first.scroll_into_view_if_needed()
         self.page.wait_for_timeout(150)
 
-    def drag_cells(self, cells, steps=6):
-        """Seret dari sel pertama melewati sel lainnya (mouse)."""
-        x, y = self.cell_xy(*cells[0])
-        self.page.mouse.move(x, y)
-        self.page.mouse.down()
-        for c, r in cells[1:]:
-            nx, ny = self.cell_xy(c, r)
-            self.page.mouse.move(nx, ny, steps=steps)
-        self.page.mouse.up()
-        self.page.wait_for_timeout(150)
-
-    def route_cells(self):
-        """Sel yang dilewati garis rute (warna teal di pusat sel), dibaca dari piksel kanvas."""
-        t = self.map_transform()
-        dpr = self.page.evaluate("() => Math.min(window.devicePixelRatio || 1, 2)")
-        box = t["box"]
-        pts = []
-        for r in range(ROWS):
-            for c in range(COLS):
-                x = (t["x"] - box["x"] + (c + 0.5) * CELL * t["s"]) * dpr
-                y = (t["y"] - box["y"] + (r + 0.5) * CELL * t["s"]) * dpr
-                pts.append([c, r, round(x), round(y)])
-        found = self.page.evaluate(
-            """(pts) => {
-              const cv = document.querySelector('.sim-canvas');
-              // salin kanvas sekali ke kanvas bantu supaya hanya ada satu pembacaan piksel
-              const tmp = document.createElement('canvas');
-              tmp.width = cv.width;
-              tmp.height = cv.height;
-              const tg = tmp.getContext('2d', { willReadFrequently: true });
-              tg.drawImage(cv, 0, 0);
-              const img = tg.getImageData(0, 0, cv.width, cv.height).data;
-              const out = [];
-              for (const [c, r, x, y] of pts) {
-                const k = (y * cv.width + x) * 4;
-                const d = [img[k], img[k + 1], img[k + 2]];
-                // teal #2dd4bf
-                if (Math.abs(d[0] - 45) < 40 && Math.abs(d[1] - 212) < 40 && Math.abs(d[2] - 191) < 40) out.push([c, r]);
-              }
-              return out;
-            }""",
-            pts,
-        )
-        return [tuple(p) for p in found]
-
-    def click_text(self, selector, text):
-        self.page.locator(selector, has_text=text).first.click()
-        self.page.wait_for_timeout(120)
-
-    def wait_task(self, task, timeout=40):
-        import time
+    def wait_until(self, js, timeout=30000, poll=100):
         t0 = time.time()
-        while time.time() - t0 < timeout:
-            if task in self.hook()["completedTasks"]:
-                return round(time.time() - t0, 1)
-            self.page.wait_for_timeout(200)
-        return None
-
-    def next_step(self):
-        self.page.locator(".step-nav .btn-primary").dispatch_event("click")
-        self.page.wait_for_timeout(350)
-
-    def __exit__(self, *a):
-        self.browser.close()
-        self.pw.stop()
-
-
-def log(*a):
-    print(*a, file=sys.stderr, flush=True)
+        while time.time() - t0 < timeout / 1000:
+            if self.page.evaluate(js):
+                return True
+            self.page.wait_for_timeout(poll)
+        return False

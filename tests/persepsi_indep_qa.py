@@ -1,7 +1,7 @@
 """QA mandiri pelajaran Persepsi lewat UI seperti pelajar.
 
 Pemakaian: python3 tests/persepsi_indep_qa.py [--mobile] [--skip-idle]
-Butuh server statis di port 8133.
+Butuh server: python3 tests/serve.py 8243 (atau --port P).
 
 Bagian:
   1. idle: tiap langkah dibuka lalu dibiarkan tanpa interaksi, tidak boleh ada tugas selesai.

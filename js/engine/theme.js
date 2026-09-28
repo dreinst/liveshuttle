@@ -41,8 +41,13 @@ export const COLORS = Object.freeze({
   shuttle: '#dbe4ee',
   pedestrian: '#fb7185',
   cyclist: '#f0abfc',
+  // lalu lintas khas Malang
+  angkot: '#6cc3ea',
+  motor: '#64748b',
+  helmets: Object.freeze(['#f8fafc', '#1f2937', '#dc2626', '#2563eb', '#facc15', '#16a34a']),
+  hijab: Object.freeze(['#f472b6', '#a78bfa', '#38bdf8', '#fbbf24', '#e2e8f0', '#34d399']),
+  halte: '#2563eb',
   cone: '#f97316',
-  cardboard: '#b7834a',
 
   // Sensor
   kamera: '#a78bfa',
@@ -69,6 +74,8 @@ export const SENSOR_COLORS = Object.freeze({
   ultrasonik: COLORS.ultrasonik,
 });
 
+const CITY_CAR = Object.freeze({ length: 3.7, width: 1.65, wheelbase: 2.45 });
+
 // Ukuran dalam meter. Angka ini realistis untuk kendaraan penumpang di Indonesia.
 export const SIZES = Object.freeze({
   laneWidth: 3.5,
@@ -79,6 +86,14 @@ export const SIZES = Object.freeze({
   cyclist: Object.freeze({ length: 1.8, width: 0.6 }),
   pedestrian: Object.freeze({ radius: 0.35 }),
   sidewalk: 3,
+  // kendaraan khas Malang (perkiraan ukuran umum). Kunci sama dengan `kind` di drawVehicle,
+  // jadi new PathAgent({ kind: 'angkot' }) langsung mendapat ukuran yang benar.
+  cityCar: CITY_CAR,
+  city: CITY_CAR,
+  mpv: Object.freeze({ length: 4.4, width: 1.73, wheelbase: 2.65 }),
+  angkot: Object.freeze({ length: 4.1, width: 1.62, wheelbase: 2.35 }),
+  motor: Object.freeze({ length: 1.9, width: 0.72, wheelbase: 1.28 }),
+  minibus: Object.freeze({ length: 7.5, width: 2.2, wheelbase: 3.9 }),
 });
 
 export const FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif";

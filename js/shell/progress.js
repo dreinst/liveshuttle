@@ -1,23 +1,46 @@
-// Penyimpanan progres belajar di localStorage (kunci simotonom.progress.v1).
+// Penyimpanan progres belajar di localStorage (kunci liveshuttle.progress.v1).
+// Progres lama dari kunci simotonom.progress.v1 dipindahkan sekali secara otomatis.
 // Bila localStorage tidak tersedia (mode privat tertentu), progres disimpan di memori saja.
 
 import { LESSONS } from '../lessons/index.js';
 
-const KEY = 'simotonom.progress.v1';
+const KEY = 'liveshuttle.progress.v1';
+const OLD_KEY = 'simotonom.progress.v1';
 const listeners = new Set();
 
-function readStorage() {
+function parse(raw) {
   try {
-    const raw = window.localStorage.getItem(KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    return data && typeof data === 'object' && data.lessons ? data : null;
+    const data = raw ? JSON.parse(raw) : null;
+    return data && typeof data === 'object' && data.lessons && typeof data.lessons === 'object' ? data : null;
   } catch {
     return null;
   }
 }
 
-let state = readStorage() || { version: 1, lessons: {} };
+function readStorage() {
+  try {
+    return parse(window.localStorage.getItem(KEY));
+  } catch {
+    return null;
+  }
+}
+
+/** Pindahkan progres dari kunci lama bila kunci baru belum ada. */
+function migrate() {
+  try {
+    const ls = window.localStorage;
+    if (ls.getItem(KEY) != null) return null;
+    const old = parse(ls.getItem(OLD_KEY));
+    if (!old) return null;
+    ls.setItem(KEY, JSON.stringify(old));
+    ls.removeItem(OLD_KEY);
+    return old;
+  } catch {
+    return null;
+  }
+}
+
+let state = readStorage() || migrate() || { version: 1, lessons: {} };
 
 function save() {
   try {
@@ -49,15 +72,13 @@ window.addEventListener('storage', (e) => {
 });
 
 export const progress = {
-  KEY,
-
-  /** Ringkasan satu pelajaran: { done, total, doneCount, lastStep, complete, visited }. */
+  /** Ringkasan satu pelajaran: { total, doneCount, lastStep, complete, visited }. */
   lesson(id) {
     const rec = state.lessons[id];
-    if (!rec) return { done: [], total: null, doneCount: 0, lastStep: 0, complete: false, visited: false };
+    if (!rec) return { total: null, doneCount: 0, lastStep: 0, complete: false, visited: false };
     const total = rec.tasks ? rec.tasks.length : null;
     const doneCount = rec.tasks ? rec.tasks.filter((t) => rec.done.includes(t)).length : rec.done.length;
-    return { done: [...rec.done], total, doneCount, lastStep: rec.lastStep || 0, complete: !!rec.complete, visited: !!rec.visited };
+    return { total, doneCount, lastStep: rec.lastStep || 0, complete: !!rec.complete, visited: !!rec.visited };
   },
 
   isTaskDone(id, taskId) {

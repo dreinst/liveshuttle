@@ -1,23 +1,29 @@
 // Uji model Lokalisasi tanpa browser (QA independen).
 // Meniru urutan update() di js/lessons/lokalisasi.js lalu mengukur galat dan konsistensi elips 95%.
+// Rute: jalan-jalan OSM sekitar Alun-alun Merdeka Malang (js/data/malang-center.json).
 // Pemakaian: node tests/lokalisasi_indep_model.mjs [detik] [sigma]
-import { createScene, CRUISE } from '../js/lessons/lokalisasi/scene.js';
+import fs from 'node:fs';
+import { parseMap } from '../js/engine/osm2d.js';
+import { buildRoute } from '../js/lessons/lokalisasi/route.js';
+import { createScene, LANE_OUT } from '../js/lessons/lokalisasi/scene.js';
 import { GpsReceiver, WheelImu, DeadReckoning, PoseFilter, LidarLandmarks, LIDAR_PERIOD, CHI2_95 } from '../js/lessons/lokalisasi/estimators.js';
 import { wrapAngle } from '../js/engine/math.js';
 
 const SECONDS = Number(process.argv[2] || 600);
 const SIGMA = Number(process.argv[3] || 2);
 const dt = 1 / 60;
+const MAP = parseMap(JSON.parse(fs.readFileSync(new URL('../js/data/malang-center.json', import.meta.url), 'utf8')));
+const ROUTE = buildRoute(MAP);
 
 function run({ steerWith = null, sigma = SIGMA, seconds = SECONDS } = {}) {
-  const scene = createScene();
+  const scene = createScene(ROUTE);
   const ego = scene.ego;
   const gps = new GpsReceiver(7);
   const imu = new WheelImu(3);
   const odo = new DeadReckoning();
   const fus = new PoseFilter();
   const mapF = new PoseFilter();
-  const lidar = new LidarLandmarks(scene.landmarks, scene.buildings, 5);
+  const lidar = new LidarLandmarks(scene.landmarks, (x, y, r) => MAP.buildingsNear(x, y, r), 5);
   let simT = 0;
   let lidarT = 0;
   const truth = () => ({ x: ego.x, y: ego.y, vx: ego.vx, vy: ego.vy });
@@ -41,16 +47,15 @@ function run({ steerWith = null, sigma = SIGMA, seconds = SECONDS } = {}) {
     const d2 = (c * dx * dx - 2 * b * dx * dy + a * dy * dy) / det;
     return d2 <= CHI2_95;
   };
-  let take = 0;
   let out = false;
   const steps = Math.round(seconds / dt);
   for (let i = 0; i < steps; i++) {
     const prevH = ego.heading;
     let pose = null;
-    if (steerWith && take <= 0) {
+    if (steerWith) {
       pose = steerWith === 'gps' ? gps.estimate(simT) : steerWith === 'fus' ? fus.pose() : steerWith === 'map' ? mapF.pose() : odo.pose();
     }
-    scene.drive(dt, pose, take > 0 ? 5 : CRUISE);
+    scene.step(dt, pose);
     simT += dt;
     const w = wrapAngle(ego.heading - prevH) / dt;
     const beta = Math.atan(0.5 * Math.tan(ego.steer));
@@ -78,13 +83,9 @@ function run({ steerWith = null, sigma = SIGMA, seconds = SECONDS } = {}) {
     }
     const lat = scene.laneOffset();
     if (steerWith) {
-      const o = Math.abs(lat) > 0.85;
+      const o = Math.abs(lat) > LANE_OUT;
       if (o && !out) st.exits++;
       out = o;
-      if (take > 0) {
-        take -= dt;
-        if (take <= 0 && Math.abs(lat) > 0.3) take = 0.1;
-      } else if (Math.abs(lat) > 1) take = 1.5;
       st.lat.push(Math.abs(lat));
     }
     const eo = Math.hypot(odo.x - ego.x, odo.y - ego.y);

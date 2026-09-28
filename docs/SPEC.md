@@ -1,4 +1,4 @@
-# SimOtonom: spec for the driverless transport tutorial simulator
+# LiveShuttle: spec for the driverless transport tutorial simulator
 
 Project root: `/Users/mcdonny/Downloads/ndur/driverless-sim`
 
@@ -10,6 +10,13 @@ explanations with a live top-down canvas simulation and small tasks the learner 
 using the simulation. It will be deployed as plain static files on Vercel.
 
 The audience is Indonesian university students. All user-facing text is Bahasa Indonesia.
+
+Everything is grounded in the real surroundings of Universitas Ma Chung and the city of Malang
+using OpenStreetMap data (raw files in `data/osm/`, compact files in `js/data/` and
+`js/sim3d/data/`): real street and place names, local traffic (angkot, sepeda motor), and honest
+labels for anything estimated (lanes, building heights, simulated traffic lights). LiDAR and other
+sensor drawings stay calm (no flickering ray lines). The 3D part has one live route map that mixes
+Google Maps style turn instructions, a Gojek/Grab style trip card and Waze style incident icons.
 
 ## Hard rules for everyone
 
@@ -39,6 +46,16 @@ The audience is Indonesian university students. All user-facing text is Bahasa I
 8. Accessibility: semantic HTML, labelled controls, visible focus, canvas has `role="img"` and an
    `aria-label`, and a text status line that describes what is happening. Respect
    `prefers-reduced-motion` for decorative animation (the simulations themselves may run).
+9. SAFETY RULE (set by the user, non negotiable): in every simulation, 2D and 3D, no vehicle can
+   ever run a red light or hit a pedestrian, whatever the learner does (manual driving, full
+   throttle, maximum speed, fast forward, bad weather, spawning pedestrians). This is enforced by
+   a final safety layer before actuation plus pedestrian gap acceptance, not by luck. Collisions
+   with other things (a parked car, a lead car in the braking lesson) may still be shown.
+10. Not a copy of the reference: the user once pasted a description of another site
+   ("Simulator Kendaraan Otonom"). Our site must not reuse its name, tagline, mode names, panel
+   titles, camera set or feature framing. See the list under Branding.
+11. Local test server: use `python3 tests/serve.py PORT` (threaded, large accept queue) instead
+   of `python3 -m http.server`, which drops connections when many modules load at once.
 
 ## File layout
 
@@ -60,20 +77,31 @@ needs extra styles it exports a `styles` string (the shell injects and removes i
 
 ## Branding
 
-Short name "SimOtonom". Full name "Simulator Kendaraan Otonom". Tagline:
-"Belajar cara mobil tanpa pengemudi melihat, berpikir, dan bergerak."
-The site teaches the AV pipeline sensing (sensor) → persepsi → perencanaan → kontrol.
+Name "LiveShuttle" (also the GitHub repo name). Tagline:
+"Pelajari teknologi transportasi tanpa pengemudi, lalu lihat shuttle otonom beraksi di jalanan
+sekitar Universitas Ma Chung." The 3D part is called "Shuttle 3D Ma Chung" and runs on real
+OpenStreetMap streets around the campus (attribution "© Kontributor OpenStreetMap" always shown).
+The site teaches the chain sensor → persepsi → perencanaan → kendali.
+
+Never use these phrases from the reference anywhere: "Simulator Kendaraan Otonom", "Belajar cara
+mobil tanpa pengemudi melihat, berpikir, dan bergerak", "Mode Tutorial", "Mode Bebas",
+"Apa yang dilihat mobil", "Objek pembatas", "Uji skenario", "Kota pintar", lampu adaptif as a
+feature, the camera set Orbit / Kejar / Atas / Kokpit, key J for pedestrians, the obstacle trio
+kerucut / kardus / mobil mogok as a placement tool, the indicator row "TTC, simpangan lajur,
+tabrakan, rem darurat, menyalip", "jangkauan deteksi 60 m", default target speed 50 km/jam.
+(The 2D lessons may still teach TTC, AEB and sensor ranges as concepts in their own words.)
 
 ## Routes
 
 - `#/` home: name and tagline, a short explanation of what driverless transport is and how to
-  use the site, an ambient animated canvas (cars on a small road grid, calm, reduced motion
-  aware), a pipeline strip (Sensor → Persepsi → Perencanaan → Kontrol), a prominent card for
-  the 3D simulator with two buttons (Mode Tutorial, Mode Bebas), the lesson cards in order with
+  use the site, an ambient animated canvas (the real Ma Chung map with a shuttle and Malang
+  traffic, calm, reduced motion aware), a pipeline strip (Sensor → Persepsi → Perencanaan → Kontrol), a prominent card for
+  Shuttle 3D Ma Chung with two buttons (Panduan, Jelajah), the lesson cards in order with
   progress, a "Mulai belajar" button, and a reset progress button.
 - `#/pelajaran/<id>` lesson page.
-- `#/simulator/tutorial` and `#/simulator/bebas` the 3D city simulator (`#/simulator` redirects
-  to the tutorial). The header nav always has links to Beranda, Simulator 3D and Pelajaran.
+- `#/shuttle-3d/panduan` (guided) and `#/shuttle-3d/jelajah` (free) the 3D simulator
+  (`#/shuttle-3d` redirects to panduan; the old `#/simulator/*` hashes redirect too). The header
+  nav always has links to Beranda, Shuttle 3D and Pelajaran.
 - Unknown routes fall back to home.
 
 ## Shared CSS variables (defined in css/style.css on :root, used by every page)
@@ -84,17 +112,17 @@ The site teaches the AV pipeline sensing (sensor) → persepsi → perencanaan �
 ## 3D simulator mounting contract
 
 `js/sim3d/index.js` exports `async function mount(container, { mode, navigate })` and returns
-`{ destroy() }`. `mode` is `'tutorial'` or `'bebas'`; `navigate(hash)` changes route. The shell
+`{ destroy() }`. `mode` is `'panduan'` or `'jelajah'`; `navigate(hash)` changes route. The shell
 creates `container` filling the viewport below the header (height `calc(100dvh - var(--header-h))`),
-lazy imports the module on `#/simulator/*`, and calls `destroy()` when leaving. Switching between
-tutorial and bebas may be handled inside the module without remounting (update the hash with
+lazy imports the module on `#/shuttle-3d/*`, and calls `destroy()` when leaving. Switching between
+panduan and jelajah may be handled inside the module without remounting (update the hash with
 `history.replaceState` so the shell does not remount). The module loads its own stylesheet
 `css/sim3d.css` by adding a `<link>` on mount and removing it on destroy. If mounting fails
 (no WebGL), the module shows a friendly message with a link to the lessons.
 
 ## Lesson page layout
 
-Desktop: header bar (logo "SimOtonom" linking home, lesson number and title, overall progress),
+Desktop: header bar (logo "LiveShuttle" linking home, lesson number and title, overall progress),
 then two columns. Left column (about 380px): step card with "Langkah n dari N", step title,
 body HTML, task box ("Tugas" plus the task text and a done state), Kembali / Lanjut buttons.
 After the last step: the lesson summary and a button to the next lesson. Right column: the
@@ -104,7 +132,7 @@ and speed 0,5x / 1x / 2x. Mobile: single column, stage first, then controls, the
 
 Lanjut is always allowed (learners may skip), but a step only counts as done when its task is
 completed. A lesson is complete when all its tasks are done. Progress is stored in
-localStorage under `simotonom.progress.v1`.
+localStorage under `liveshuttle.progress.v1`.
 
 ## Lesson contract
 
@@ -181,22 +209,55 @@ Dark "control room" theme with high contrast and generous spacing.
 ## Lessons (ids fixed in js/lessons/index.js)
 
 1. `level-otomasi` Level Otomasi (SAE J3016 levels 0 to 5, who drives, ODD, takeover request,
-   minimal risk maneuver).
-2. `sensor` Sensor Kendaraan (kamera, LiDAR, radar, ultrasonik, weather effects).
+   minimal risk maneuver) on a trip from Universitas Ma Chung to Alun-alun Merdeka.
+2. `sensor` Sensor Kendaraan (kamera, LiDAR, radar, ultrasonik, weather effects) on Jalan
+   Karangampel Timur north of the campus.
 3. `persepsi` Persepsi dan Fusi Sensor (raw detections, fusion, tracking, ghost rejection,
-   motion prediction).
+   motion prediction) on Jalan Karangampel Timur with mixed Malang traffic.
 4. `lokalisasi` Lokalisasi (GPS noise and urban canyon, odometry drift, fusion filter, landmark
-   and map matching).
-5. `rute` Perencanaan Rute (grid city, A* vs Dijkstra, road closures, congestion cost).
-6. `kontrol` Kendali Kemudi dan Kecepatan (pure pursuit lookahead, PID speed, error plots).
+   and map matching with an HD map) around the Kayutangan block north of Alun-alun Merdeka.
+5. `rute` Perencanaan Rute (A* vs Dijkstra on the real Malang road graph from Ma Chung to the city
+   centre, road closures, congestion cost).
+6. `kontrol` Kendali Kemudi dan Kecepatan (pure pursuit lookahead, PID speed, error plots) on the
+   Villa Puncak Tidar boulevard with a roundabout at each end.
 7. `keputusan` Pengambilan Keputusan (behavior state machine: traffic light incl. yellow
-   dilemma, pedestrian crossing, stalled vehicle overtake on the right).
+   dilemma, pedestrian crossing, overtaking a stopped angkot on the right) on Jalan Kawi, Malang.
 8. `jarak-aman` Jarak Aman dan Rem Darurat (time gap, ACC, FCW and AEB, stopping distance
-   = reaction distance + v^2 / (2 mu g), road conditions, human vs system reaction time).
-9. `shuttle` Misi Shuttle Otonom (sandbox: campus road network, halte, passengers, traffic
-   lights, pedestrians, road closures with rerouting, mission stats).
-10. `kuis` Kuis Akhir (multiple choice across all lessons, feedback with explanations, score,
-    retry; layout 'full').
+   = reaction distance + v^2 / (2 mu g), road conditions, human vs system reaction time) on Jalan
+   Soekarno-Hatta and a toll road.
+9. `shuttle` Misi Shuttle Otonom (sandbox on the OSM streets around Ma Chung with the same five
+   halte as Shuttle 3D: passengers, simulated traffic lights, pedestrians, road closures with
+   rerouting, mission stats).
+10. `kuis` Kuis Akhir (multiple choice across all lessons and Shuttle 3D Ma Chung, feedback with
+    explanations, score, retry; layout 'full').
 
 Each simulation lesson has 4 to 6 steps, most with a task that is detected automatically from
 the simulation state (for example "ubah cuaca ke kabut lalu nyalakan radar").
+
+## Shuttle 3D Ma Chung (js/sim3d)
+
+A 3D city built from `js/sim3d/data/machung-city.json` (about 1 km x 1 km of OSM around the campus,
+format in `docs/MAPDATA.md`). LiveShuttle, a 6 m electric shuttle with 12 seats, drives a loop of
+five halte (Gerbang Ma Chung, Jalan Karangampel Timur, Jalan Puncak Tidar, Villa Puncak Lawu,
+Jalan Raya Candi V) among cars, MPVs, pickups, angkot, motorbikes and pedestrians.
+
+- Modes: Panduan (ten guided steps with automatic tasks, ending in a button to Jelajah) and
+  Jelajah (free). Cameras Kabin, Drone, Sinematik and Peta (keys 1 to 4).
+- HUD: Lapisan otonomi strip (Indra, Pahami, Rencana, Gerak with live sentences), Perisai
+  keselamatan panel (the two counters, interventions, log), Kendali dan alat panel, one live route
+  map (turn banner, trip card, flowing route line, incident icons, reroute animation, expand,
+  compass), time control (pause, 1x, 2x, 4x) and the OSM attribution. Mobile uses a bottom sheet
+  with tabs.
+- Tools: take the wheel (M, arrows or WASD, on-screen pad), crossing pedestrian (Y), LiDAR rays
+  (L, off by default), sensor view Tenang (default) or Detail, parked vehicle, roadworks, close a
+  road (click the 3D view or the map), call passengers, traffic density, speed limit 10 to 40 km/jam.
+- Weather changes by itself every 5 minutes of simulated time (Cerah, Hujan, Kabut, Malam) with a
+  countdown. There is no weather control. Rain lowers road friction, fog shortens camera and LiDAR
+  range, and the shuttle caps its own speed per weather and explains why.
+- Traffic lights near the campus are simulated (OSM has none there) and labelled as such.
+- Safety rule 9 is enforced by `shield.js` and `egoshield.js` for every vehicle every 1/60 s tick,
+  with pedestrian gap acceptance in `pedestrians.js`. `window.__sim3d.invariants` exposes the
+  counters `redLight` and `pedContact`, which must stay 0. A pedestrian within 0,6 m of a vehicle body
+  never moves closer to it (every step and every edge change is checked). `tests/qa-akhir_safety3d.py`
+  attacks the rule in all four weathers and checks it with its own geometric monitor.
+

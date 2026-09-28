@@ -1,22 +1,16 @@
-// Pelajaran 1: Level Otomasi (SAE J3016, level 0 sampai 5).
-//
-// Pola sama dengan pelajaran contoh (sensor.js):
-//   1. Teks pelajaran (intro, steps, summary) ada di objek default export.
-//   2. Model dunia dan perilaku tiap level ada di ./level-otomasi/scene.js, geometri jalan di
-//      ./level-otomasi/road.js.
-//   3. mount(ctx) menyusun kanvas, loop, panel kontrol, HUD, dan kotak peringatan di atas kanvas.
-//   4. Tugas dideteksi otomatis dari keadaan simulasi (waktu simulasi, bukan waktu nyata) atau dari
-//      kejadian yang dicatat model, dan hanya untuk langkah yang sedang dibuka.
-//   5. onStep(i) memasang skenario langkah, reset() mengulang skenario dengan level yang sedang
-//      dipilih pelajar.
+// Pelajaran 1: Level Otomasi (SAE J3016, level 0 sampai 5), dalam perjalanan dari kampus
+// Universitas Ma Chung ke Alun-alun Merdeka, Malang. File ini berisi teks, panel, dan deteksi tugas.
+// Model dan perilaku tiap level ada di ./level-otomasi/scene.js, jalan ilustrasi di road.js, dan peta
+// perjalanan nyata (OpenStreetMap) di tripmap.js dengan data rute di data/trip.js.
 
 import { COLORS } from '../engine/theme.js';
-import { fmt, msToKmh, kmhToMs, clamp } from '../engine/math.js';
+import { fmt, fmtSpeed, kmhToMs, clamp } from '../engine/math.js';
 import { createLabelLayer, drawScaleBar } from '../engine/draw.js';
 import { icon } from '../engine/icons.js';
 import * as ui from '../engine/ui.js';
-import { createScene, V_SET, MANUAL_DIST } from './level-otomasi/scene.js';
+import { createScene, V_CITY, V_KAWASAN, MANUAL_DIST, ODD_EXIT } from './level-otomasi/scene.js';
 import { EDGE_LEFT } from './level-otomasi/road.js';
+import { createTripMap, streetAt, streetStart, TRIP_LENGTH } from './level-otomasi/tripmap.js';
 
 const LEVELS = [
   { name: 'Tanpa otomasi', desc: 'Kamu mengemudi penuh. Sistem hanya memperingatkan atau mengerem darurat sesaat.' },
@@ -41,18 +35,20 @@ const RESP_ROWS = [
   { task: 'Kemudi dan kecepatan', cells: ['kamu', 'both', 'sistem', 'sistem', 'sistem', 'sistem'] },
   { task: 'Memantau jalan', cells: ['kamu', 'kamu', 'kamu', 'sistem', 'sistem', 'sistem'] },
   { task: 'Cadangan saat sistem tidak mampu', cells: ['kamu', 'kamu', 'kamu', 'ask', 'sistem', 'sistem'] },
-  { task: 'Area kerja (ODD)', cells: ['na', 'lim', 'lim', 'lim', 'lim', 'all'] },
+  { task: 'Kondisi kerja (ODD)', cells: ['na', 'lim', 'lim', 'lim', 'lim', 'all'] },
 ];
-const EXAMPLES = ['Peringatan dan rem darurat', 'ACC', 'ACC dan penjaga lajur', 'Pilot jalan tol', { html: 'Robotaksi, <em>shuttle</em> tanpa sopir' }, 'Belum ada'];
+const EXAMPLES = ['Peringatan dan rem darurat', 'ACC', 'ACC dan penjaga lajur', 'Pilot jalan tol', { html: '<em>Shuttle</em> kampus tanpa sopir, robotaksi' }, 'Belum ada'];
 
-// Skenario tiap langkah. egoAt = posisi awal di pola jalan (0 sampai 350 m lurus, lalu tikungan S).
+// Skenario tiap langkah. egoAt = posisi awal di pola tikungan jalan ilustrasi (0 sampai 350 m lurus,
+// lalu tikungan S). trip = jarak awal di rute nyata (m dari kampus), dipakai untuk peta perjalanan,
+// batas kecepatan, dan batas area operasi level 4.
 const PRESETS = [
-  { level: 0, egoAt: 10, speed: 0, lead: { gap: 30, speed: 0, wait: true } },
-  { level: 0, egoAt: 10, speed: 0, lead: { gap: 24, speed: 0, wait: true } },
-  { level: 2, egoAt: 250, speed: kmhToMs(55), lead: { gap: 34, speed: kmhToMs(50) } },
-  { level: 3, egoAt: 650, speed: V_SET, lead: null, zone: 300 },
-  { level: 4, egoAt: 650, speed: V_SET, lead: null, boundary: 230 },
-  { level: 5, egoAt: 650, speed: V_SET, lead: null, boundary: 200 },
+  { level: 0, egoAt: 10, trip: streetStart('Jalan Tidar', 2190) + 60, speed: 0, lead: { kind: 'angkot', code: 'ADL', gap: 26, speed: 0, wait: true } },
+  { level: 0, egoAt: 10, trip: streetStart('Jalan Galunggung', 2942) + 60, speed: 0, lead: { kind: 'angkot', code: 'GL', gap: 22, speed: 0, wait: true } },
+  { level: 2, egoAt: 250, trip: streetStart('Jalan Raya Dieng', 3618) + 10, speed: kmhToMs(36), lead: { kind: 'city', gap: 30, speed: kmhToMs(34) } },
+  { level: 3, egoAt: 650, trip: streetStart('Jalan Kawi', 4506) + 60, speed: V_CITY, lead: null, zone: 200 },
+  { level: 4, egoAt: 650, trip: ODD_EXIT - 115, speed: V_KAWASAN, lead: null },
+  { level: 5, egoAt: 650, trip: ODD_EXIT - 105, speed: V_KAWASAN, lead: null },
 ];
 
 const TONE_COLORS = { danger: COLORS.danger, warn: COLORS.warn, ok: COLORS.ok, info: COLORS.accent };
@@ -63,63 +59,65 @@ export default {
   layout: 'sim',
   intro:
     '<p>Tidak semua mobil yang disebut otonom benar-benar mengemudi sendiri. Standar <strong>SAE J3016</strong> membagi otomasi mengemudi menjadi enam level, dari 0 sampai 5. Pembedanya adalah siapa yang bertanggung jawab atas tiap bagian tugas mengemudi, kamu atau sistem.</p>' +
-    '<p>Kamu akan mencoba tiap level di jalan tol dua lajur searah. Seperti di Indonesia, mobil berjalan di lajur kiri dan menyalip lewat lajur kanan.</p>',
+    '<p>Kamu akan mencoba tiap level dalam perjalanan dari kampus Universitas Ma Chung ke Alun-alun Merdeka di pusat kota Malang, bersama angkot, sepeda motor, dan mobil lain. Kendaraan berjalan di lajur kiri dan menyalip lewat lajur kanan.</p>' +
+    '<p class="note">Jalan di simulasi adalah ilustrasi: jalan bermedian dengan dua lajur per arah, tanpa persimpangan. Rute sebenarnya dari OpenStreetMap tampil di <strong>Peta perjalanan</strong> di bawah simulasi.</p>',
   steps: [
     {
       title: 'Level 0: kamu yang mengemudi',
       body:
         '<p>Di <strong>level 0</strong> tidak ada otomasi mengemudi. Kamu yang menyetir, mengatur gas dan rem, serta memantau jalan.</p>' +
         '<p>Mobil level 0 tetap boleh punya fitur keselamatan, misalnya peringatan keluar lajur, peringatan tabrakan depan, atau rem darurat otomatis. Fitur itu hanya memperingatkan atau bertindak sesaat, jadi levelnya tetap 0.</p>' +
+        '<p>Di depanmu ada angkot yang sedang menunggu penumpang. Angkot itu mulai jalan saat kamu bergerak. Batas kecepatan di jalan kota ini 40 km/jam.</p>' +
         '<p class="note">Pakai tombol Kiri, Gas, Rem, dan Kanan, atau tombol panah di keyboard. Jalannya berkelok landai, jadi sesekali kamu perlu menyetir.</p>',
       task: { id: 'l0-manual', text: 'Kemudikan mobil sendiri di <strong>level 0</strong> sejauh 150 m.' },
     },
     {
       title: 'Level 1: satu bantuan',
       body:
-        '<p>Di <strong>level 1</strong> sistem membantu satu hal saja: mengatur kecepatan <em>atau</em> menyetir. Contoh yang paling umum adalah <strong>ACC</strong> (<em>adaptive cruise control</em>). ACC memakai radar untuk mengukur jarak ke mobil depan, lalu mengatur gas dan rem supaya jaraknya tetap aman.</p>' +
-        '<p>Kamu tetap menyetir dan memantau jalan. ACC di sini menjaga jarak 4 m ditambah jarak tempuh 1,5 detik, dengan kecepatan paling tinggi 60 km/jam. Menginjak rem mematikan ACC.</p>',
-      task: { id: 'l1-acc', text: 'Pilih <strong>level 1</strong>, lalu biarkan ACC menjaga jarak di belakang mobil depan selama 5 detik. Kamu tetap menyetir.' },
+        '<p>Di <strong>level 1</strong> sistem membantu satu hal saja: mengatur kecepatan <em>atau</em> menyetir. Contoh yang paling umum adalah <strong>ACC</strong> (<em>adaptive cruise control</em>). ACC memakai radar untuk mengukur jarak ke kendaraan depan, lalu mengatur gas dan rem supaya jaraknya tetap aman.</p>' +
+        '<p>Kamu tetap menyetir dan memantau jalan. ACC di sini menjaga jarak 4 m ditambah jarak tempuh 1,5 detik dan tidak melewati batas kecepatan jalan, paling tinggi 40 km/jam. Angkot di depanmu sering berganti kecepatan, jadi perhatikan cara ACC menyesuaikan diri. Menginjak rem mematikan ACC.</p>',
+      task: { id: 'l1-acc', text: 'Pilih <strong>level 1</strong>, lalu biarkan ACC menjaga jarak di belakang angkot selama 5 detik. Kamu tetap menyetir.' },
     },
     {
       title: 'Level 2: sistem menyetir, kamu mengawasi',
       body:
         '<p>Di <strong>level 2</strong> sistem menyetir sekaligus mengatur kecepatan. Kamu tetap pengemudinya. Tugas memantau jalan dan menanggapi kejadian masih milikmu, jadi matamu harus tetap di jalan.</p>' +
-        '<p>Karena itu mobil level 2 memeriksa perhatian pengemudi. Bila kamu tidak merespons, sistem memberi peringatan keras, memperlambat mobil, lalu menyerahkan kemudi kembali kepadamu.</p>' +
+        '<p>Karena itu mobil level 2 memeriksa perhatian pengemudi. Bila kamu tidak merespons, sistem memberi peringatan keras, memperlambat mobil, lalu menyerahkan kemudi kembali kepadamu. Sepeda motor yang menyalip lewat lajur kanan juga tetap menjadi urusanmu.</p>' +
         '<p class="note">Mobil sungguhan memakai sensor di setir atau kamera yang melihat wajah pengemudi. Di sini tombol Pegang kemudi menggantikannya.</p>',
       task: { id: 'l2-attention', text: 'Saat muncul pesan <strong>Pegang kemudi</strong>, tekan tombol Pegang kemudi atau <kbd>P</kbd>.' },
     },
     {
       title: 'Level 3: siap mengambil alih',
       body:
-        '<p>Di <strong>level 3</strong> sistem mengemudi dan memantau jalan sendiri, tetapi hanya di dalam <strong>ODD</strong> (<em>operational design domain</em>). ODD adalah kondisi tempat sistem dirancang bekerja, misalnya jalan tol, siang hari, dan kecepatan tertentu.</p>' +
-        '<p>Selama sistem aktif kamu boleh tidak memperhatikan jalan, tetapi harus tetap di kursi pengemudi dan siap. Sebelum keluar dari ODD, misalnya karena ada zona konstruksi, sistem memberi <strong>permintaan ambil alih</strong> dengan hitungan mundur. Di simulasi ini hitungan mundurnya 10 detik.</p>' +
+        '<p>Di <strong>level 3</strong> sistem mengemudi dan memantau jalan sendiri, tetapi hanya di dalam <strong>ODD</strong> (<em>operational design domain</em>). ODD adalah kondisi tempat sistem dirancang bekerja. Sistem level 3 yang sudah dijual umumnya hanya aktif di jalan tol. Di simulasi ini ODD sistem level 3 adalah jalan bermedian tanpa persimpangan, siang hari, kecepatan sampai 40 km/jam, dan tanpa pekerjaan jalan.</p>' +
+        '<p>Selama sistem aktif kamu boleh tidak memperhatikan jalan, tetapi harus tetap di kursi pengemudi dan siap. Sebelum keluar dari ODD, misalnya karena ada zona pekerjaan jalan di depan, sistem memberi <strong>permintaan ambil alih</strong> dengan hitungan mundur. Di simulasi ini hitungan mundurnya 10 detik.</p>' +
         '<p class="note is-warn">Bila kamu diam saja, mobil ini melambat dan berhenti di lajurnya dengan lampu hazard. Itu hanya upaya terakhir. Di level 3 orang di kursi pengemudi tetap diharapkan mengambil alih.</p>',
       task: { id: 'l3-takeover', text: 'Tunggu permintaan ambil alih, lalu tekan <strong>Ambil alih</strong> atau <kbd>A</kbd> sebelum hitungan mundur habis.' },
     },
     {
       title: 'Level 4: sistem menjadi cadangannya sendiri',
       body:
-        '<p>Di <strong>level 4</strong> sistem mengemudi dan memantau jalan. Bila ada masalah, sistem juga membawa mobil ke <strong>kondisi risiko minimal</strong> tanpa bantuan manusia. Semua itu berlaku selama mobil masih di dalam ODD. Contohnya robotaksi dan <em>shuttle</em> tanpa sopir yang melayani kawasan tertentu.</p>' +
-        '<p>Saat mendekati batas ODD, sistem level 4 tidak bergantung pada bantuanmu. Ia melakukan manuver risiko minimal: menyalakan lampu sein, menepi ke bahu jalan kiri, lalu berhenti dengan aman.</p>' +
-        '<p class="note">Robotaksi sungguhan biasanya memilih rute yang tetap di dalam ODD. Jalan di simulasi ini sengaja lurus melewati batas supaya kamu bisa melihat apa yang dilakukan sistem.</p>',
-      task: { id: 'l4-mrm', text: 'Amati mobil level 4 menepi dan berhenti sendiri sebelum rambu <strong>Batas area operasi</strong>.' },
+        '<p>Di <strong>level 4</strong> sistem mengemudi dan memantau jalan. Bila ada masalah, sistem juga membawa mobil ke <strong>kondisi risiko minimal</strong> tanpa bantuan manusia. Semua itu berlaku selama mobil masih di dalam ODD. Contohnya <em>shuttle</em> kampus tanpa sopir yang hanya melayani satu kawasan.</p>' +
+        '<p>Di simulasi ini ODD sistem level 4 adalah kawasan kampus Ma Chung dan perumahan Villa Puncak Tidar, dengan batas kecepatan 30 km/jam. Lihat area berwarna hijau toska di Peta perjalanan. Saat rute akan keluar dari kawasan itu, sistem tidak bergantung pada bantuanmu. Ia melakukan manuver risiko minimal: menyalakan lampu sein, menepi ke tepi kiri jalan, lalu berhenti dengan aman.</p>' +
+        '<p class="note">Garis area di peta mengikuti batas kawasan di OpenStreetMap, tetapi ODD ini hanya contoh untuk pelajaran. <em>Shuttle</em> sungguhan akan memilih rute yang tetap di dalam kawasannya. Di sini rutenya sengaja keluar kawasan supaya kamu bisa melihat apa yang dilakukan sistem.</p>',
+      task: { id: 'l4-mrm', text: 'Amati mobil level 4 menepi dan berhenti sendiri sebelum rambu <strong>Batas area operasi</strong> di ujung kawasan Villa Puncak Tidar.' },
     },
     {
       title: 'Level 5: di mana saja',
       body:
-        '<p>Di <strong>level 5</strong> sistem bisa mengemudi di semua jalan dan kondisi yang masih bisa ditangani pengemudi manusia. ODD-nya tidak terbatas, jadi rambu batas area operasi tidak menghentikannya.</p>' +
+        '<p>Di <strong>level 5</strong> sistem bisa mengemudi di semua jalan dan kondisi yang masih bisa ditangani pengemudi manusia. ODD-nya tidak terbatas, jadi batas kawasan tidak menghentikannya. Mobil terus melaju ke arah pusat kota.</p>' +
         '<p class="note is-warn">Sampai sekarang belum ada kendaraan level 5 yang dijual atau beroperasi secara komersial. Level 5 masih menjadi tujuan riset.</p>' +
-        '<p>Coba pindah-pindah level di panel dan bandingkan isi tabel <strong>Siapa yang menangani</strong>. Level berlaku untuk fitur yang sedang aktif, jadi satu mobil bisa berganti level dalam satu perjalanan.</p>',
+        '<p>Coba pindah-pindah level di panel dan bandingkan isi tabel <strong>Siapa yang menangani</strong>. Level berlaku untuk fitur yang sedang aktif, jadi satu mobil bisa berganti level dalam satu perjalanan. Setelah keluar kawasan, level 4 tidak bisa diaktifkan lagi.</p>',
     },
   ],
   summary:
     '<p>Level SAE menjawab pertanyaan siapa yang bertanggung jawab atas tugas mengemudi.</p>' +
     '<ul><li>Level 0 sampai 2: kamu pengemudinya. Sistem hanya membantu, dan kamu harus terus memantau jalan.</li>' +
     '<li>Level 3: sistem mengemudi di dalam ODD. Kamu harus siap mengambil alih saat diminta.</li>' +
-    '<li>Level 4: sistem menangani semuanya di dalam ODD, termasuk berhenti dengan aman saat tidak bisa melanjutkan.</li>' +
+    '<li>Level 4: sistem menangani semuanya di dalam ODD, misalnya satu kawasan kampus, termasuk berhenti dengan aman saat tidak bisa melanjutkan.</li>' +
     '<li>Level 5: sistem mengemudi di mana saja. Level ini belum ada di pasaran.</li></ul>' +
     '<p class="note">Kereta punya skala serupa bernama <strong>GoA</strong> (<em>Grade of Automation</em>), dari GoA0 sampai GoA4, yang diatur dalam standar IEC 62290. Di GoA4 kereta berjalan tanpa petugas sama sekali di dalamnya.</p>' +
-    '<p class="note">Simulasi ini disederhanakan. Hanya ada satu jalan dan satu mobil depan, sensor dianggap sempurna, dan angka seperti hitungan mundur 10 detik dipilih khusus untuk simulasi ini. Di dunia nyata, waktu dan cara pengalihan kendali ditentukan oleh regulasi dan produsen.</p>',
+    '<p class="note">Simulasi ini disederhanakan. Jalannya ilustrasi tanpa persimpangan, hanya ada satu kendaraan di depanmu, sepeda motor di arahmu hanya menyalip lewat lajur kanan, dan sensor dianggap sempurna. Angka seperti hitungan mundur 10 detik serta batas kecepatan 30 dan 40 km/jam dipilih untuk simulasi ini. Di dunia nyata, waktu dan cara pengalihan kendali ditentukan oleh regulasi dan produsen.</p>',
 
   styles: buildStyles(),
 
@@ -127,16 +125,14 @@ export default {
     // ---------- model ----------
     const scene = createScene();
     const { st, ego, lead } = scene;
-    const N = ctx.stepCount;
 
     // ---------- kanvas dan loop ----------
     const labels = createLabelLayer();
     const view = ctx.createView({
-      label: 'Jalan tol dua lajur dilihat dari atas dengan mobil otonom berwarna hijau toska di lajur kiri.',
-      background: COLORS.ground,
+      label: 'Jalan bermedian dua lajur per arah (ilustrasi) di rute kampus Ma Chung ke pusat kota Malang, dilihat dari atas, dengan mobil otonom berwarna hijau toska di lajur kiri.',
     });
 
-    const loop = ctx.createLoop({
+    ctx.createLoop({
       update(dt) {
         scene.update(dt);
         drainEvents();
@@ -168,12 +164,7 @@ export default {
     const holdGas = ui.holdButton(pad, { label: 'Gas', icon: 'arrowUp', onChange: (on) => scene.setInput('gas', on) });
     const holdBrake = ui.holdButton(pad, { label: 'Rem', icon: 'arrowDown', onChange: (on) => scene.setInput('brake', on) });
     const holdRight = ui.holdButton(pad, { label: 'Kanan', icon: 'arrowRight', onChange: (on) => scene.setInput('right', on) });
-    const HOLDS = [
-      [holdLeft, 'steer'],
-      [holdGas, 'gas'],
-      [holdBrake, 'brake'],
-      [holdRight, 'steer'],
-    ];
+    const HOLDS = [[holdLeft, 'steer'], [holdGas, 'gas'], [holdBrake, 'brake'], [holdRight, 'steer']];
     const actRow = ui.buttonRow(driveGroup, { className: 'act-row' });
     const handBtn = ui.button(actRow, { label: 'Pegang kemudi', icon: 'hand', onClick: () => doHold() });
     handBtn.dataset.act = 'pegang';
@@ -189,14 +180,29 @@ export default {
     const dataGroup = ui.group(ctx.controls, { title: 'Data perjalanan', className: 'grp-data' });
     const grid = ui.readoutGrid(dataGroup);
     const speedOut = ui.readout(grid, { label: 'Kecepatan', value: '0 km/jam' });
-    const gapOut = ui.readout(grid, { label: 'Jarak ke mobil depan', value: '-' });
+    const gapOut = ui.readout(grid, { label: 'Jarak ke kendaraan depan', value: '-' });
     const accOut = ui.readout(grid, { label: 'Jarak aman sistem', value: '-' });
     const laneOut = ui.readout(grid, { label: 'Posisi', value: 'Lajur kiri' });
     ui.legend(dataGroup, [
       { color: COLORS.path, label: 'Rencana jalur sistem', shape: 'line' },
       { color: COLORS.radar, label: 'Radar ACC', shape: 'line' },
+      { color: COLORS.lidar, label: 'Sistem memantau sekeliling (level 3 ke atas)', shape: 'line' },
       { color: COLORS.target, label: 'Batas area operasi', shape: 'line' },
     ]);
+
+    // ---------- panel: peta perjalanan (rute nyata dari OpenStreetMap) ----------
+    const tripGroup = ui.group(ctx.controls, { title: 'Peta perjalanan', wide: true, className: 'grp-trip' });
+    const tripBox = ui.el('div', { class: 'trip-map' });
+    tripGroup.append(tripBox);
+    const tripWhere = ui.el('p', { class: 'trip-where' });
+    tripGroup.append(tripWhere);
+    ui.legend(tripGroup, [
+      { color: COLORS.accent, label: 'Area operasi level 4: kampus Ma Chung dan Villa Puncak Tidar', shape: 'square' },
+      { color: COLORS.pathAlt, label: 'Rute nyata dari OpenStreetMap', shape: 'line' },
+      { color: COLORS.target, label: 'Batas area operasi di rute', shape: 'dot' },
+    ]);
+    tripGroup.append(ui.el('p', { class: 'ctl-hint', text: 'Jalan di simulasi adalah ilustrasi. Titik hijau toska di peta adalah perkiraan posisimu, dihitung dari jarak yang sudah ditempuh.' }));
+    const drawTrip = createTripMap(ctx, tripBox);
 
     // ---------- panel: tabel tanggung jawab ----------
     const respGroup = ui.group(ctx.controls, { title: 'Siapa yang menangani', wide: true, className: 'grp-resp' });
@@ -225,13 +231,11 @@ export default {
     const chipDriver = ui.hudChip(ctx.hud, { label: 'Kendali', color: COLORS.warn });
     const chipSpeed = ui.hudChip(ctx.hud, { label: 'Kecepatan', color: COLORS.text });
     const chipInfo = ui.hudChip(ctx.hud, { label: '', color: COLORS.target });
-    const chipInfoLabel = ui.el('span', { class: 'hud-label' });
-    chipInfo.el.insertBefore(chipInfoLabel, chipInfo.el.firstChild);
 
     const alertEl = ui.el('div', { class: 'lvl-alert', hidden: true });
     alertEl.innerHTML =
       '<span class="lvl-alert-icon"></span><div class="lvl-alert-body"><strong class="lvl-alert-title"></strong><span class="lvl-alert-text"></span></div><span class="lvl-alert-count" aria-hidden="true"></span>';
-    const alertBtn = ui.button(alertEl, { label: 'Ambil alih', variant: 'primary', small: true, onClick: () => alertAction() });
+    const alertBtn = ui.button(alertEl, { label: 'Ambil alih', variant: 'primary', small: true, onClick: () => ACTIONS[shownAlert?.action]?.() });
     alertBtn.dataset.act = 'alert-action';
     ctx.stage.append(alertEl);
     const alertIcon = alertEl.querySelector('.lvl-alert-icon');
@@ -250,12 +254,8 @@ export default {
     const levelKey = (n) => () => {
       // Sama seperti klik: memilih level yang sudah aktif tidak mengulang sistemnya (misalnya saat
       // permintaan ambil alih sedang berjalan). Bila sistemnya mati, tombol angka berfungsi seperti Aktifkan.
-      if (st.level === n) {
-        if (n > 0 && !st.engaged) engageAgain();
-        return;
-      }
-      levelCtl.set(n);
-      chooseLevel(n);
+      if (st.level !== n) chooseLevel(n);
+      else if (n > 0 && !st.engaged) engageAgain();
     };
     ctx.keys({
       ArrowLeft: keyHold(holdLeft, 'steer'),
@@ -271,48 +271,17 @@ export default {
       4: levelKey(4),
       5: levelKey(5),
     });
-    // Tombol segmen yang diklik dengan mouse atau jari tetap memegang fokus, sehingga tombol panah
-    // mengganti pilihan (level atau kecepatan) alih-alih menyetir. Lepas fokus hanya untuk klik
-    // penunjuk; pengguna keyboard tetap bisa berpindah pilihan dengan panah.
-    ctx.listen(ctx.root, 'click', (e) => {
-      const b = e.target.closest?.('.seg-btn');
-      if (b && e.detail > 0) b.blur();
-    });
 
-    // ---------- aksi ----------
-    function releaseHolds() {
-      for (const [b] of HOLDS) b.setActive(false);
-    }
-
-    function chooseLevel(n) {
-      scene.setLevel(n);
+    // ---------- aksi (panel diperbarui langsung, juga saat simulasi dijeda) ----------
+    const act = (fn) => (arg) => {
+      fn(arg);
       refreshPanels();
-    }
-
-    function engageAgain() {
-      scene.engage();
-      refreshPanels();
-    }
-
-    function doHold() {
-      scene.pressHold();
-      drainEvents();
-      refreshPanels();
-    }
-
-    function doTakeover() {
-      scene.pressTakeover();
-      drainEvents();
-      refreshPanels();
-    }
-
-    function alertAction() {
-      const a = shownAlert;
-      if (!a) return;
-      if (a.action === 'takeover') doTakeover();
-      else if (a.action === 'hold') doHold();
-      else if (a.action === 'engage') engageAgain();
-    }
+    };
+    const chooseLevel = act(scene.setLevel);
+    const engageAgain = act(scene.engage);
+    const doHold = act(scene.pressHold);
+    const doTakeover = act(scene.pressTakeover);
+    const ACTIONS = { takeover: doTakeover, hold: doHold, engage: engageAgain };
 
     // ---------- tugas ----------
     function drainEvents() {
@@ -333,7 +302,7 @@ export default {
     }
 
     // ---------- teks keadaan ----------
-    const kmh = (v) => fmt(msToKmh(Math.max(0, v)), 0, 'km/jam');
+    const kmh = (v) => fmtSpeed(Math.max(0, v));
 
     function leadGap() {
       if (!lead.active) return null;
@@ -354,8 +323,9 @@ export default {
       const L = st.level;
       const v = kmh(ego.speed);
       const step = ctx.currentStep();
-      const ev = scene.oddEventAhead();
-      const evText = ev && ev.dist > 0 && ev.dist < 450 ? ` ${ev.kind === 'zona' ? 'Zona konstruksi' : 'Batas area operasi'} ${fmt(ev.dist, 0)} m lagi.` : '';
+      const ev = scene.eventForLevel(L);
+      const evText = ev && ev.dist >= 0.5 && ev.dist < 450 ? ` ${ev.kind === 'zona' ? 'Zona pekerjaan jalan' : 'Batas area operasi'} ${fmt(ev.dist, 0)} m lagi.` : '';
+      const where = scene.inKawasan(st.egoS) ? ' di kawasan Villa Puncak Tidar' : '';
       if (L === 0) {
         let t = `Level 0: kamu mengemudi penuh, ${v}.`;
         if (step === 0 && !ctx.isTaskDone('l0-manual')) t += ` Sudah ${fmt(Math.min(st.counters.manualDist, MANUAL_DIST), 0)} dari 150 m.`;
@@ -366,7 +336,7 @@ export default {
       if (L === 1) {
         let t =
           st.acc.mode === 'follow'
-            ? `Level 1: ACC menjaga jarak ${fmt(st.acc.gap, 0)} m di belakang mobil depan, ${v}. Kamu yang menyetir.`
+            ? `Level 1: ACC menjaga jarak ${fmt(st.acc.gap, 0)} m di belakang kendaraan depan, ${v}. Kamu yang menyetir.`
             : `Level 1: ACC menjaga kecepatan ${v}. Kamu yang menyetir.`;
         if (step === 1 && !ctx.isTaskDone('l1-acc') && st.acc.mode === 'follow') t += ` Sudah ${fmt(Math.min(st.counters.accFollow, 5), 0)} dari 5 detik.`;
         return t;
@@ -388,12 +358,12 @@ export default {
       }
       if (L === 4) {
         const ph = st.ads.phase;
-        if (ph === 'mrm') return 'Level 4: batas area operasi di depan. Sistem menepi ke bahu jalan kiri dan berhenti sendiri.';
-        if (ph === 'mrc') return 'Level 4: mobil berhenti aman di bahu jalan dengan lampu hazard. Tidak ada yang perlu mengambil alih.';
-        return `Level 4: sistem mengemudi sendiri, ${v}.${evText}`;
+        if (ph === 'mrm') return 'Level 4: rute akan keluar dari area operasi. Sistem menepi ke tepi kiri jalan dan berhenti sendiri.';
+        if (ph === 'mrc') return 'Level 4: mobil berhenti aman di tepi jalan dengan lampu hazard. Tidak ada yang perlu mengambil alih.';
+        return `Level 4: sistem mengemudi sendiri${where}, ${v}.${evText}`;
       }
       const passed = st.boundary && st.egoS + scene.EGO_HL > st.boundary.s && st.egoS < st.boundary.s + 120;
-      return `Level 5: sistem mengemudi sendiri, ${v}.${passed ? ' Batas area operasi tidak menghentikannya.' : evText}`;
+      return `Level 5: sistem mengemudi sendiri${where}, ${v}.${passed ? ' Batas area operasi level 4 tidak menghentikannya.' : evText}`;
     }
 
     // ---------- kotak peringatan ----------
@@ -401,8 +371,9 @@ export default {
       const L = st.level;
       const fk = scene.flashKey();
       const ph = st.ads.phase;
-      if (fk === 'crash') return { key: 'crash', tone: 'danger', icon: 'alert', title: 'Tabrakan', text: 'Mobil menabrak mobil depan. Rem lebih awal.' };
-      if (fk === 'crash-zone') return { key: 'crash-zone', tone: 'danger', icon: 'alert', title: 'Tabrakan', text: 'Mobil menabrak zona konstruksi. Pindah lajur lebih awal.' };
+      if (fk === 'crash') return { key: 'crash', tone: 'danger', icon: 'alert', title: 'Tabrakan', text: `Mobil menabrak ${scene.leadName()}. Rem lebih awal.` };
+      if (fk === 'crash-motor') return { key: 'crash-motor', tone: 'danger', icon: 'alert', title: 'Tabrakan', text: 'Mobil menyerempet sepeda motor di lajur kanan. Pastikan lajurnya kosong sebelum pindah.' };
+      if (fk === 'crash-zone') return { key: 'crash-zone', tone: 'danger', icon: 'alert', title: 'Tabrakan', text: 'Mobil menabrak zona pekerjaan jalan. Pindah lajur lebih awal.' };
       if (fk === 'offroad') return { key: 'offroad', tone: 'warn', icon: 'alert', title: 'Mobil keluar jalan', text: 'Posisi dikembalikan ke lajur. Setir pelan mengikuti tikungan.' };
       if (st.aeb.active || fk === 'aeb') {
         return { key: 'aeb', tone: 'danger', icon: 'alert', title: 'Rem darurat otomatis', text: 'Mengerem sesaat agar tidak menabrak. Ini tidak menaikkan level.' };
@@ -414,7 +385,7 @@ export default {
           pulse: true,
           icon: 'steering',
           title: 'Ambil alih kemudi',
-          text: st.ads.reason === 'zona' ? 'Zona konstruksi di depan, di luar ODD sistem.' : 'Batas area operasi sistem ada di depan.',
+          text: 'Zona pekerjaan jalan di depan, di luar ODD sistem.',
           count: fmt(Math.ceil(st.ads.left), 0),
           action: 'takeover',
         };
@@ -442,35 +413,36 @@ export default {
       }
       if (fk === 'l2-thanks') return { key: 'l2-thanks', tone: 'ok', icon: 'check', title: 'Tangan di setir', text: 'Sistem level 2 tetap aktif. Terus awasi jalan.' };
       if (fk === 'l2-handback') return { key: 'l2-handback', tone: 'warn', icon: 'alert', title: 'Sistem level 2 mati', text: 'Kamu tidak merespons, jadi kemudi diserahkan kepadamu.', action: 'engage' };
-      if (fk === 'l2-zone') return { key: 'l2-zone', tone: 'warn', icon: 'alert', title: 'Level 2 menyerahkan kemudi', text: 'Zona konstruksi di luar kemampuan sistem. Kamu yang menyetir.' };
+      if (fk === 'l2-zone') return { key: 'l2-zone', tone: 'warn', icon: 'alert', title: 'Level 2 menyerahkan kemudi', text: 'Zona pekerjaan jalan di luar kemampuan sistem. Kamu yang menyetir.' };
       if (fk === 'brake-cancel') return { key: 'brake-cancel', tone: 'info', icon: 'info', title: 'Sistem mati karena kamu mengerem', text: 'Menginjak rem selalu mengembalikan kendali kepadamu.', action: 'engage' };
-      if (fk === 'l3-refuse') return { key: 'l3-refuse', tone: 'warn', icon: 'alert', title: 'Level 3 belum bisa aktif', text: 'Kejadian di luar ODD terlalu dekat. Kamu mengemudi dulu.' };
-      if (fk === 'odd-outside') return { key: 'odd-outside', tone: 'warn', icon: 'alert', title: `Level ${L} tidak bisa aktif`, text: 'Mobil sudah di luar area operasi sistem.' };
+      if (fk === 'l3-refuse') return { key: 'l3-refuse', tone: 'warn', icon: 'alert', title: 'Level 3 belum bisa aktif', text: 'Zona pekerjaan jalan di luar ODD sudah terlalu dekat. Kamu mengemudi dulu.' };
+      if (fk === 'odd-outside') return { key: 'odd-outside', tone: 'warn', icon: 'alert', title: `Level ${L} tidak bisa aktif`, text: 'Mobil sudah di luar area operasinya, kawasan kampus Ma Chung dan Villa Puncak Tidar.' };
       if (fk === 'l3-taken') {
-        return { key: 'l3-taken', tone: 'ok', icon: 'check', title: 'Kamu mengemudi', text: st.zone ? 'Pindah ke lajur kanan untuk melewati zona konstruksi.' : 'Sistem level 3 mati sampai kamu mengaktifkannya lagi.' };
+        return { key: 'l3-taken', tone: 'ok', icon: 'check', title: 'Kamu mengemudi', text: st.zone ? 'Pindah ke lajur kanan untuk melewati zona pekerjaan jalan. Lihat dulu sepeda motor di kanan.' : 'Sistem level 3 mati sampai kamu mengaktifkannya lagi.' };
       }
       if (fk === 'l3-taken-free') return { key: 'l3-taken-free', tone: 'info', icon: 'info', title: 'Kamu mengambil alih', text: 'Pengemudi level 3 boleh mengambil alih kapan saja.' };
       if (st.fcw) return { key: 'fcw', tone: 'danger', icon: 'alert', title: 'Awas tabrakan depan', text: 'Rem sekarang. Di level ini kamu yang harus bereaksi.' };
       if (st.ldw != null) return { key: 'ldw', tone: 'warn', icon: 'alert', title: 'Keluar lajur', text: 'Sistem hanya memperingatkan. Kamu yang menyetir kembali.' };
-      if (st.engaged && L === 4 && ph === 'mrm') return { key: 'l4-mrm', tone: 'info', icon: 'info', title: 'Manuver risiko minimal', text: 'Batas area operasi di depan. Sistem menepi sendiri.' };
-      if (st.engaged && L === 4 && ph === 'mrc') return { key: 'l4-mrc', tone: 'ok', icon: 'check', title: 'Berhenti aman di bahu jalan', text: 'Tidak ada yang perlu mengambil alih. Coba pilih level 5.' };
+      if (st.engaged && L === 4 && ph === 'mrm') return { key: 'l4-mrm', tone: 'info', icon: 'info', title: 'Manuver risiko minimal', text: 'Batas area operasi di depan. Sistem menepi sendiri sebelum keluar kawasan.' };
+      if (st.engaged && L === 4 && ph === 'mrc') return { key: 'l4-mrc', tone: 'ok', icon: 'check', title: 'Berhenti aman di tepi jalan', text: 'Tidak ada yang perlu mengambil alih. Coba pilih level 5.' };
       const b = st.boundary;
       if (st.engaged && L === 5 && b && st.egoS > b.s - 90 && st.egoS < b.s + 50) {
         return { key: 'l5-pass', tone: 'info', icon: 'info', title: 'Level 5 terus berjalan', text: 'ODD level 5 tidak terbatas, jadi batas ini tidak berlaku.' };
       }
       const z = st.zone;
       if (st.engaged && L >= 4 && z && st.egoS > z.s0 - 130 && st.egoS < z.s1) {
-        return { key: 'l45-zone', tone: 'info', icon: 'info', title: 'Sistem melewati zona konstruksi', text: 'Sistem pindah ke lajur kanan dan melambat sendiri.' };
+        return {
+          key: 'l45-zone',
+          tone: 'info',
+          icon: 'info',
+          title: 'Sistem melewati zona pekerjaan jalan',
+          text: st.wantRight ? 'Sistem menyalakan sein kanan dan menunggu lajur kanan kosong.' : 'Sistem pindah ke lajur kanan dan melambat sendiri.',
+        };
       }
       return null;
     }
 
-    function actionLabel(a) {
-      if (a.action === 'takeover') return 'Ambil alih';
-      if (a.action === 'hold') return 'Pegang kemudi';
-      if (a.action === 'engage') return `Aktifkan level ${st.level}`;
-      return '';
-    }
+    const actionLabel = (a) => ({ takeover: 'Ambil alih', hold: 'Pegang kemudi', engage: `Aktifkan level ${st.level}` })[a.action] || '';
 
     function paintAlert() {
       const a = currentAlert();
@@ -560,7 +532,8 @@ export default {
         accOut.set('bebas');
         accOut.setTone('');
       }
-      laneOut.set(st.egoD > EDGE_LEFT ? 'Bahu jalan' : st.egoD >= 0 ? 'Lajur kiri' : 'Lajur kanan');
+      const lane = st.egoD > EDGE_LEFT ? 'Tepi kiri jalan' : st.egoD >= 0 ? 'Lajur kiri' : 'Lajur kanan';
+      laneOut.set(lane);
 
       // HUD
       chipLevel.set(String(L));
@@ -573,27 +546,69 @@ export default {
       const ev = scene.oddEventAhead();
       if (ctx.currentStep() === 0 && L === 0 && !ctx.isTaskDone('l0-manual')) {
         info = ['Jarak manual', `${fmt(Math.min(st.counters.manualDist, MANUAL_DIST), 0)} dari 150 m`, COLORS.accent];
-      } else if (ev && ev.dist > 0 && ev.dist < 450) {
-        info = ev.kind === 'zona' ? ['Zona konstruksi', fmt(ev.dist, 0, 'm'), '#fdba74'] : ['Batas area operasi', fmt(ev.dist, 0, 'm'), COLORS.target];
+      } else if (ev && ev.dist >= 0.5 && ev.dist < 450) {
+        info = ev.kind === 'zona' ? ['Pekerjaan jalan', fmt(ev.dist, 0, 'm'), '#fdba74'] : ['Batas ODD level 4', fmt(ev.dist, 0, 'm'), COLORS.target];
       }
       chipInfo.show(!!info);
       if (info) {
-        if (chipInfoLabel.textContent !== info[0]) chipInfoLabel.textContent = info[0];
+        chipInfo.setLabel(info[0]);
         chipInfo.set(info[1]);
-        chipInfo.el.style.setProperty('--tone', info[2]);
+        chipInfo.setColor(info[2]);
       }
 
       paintAlert();
       ctx.setStatus(statusText());
       drainEvents();
+      refreshTrip();
 
-      const pos = st.egoD > EDGE_LEFT ? 'di bahu jalan kiri' : st.egoD >= 0 ? 'di lajur kiri' : 'di lajur kanan';
-      const label = `Jalan tol dua lajur dilihat dari atas. Mobil otonom berwarna hijau toska ${pos}. Level ${L}, yang mengemudi: ${drv.text.toLowerCase()}.`;
+      const area = scene.inKawasan(st.egoS) ? 'di kawasan Villa Puncak Tidar' : 'di jalan kota menuju Alun-alun Merdeka';
+      const label = `Jalan bermedian dua lajur per arah (ilustrasi) ${area}, dilihat dari atas. Mobil otonom berwarna hijau toska di ${lane.toLowerCase()}. Level ${L}, yang mengemudi: ${drv.text.toLowerCase()}.`;
       if (label !== lastLabel) {
         lastLabel = label;
         view.setLabel(label);
       }
     }
+
+    // ---------- peta perjalanan ----------
+    const km = (m) => fmt(m / 1000, 1, 'km');
+    function refreshTrip() {
+      const trip = scene.tripAt(st.egoS);
+      const front = trip + scene.EGO_HL;
+      drawTrip({ trip, zoneTrip: st.zone ? scene.tripAt(st.zone.s0) : null });
+      let text;
+      if (trip >= TRIP_LENGTH - 5) text = 'Sudah sampai di sekitar Alun-alun Merdeka. Jalan ilustrasi di atas tetap berlanjut.';
+      else {
+        text = `Kira-kira di ${streetAt(trip)}, ${km(trip)} dari kampus. Masih ${km(TRIP_LENGTH - trip)} ke Alun-alun Merdeka.`;
+        if (front < ODD_EXIT) text += ` Tinggal ${fmt(ODD_EXIT - front, 0, 'm')} lagi ke batas area operasi level 4.`;
+      }
+      if (tripWhere.textContent !== text) tripWhere.textContent = text;
+    }
+
+    // antarmuka baca saja untuk pengujian otomatis (dihapus saat pelajaran ditinggalkan)
+    const hook = {
+      get state() {
+        return {
+          level: st.level,
+          engaged: st.engaged,
+          phase: st.ads.phase,
+          trip: scene.tripAt(st.egoS),
+          inKawasan: scene.inKawasan(st.egoS),
+          limitKmh: Math.round(scene.limitAt(st.egoS) * 3.6),
+          speedKmh: ego.speed * 3.6,
+          egoD: st.egoD,
+          crashes: { ...st.crashLog },
+          actors: scene.actorKinds(),
+          bikes: scene.bikes.filter((m) => m.active).map((m) => ({ s: m.s - st.egoS, d: m.d, v: m.v })),
+          lead: lead.active ? { kind: lead.kind, gap: leadGap() } : null,
+          // pelajaran ini tidak punya lampu pengatur simpang maupun orang yang berjalan kaki, jadi semuanya selalu 0
+          safety: { redLightRuns: 0, pedestrianContacts: 0, trafficLights: 0, pedestrians: 0 },
+        };
+      },
+    };
+    window.__levelOtomasi = hook;
+    ctx.onCleanup(() => {
+      if (window.__levelOtomasi === hook) delete window.__levelOtomasi;
+    });
 
     // ---------- kamera dan menggambar ----------
     function updateCamera() {
@@ -610,7 +625,7 @@ export default {
 
     function render() {
       updateCamera();
-      const g = view.begin(COLORS.ground);
+      const g = view.begin();
       scene.draw(g, view, labels, { time: st.t });
       labels.draw(g, view);
       drawScaleBar(g, view);
@@ -622,10 +637,9 @@ export default {
     }
 
     function applyStep(i, level) {
-      const p = PRESETS[clamp(i, 0, N - 1)];
-      releaseHolds();
+      const p = PRESETS[clamp(i, 0, ctx.stepCount - 1)];
+      for (const [b] of HOLDS) b.setActive(false);
       scene.applyPreset(level == null ? p : { ...p, level });
-      levelCtl.set(st.level);
       shownAlert = null;
       alertEl.hidden = true;
       refreshPanels();
@@ -633,17 +647,9 @@ export default {
 
     // ---------- antarmuka ke shell ----------
     return {
-      onStep(i) {
-        applyStep(i);
-      },
-      reset() {
-        // ulangi skenario langkah ini, dengan level yang sedang dipilih pelajar
-        applyStep(ctx.currentStep(), st.level);
-        loop.resetTime();
-      },
-      destroy() {
-        // Kanvas, loop, keyboard, dan listener dibersihkan otomatis oleh ctx.
-      },
+      onStep: (i) => applyStep(i),
+      // ulangi skenario langkah ini dengan level yang sedang dipilih pelajar (shell mengulang waktu loop)
+      reset: () => applyStep(ctx.currentStep(), st.level),
     };
   },
 };
@@ -695,6 +701,10 @@ function buildStyles() {
     ${P} .act-row .btn { min-height: 44px; padding: 0 8px; gap: 6px; font-size: 0.86rem; }
     ${P} .act-row .btn.is-asked { border-color: var(--warn); background: rgba(245, 158, 11, 0.16); color: #fcd34d; }
 
+    ${P} .trip-map { position: relative; height: 260px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: #13261f; }
+    ${P} .trip-where { margin-top: 8px; color: var(--text-soft); font-size: 0.9rem; }
+    ${P} .grp-trip .legend { margin-top: 6px; }
+
     ${P} .grp-resp .data-table-wrap { overflow-x: auto; }
     ${P} .resp-table th, ${P} .resp-table td { white-space: normal; }
     ${P} .resp-table thead th { text-align: center; vertical-align: bottom; }
@@ -725,6 +735,7 @@ function buildStyles() {
       ${P} .lvl-alert-body { flex: 1; }
       ${hide}
       ${P} .resp-table tbody th { min-width: 0; }
+      ${P} .trip-map { height: 200px; }
     }
   `;
 }

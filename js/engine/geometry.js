@@ -122,7 +122,8 @@ export function boundingRadius(obj) {
   }
 }
 
-function shapeCenter(obj) {
+/** Titik pusat objek: titik berat untuk poligon (disimpan di obj._centroid), selain itu (x, y). */
+export function shapeCenter(obj) {
   if (shapeType(obj) === 'polygon') {
     if (!obj._centroid) obj._centroid = polygonCentroid(obj.points);
     return obj._centroid;
@@ -475,6 +476,24 @@ export class Path {
     return lo;
   }
 
+  /**
+   * Arah segmen i. Segmen dengan panjang nol (titik kembar) memakai arah segmen terdekat yang
+   * punya panjang, supaya arah tidak tiba-tiba menjadi 0 (menghadap timur).
+   */
+  segmentHeading(i) {
+    const pts = this.points;
+    const n = pts.length - 1;
+    for (let d = 0; d < n; d++) {
+      for (const j of d === 0 ? [i] : [i + d, i - d]) {
+        if (j < 0 || j >= n) continue;
+        const dx = pts[j + 1].x - pts[j].x;
+        const dy = pts[j + 1].y - pts[j].y;
+        if (dx * dx + dy * dy > 1e-18) return Math.atan2(dy, dx);
+      }
+    }
+    return 0;
+  }
+
   /** Posisi dan arah pada jarak s. Hasil: { x, y, heading, s, index }. */
   sample(s) {
     s = this._wrap(s);
@@ -486,7 +505,7 @@ export class Path {
     return {
       x: a.x + (b.x - a.x) * t,
       y: a.y + (b.y - a.y) * t,
-      heading: Math.atan2(b.y - a.y, b.x - a.x),
+      heading: segLen > 0 ? Math.atan2(b.y - a.y, b.x - a.x) : this.segmentHeading(i),
       s,
       index: i,
     };
@@ -496,6 +515,8 @@ export class Path {
    * Titik terdekat pada jalur dari (px, py).
    * Hasil: { x, y, s, dist, heading, lateral, index }. lateral positif = titik ada di KIRI jalur.
    * Beri hintS dan window (m) untuk mencari hanya di sekitar posisi sebelumnya (lebih cepat, tidak lompat).
+   * Pada jalur tertutup (closed) hintS diabaikan dan semua segmen diperiksa: hasil selalu benar,
+   * hanya lebih lambat untuk jalur yang sangat panjang.
    */
   closest(px, py, hintS = null, window = 30) {
     let best = null;
@@ -518,7 +539,7 @@ export class Path {
       }
     }
     const { q, i, a, b } = best;
-    const heading = Math.atan2(b.y - a.y, b.x - a.x);
+    const heading = a.x === b.x && a.y === b.y ? this.segmentHeading(i) : Math.atan2(b.y - a.y, b.x - a.x);
     const s = this.cum[i] + q.t * (this.cum[i + 1] - this.cum[i]);
     // kiri dari arah jalur = (sin h, -cos h)
     const lateral = (px - q.x) * Math.sin(heading) - (py - q.y) * Math.cos(heading);

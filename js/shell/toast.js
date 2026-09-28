@@ -1,4 +1,4 @@
-// Notifikasi singkat di bagian bawah layar.
+// Notifikasi singkat di bagian bawah layar. Klik tembus ke elemen di bawahnya.
 
 import { icon } from '../engine/icons.js';
 
@@ -25,15 +25,7 @@ export function toast(text, { tone = 'info', duration = 3600 } = {}) {
     node.classList.add('is-leaving');
     setTimeout(() => node.remove(), 250);
   };
-  const timer = setTimeout(remove, duration);
-  node.addEventListener('click', () => {
-    clearTimeout(timer);
-    remove();
-  });
-}
-
-/** Hapus semua toast (misalnya saat pindah halaman). */
-export function clearToasts() {
-  const region = document.getElementById('toasts');
-  if (region) region.textContent = '';
+  // Toast tidak menangkap klik (pointer-events: none di CSS), jadi tidak pernah menghalangi
+  // tombol di bawahnya. Ia hilang sendiri setelah `duration`.
+  setTimeout(remove, duration);
 }

@@ -35,7 +35,7 @@ const EDGES = [
   { a: 'salip', b: 'kembali' },
   { a: 'kembali', b: 'melaju' },
 ];
-// perpindahan jarang (mobil mogok disingkirkan saat menunggu): digambar sebagai siku lewat baris tengah
+// perpindahan jarang (angkot pergi saat mobil menunggu celah): digambar sebagai siku lewat baris tengah
 const RARE = { a: 'celah', b: 'melaju' };
 
 const EDGE_COLOR = 'rgba(148, 163, 184, 0.4)';
@@ -136,15 +136,14 @@ export function drawDiagram(g, rect, { state, prev, age = Infinity }) {
       const sy = from === e.a ? dy : -dy;
       const p0 = edgePoint(F, sx, sy);
       const p1 = edgePoint(T, -sx, -sy);
-      const shift = side === 0 ? 0 : side;
-      const a = { x: p0.x + ox * shift, y: p0.y + oy * shift };
-      const b = { x: p1.x + ox * shift, y: p1.y + oy * shift };
+      const a = { x: p0.x + ox * side, y: p0.y + oy * side };
+      const b = { x: p1.x + ox * side, y: p1.y + oy * side };
       const hot = prev === from && state === to && age < GLOW_SECONDS;
       if (hot) {
         const k = 1 - age / GLOW_SECONDS;
         arrow(g, a, b, { color: withAlpha(STATES[to].color, 0.35 + 0.65 * k), width: 2.5 });
       } else {
-        arrow(g, a, b, { color: e.rare ? 'rgba(148, 163, 184, 0.25)' : EDGE_COLOR, width: 1.3, dash: e.rare ? [4, 4] : null });
+        arrow(g, a, b, { color: EDGE_COLOR, width: 1.3 });
       }
     }
   }

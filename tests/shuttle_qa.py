@@ -1,10 +1,13 @@
-"""QA pelajaran Misi Shuttle Otonom lewat UI seperti pelajar: semua tugas, alat peta, jeda,
-ulangi, kecepatan, dan uji kebocoran navigasi.
+"""QA pelajaran Misi Shuttle Otonom (jalan asli sekitar Ma Chung), satu skrip untuk semuanya.
 
-Pemakaian: python3 tests/shuttle_qa.py [--mobile]
-Butuh server statis di port 8119.
+Pemakaian: python3 tests/shuttle_qa.py [--mobile]   (server: python3 tests/serve.py 8249)
+Isi: kelima tugas diselesaikan lewat UI, lalu pelajar "nakal" mencoba melanggar aturan keras (pejalan
+kaki uji berulang, batas 30 km/jam, 8 kali x 2x, hujan, tutup dan buka jalan). Di awal, uji model
+Node (tests/shuttle_model.mjs, normal dan --blind) ikut dijalankan pada versi desktop.
 """
 import json
+import os
+import subprocess
 import sys
 import time
 
@@ -12,216 +15,172 @@ from playwright.sync_api import sync_playwright
 
 CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-arm64/"
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
-BASE = "http://127.0.0.1:8119/"
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/shuttle/"
+BASE = "http://127.0.0.1:8249/"
+HERE = os.path.dirname(os.path.abspath(__file__))
+SHOTS = os.path.join(HERE, "shots", "shuttle")
 MOBILE = "--mobile" in sys.argv
 TAG = "m" if MOBILE else "d"
-MAP = {"minX": -14, "minY": -9, "maxX": 134, "maxY": 109}
-PAD = 10
-# satu titik di ruas tempat halte berada (untuk menutup jalan lewat ketukan)
-HALTE_ROAD = {"Gerbang Utama": (0, 76), "Asrama": (38, 100), "Kantin": (88, 100), "Perpustakaan": (120, 24), "Rektorat": (36, 0)}
-SHELTER = {"Rektorat": (27.5, 5.0)}
+os.makedirs(SHOTS, exist_ok=True)
+out = {"mobile": MOBILE, "errors": [], "problems": []}
 
-errors = []
-log = {}
-
-
-def hook(page):
-    return page.evaluate("() => JSON.parse(JSON.stringify(window.__simotonom))")
+if not MOBILE:
+    for extra in ([], ["--blind"]):
+        r = subprocess.run(["node", os.path.join(HERE, "shuttle_model.mjs"), "20", "4", *extra], capture_output=True, text=True)
+        out["model" + ("_blind" if extra else "")] = [l for l in r.stdout.splitlines() if l.startswith(("seed", "ATURAN"))]
+        if r.returncode:
+            out["problems"].append("uji model gagal " + " ".join(extra))
 
 
-def wait_task(page, task, timeout):
+def js(expr):
+    return page.evaluate(expr)
+
+
+def snap():
+    return js("() => window.__lessonSafety.snapshot()")
+
+
+def done():
+    return js("() => window.__simotonom.completedTasks")
+
+
+def wait_task(task, timeout):
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if task in hook(page)["completedTasks"]:
+        s = snap()
+        if s["redRuns"] or s["pedContacts"]:
+            out["problems"].append(f"aturan keras dilanggar saat {task}: {s['events']}")
+        if task in done():
             return round(time.time() - t0, 1)
-        page.wait_for_timeout(250)
+        page.wait_for_timeout(500)
+    out["problems"].append(f"tugas {task} tidak selesai dalam {timeout} detik")
     return None
 
 
-def next_step(page):
-    page.locator(".step-nav .btn-primary").dispatch_event("click")
-    page.wait_for_timeout(400)
+def click(text, sel="button"):
+    page.locator(sel, has_text=text).first.click()
+    page.wait_for_timeout(250)
 
 
-def shot(page, name, full=False):
-    page.screenshot(path=f"{SHOTS}qa-{TAG}-{name}.png", full_page=full)
+def shot(name):
+    page.locator(".stage").first.screenshot(path=os.path.join(SHOTS, f"qa-{TAG}-{name}.png"))
 
 
-def stage_shot(page, name):
-    page.locator(".stage").screenshot(path=f"{SHOTS}qa-{TAG}-{name}.png")
-
-
-def to_screen(page, x, y):
-    """Titik dunia ke titik layar pada tampilan Seluruh kampus (meniru View.fit)."""
-    box = page.locator(".sim-canvas").bounding_box()
-    w, h = box["width"], box["height"]
-    bw, bh = MAP["maxX"] - MAP["minX"], MAP["maxY"] - MAP["minY"]
-    scale = min((w - 2 * PAD) / bw, (h - 2 * PAD) / bh)
-    cx, cy = (MAP["minX"] + MAP["maxX"]) / 2, (MAP["minY"] + MAP["maxY"]) / 2
-    return box["x"] + (x - cx) * scale + w / 2, box["y"] + (y - cy) * scale + h / 2
-
-
-def tap_world(page, x, y):
-    page.locator(".sim-canvas").scroll_into_view_if_needed()
-    page.wait_for_timeout(150)
-    sx, sy = to_screen(page, x, y)
-    if MOBILE:
-        page.touchscreen.tap(sx, sy)
-    else:
-        page.mouse.click(sx, sy)
-    page.wait_for_timeout(350)
-
-
-def seg(page, text):
-    page.locator(".seg-btn", has_text=text).first.click()
-    page.wait_for_timeout(200)
-
-
-def toast_texts(page):
-    return page.evaluate("() => [...document.querySelectorAll('.toast')].map(t => t.textContent.trim())")
-
-
-def readout(page, label):
-    return page.evaluate(
-        """(label) => { const r = [...document.querySelectorAll('.readout')].find(e => e.querySelector('.readout-label')?.textContent === label);
-        return r ? r.querySelector('.readout-value').textContent : null; }""", label)
-
-
-def brain(page):
-    return page.evaluate("() => [...document.querySelectorAll('.sh-brain li')].map(li => li.textContent.trim())")
+def next_step():
+    page.locator(".step-nav .btn-primary").first.click()
+    page.wait_for_timeout(500)
 
 
 with sync_playwright() as pw:
     browser = pw.chromium.launch(executable_path=CHROME, headless=True)
-    if MOBILE:
-        ctx = browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2, is_mobile=True, has_touch=True)
-    else:
-        ctx = browser.new_context(viewport={"width": 1366, "height": 900}, device_scale_factor=1)
-    page = ctx.new_page()
-    page.on("console", lambda m: errors.append(f"{m.type}: {m.text}") if m.type in ("error", "warning") else None)
-    page.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
-
+    vp = dict(viewport={"width": 390, "height": 844}, device_scale_factor=2, is_mobile=True, has_touch=True) if MOBILE else dict(viewport={"width": 1366, "height": 900})
+    page = browser.new_context(**vp).new_page()
+    page.on("console", lambda m: m.type in ("error", "warning") and "ReadPixels" not in m.text and out["errors"].append(f"{m.type}: {m.text}"))
+    page.on("pageerror", lambda e: out["errors"].append(f"pageerror: {e}"))
     page.goto(BASE + "#/", wait_until="load")
-    page.evaluate("() => localStorage.clear()")
+    js("() => localStorage.clear()")
     page.goto(BASE + "#/pelajaran/shuttle", wait_until="load")
-    page.wait_for_timeout(1500)
-    h = hook(page)
-    log["start"] = {"step": h["stepIndex"], "status": h["lessonStatus"], "loops": h["activeLoops"]}
-    stage_shot(page, "0-awal")
+    page.wait_for_function("() => window.__lessonSafety && window.__simotonom.lessonStatus === 'ready'", timeout=30000)
 
-    # langkah 1: halte pertama
-    log["first-stop"] = wait_task(page, "first-stop", 60)
-    stage_shot(page, "1-halte")
-    log["brain-1"] = brain(page)
-    next_step(page)
+    # aksesibilitas dasar dan target sentuh
+    out["canvas"] = js("() => { const c = document.querySelector('.sim-canvas'); return [c.getAttribute('role'), (c.getAttribute('aria-label') || '').slice(0, 60)]; }")
+    out["smallTargets"] = js("""() => [...document.querySelectorAll('.controls button, .controls input:not([type=checkbox])')]
+        .filter(e => e.offsetParent).map(e => [e.textContent.trim().slice(0, 24) || e.type, Math.round(e.getBoundingClientRect().height)]).filter(([, h]) => h < 40)""")
+    shot("0-awal")
 
-    # langkah 2: tutup jalan (ketuk peta seperti pelajar, tombol sebagai cadangan)
-    seg(page, "Seluruh kampus")
-    seg(page, "Tutup jalan")
-    page.wait_for_timeout(600)
-    # uji ketuk ruas yang bukan rute: Jl. Riset, lalu buka lagi
-    tap_world(page, 90, 50)
-    log["tap-riset"] = toast_texts(page)
-    page.wait_for_timeout(500)
-    stage_shot(page, "2a-riset-ditutup")
-    tap_world(page, 90, 50)
-    log["tap-riset-open"] = toast_texts(page)
-    page.wait_for_timeout(1200)
-    target = page.locator(".hud-chip", has_text="Menuju").locator(".hud-value").text_content()
-    log["target-before"] = target
-    # coba ketuk ruas seperti pelajar: ruas halte tujuan dulu, lalu ruas lain, buka lagi bila rute tidak berubah
-    candidates = [HALTE_ROAD.get(target)] + [(60, 25), (30, 50), (90, 50), (60, 75), (38, 100), (88, 100), (120, 24), (36, 0), (0, 30), (120, 75), (0, 76), (90, 0)]
-    log["tap-tries"] = 0
-    for pt in [c for c in candidates if c]:
-        tap_world(page, *pt)
-        log["tap-tries"] += 1
-        if wait_task(page, "closure", 2.2) is not None:
-            log["closure"] = f"ketuk {pt}"
-            break
-        page.locator("button", has_text="Buka semua jalan").click()
-        page.wait_for_timeout(300)
-    stage_shot(page, "2b-reroute")
-    if "closure" not in log:
-        log["closure-fallback"] = True
-        for _ in range(12):
-            page.locator("button", has_text="Tutup ruas di depan").click()
-            page.wait_for_timeout(700)
-            if wait_task(page, "closure", 3) is not None:
-                log["closure"] = "button"
-                break
-            page.locator("button", has_text="Buka semua jalan").click()
-            page.wait_for_timeout(2500)
-    stage_shot(page, "2c-closure-done")
-    log["brain-2"] = brain(page)
-    next_step(page)
-
-    # langkah 3: hujan
-    page.wait_for_timeout(4000)
-    gap_dry = page.locator(".hud-chip", has_text="Jarak ke depan").locator(".hud-value").text_content()
-    log["gap-dry"] = gap_dry
-    stage_shot(page, "3a-sebelum-hujan")
-    page.locator(".ctl-toggle", has_text="Hujan").click()
-    log["rain"] = wait_task(page, "rain", 45)
-    page.wait_for_timeout(3000)
-    log["gap-rain"] = page.locator(".hud-chip", has_text="Jarak ke depan").locator(".hud-value").text_content()
-    log["brain-3"] = brain(page)
-    stage_shot(page, "3b-hujan")
-    next_step(page)
-
-    # langkah 4: antar 10 penumpang, kecepatan 2x; uji juga pilih halte di peta
-    page.locator(".speed-wrap .seg-btn", has_text="2x").click()
-    seg(page, "Seluruh kampus")
-    seg(page, "Pilih halte")
-    tap_world(page, *SHELTER["Rektorat"])
-    log["halte-off"] = page.locator(".ctl-toggle", has_text="Rektorat").get_attribute("aria-checked")
-    stage_shot(page, "4a-rektorat-off")
-    tap_world(page, *SHELTER["Rektorat"])
-    log["halte-on"] = page.locator(".ctl-toggle", has_text="Rektorat").get_attribute("aria-checked")
-    log["deliver-10"] = wait_task(page, "deliver-10", 180)
-    log["delivered"] = readout(page, "Penumpang diantar")
-    stage_shot(page, "4b-antar")
-    next_step(page)
-
-    # langkah 5: satu putaran tanpa pelanggaran, dengan pejalan kaki mendadak (tombol J)
-    page.wait_for_timeout(2000)
-    page.keyboard.press("j")
-    page.wait_for_timeout(2500)
-    stage_shot(page, "5a-pejalan")
-    log["clean-run"] = wait_task(page, "clean-run", 260)
-    log["violations"] = readout(page, "Pelanggaran lampu merah")
-    log["emergencies"] = readout(page, "Pengereman darurat")
-    log["loops-done"] = readout(page, "Putaran selesai")
-    stage_shot(page, "5b-putaran")
-    shot(page, "5c-halaman", full=True)
-    next_step(page)
-    shot(page, "6-ringkasan")
-    log["summary"] = page.locator(".summary-tasks-title").text_content()
-
-    # jeda, ulangi, kecepatan
-    page.locator(".speed-wrap .seg-btn", has_text="1x").click()
-    page.locator('[data-act="pause"]').click()
+    # 1. halte pertama
+    click("4 kali", ".seg-btn")
+    out["t_first_stop"] = wait_task("first-stop", 120)
+    shot("1-halte")
+    # 2. tutup jalan: ketuk jalan di rute (tampilan Seluruh rute), lalu tombol
+    next_step()
+    click("Seluruh rute", ".seg-btn")
+    page.locator(".sim-canvas").scroll_into_view_if_needed()
     page.wait_for_timeout(300)
-    log["paused"] = hook(page)["paused"]
-    page.locator('[data-act="pause"]').click()
-    page.locator('[data-act="reset"]').click()
+    pt = js("() => { const a = window.__lessonSafety.api, v = window.__lessonSafety.view, p = a.routePoints(); const q = p[Math.min(p.length - 1, Math.floor(p.length * 0.6))]; const s = v.worldToScreen(q.x, q.y); const r = v.canvas.getBoundingClientRect(); return [r.left + s.x, r.top + s.y]; }")
+    (page.touchscreen.tap if MOBILE else page.mouse.click)(pt[0], pt[1])
     page.wait_for_timeout(600)
-    log["after-reset"] = {"delivered": readout(page, "Penumpang diantar"), "paused": hook(page)["paused"], "speed": hook(page)["speed"]}
+    out["closed_by_tap"] = snap()["closed"]
+    out["toasts"] = js("() => [...document.querySelectorAll('.toast')].map(t => t.textContent.trim())")
+    if not done().count("closure"):
+        click("Tutup jalan di depan")
+    out["t_closure"] = wait_task("closure", 60)
+    shot("2-tutup")
+    click("Ikuti shuttle", ".seg-btn")
+    # 3. hujan (langkah ini membuka semua jalan dan menaruh angkot pelan di depan)
+    next_step()
+    click("Hujan", "[role=switch]")
+    out["t_rain"] = wait_task("rain", 90)
+    out["brain_rain"] = js("() => [...document.querySelectorAll('.sh-brain li')].map(li => li.textContent.trim())")
+    shot("3-hujan")
+    click("Hujan", "[role=switch]")
+    # 4. antar 10 penumpang
+    next_step()
+    click("8 kali", ".seg-btn")
+    click("2x", ".seg-btn")
+    out["t_deliver"] = wait_task("deliver-10", 600)
+    shot("4-antar")
+    # 5. satu putaran bersih
+    next_step()
+    out["t_clean"] = wait_task("clean-run", 900)
+    out["after_tasks"] = {k: snap()[k] for k in ("redRuns", "pedContacts", "otherCollisions", "loops", "delivered", "time")}
 
-    # kebocoran loop saat pindah halaman berkali-kali
-    for _ in range(3):
-        page.goto(BASE + "#/", wait_until="load")
-        page.wait_for_timeout(500)
-        page.goto(BASE + "#/pelajaran/shuttle", wait_until="load")
-        page.wait_for_timeout(900)
-    page.evaluate("() => { location.hash = '#/'; }")
+    # pejalan kaki uji saat shuttle berhenti di halte: menunggu dan menyebut alasannya
+    page.wait_for_function("() => window.__lessonSafety.snapshot().mode === 'dwell'", timeout=120000)
+    js("""() => { const b = (t) => [...document.querySelectorAll('button')].find(e => e.textContent.trim() === t).click();
+        b('1 kali'); b('0,5x'); b('Pejalan kaki menyeberang'); }""")
+    page.wait_for_timeout(400)
+    out["pedWaitDwell"] = js("() => document.querySelector('.sh-pedwait').textContent")
+    click("8 kali", ".seg-btn")
+    click("2x", ".seg-btn")
+    # pelajar nakal: semua tombol sekaligus, berulang
+    slider = page.locator("input[type=range]").first
+    slider.focus()
+    page.keyboard.press("End")
+    waits = set()
+    for i in range(24):
+        click("Pejalan kaki menyeberang")
+        if i % 4 == 1:
+            click("Tutup jalan di depan")
+        if i % 4 == 3:
+            click("Buka semua jalan")
+        if i % 6 == 2:
+            click("Hujan", "[role=switch]")
+        page.wait_for_timeout(1200)
+        w = js("() => document.querySelector('.sh-pedwait').textContent")
+        if w:
+            waits.add(w)
+        s = snap()
+        if s["redRuns"] or s["pedContacts"]:
+            out["problems"].append(f"aturan keras dilanggar (nakal {i}): {s['events']}")
+        if i == 10:
+            shot("5-nakal")
+    s = snap()
+    out["abuse"] = {k: s[k] for k in ("redRuns", "pedContacts", "otherCollisions", "pedTests", "emergencies", "limitKmh", "time", "clamps")}
+    out["pedWaitTexts"] = sorted(waits)
+    if s["pedTests"] < 3:
+        out["problems"].append("pejalan kaki uji terlalu jarang muncul")
+    # tampilan pejalan kaki uji dari dekat
+    click("1 kali", ".seg-btn")
+    click("1x", ".seg-btn")
+    for _ in range(4):
+        click("Pejalan kaki menyeberang")
+        try:
+            page.wait_for_function("() => window.__lessonSafety.api.peds.peds.some(p => p.test)", timeout=30000)
+            break
+        except Exception:
+            out.setdefault("pedWaitLate", []).append(js("() => document.querySelector('.sh-pedwait').textContent"))
+    page.wait_for_timeout(1500)
+    shot("6-pejalan-uji")
+    out["status"] = js("() => document.querySelector('[role=status]').textContent.trim()")
+    out["done"] = done()
+    page.screenshot(path=os.path.join(SHOTS, f"qa-{TAG}-7-halaman.png"), full_page=True)
+    # tinggalkan pelajaran: loop berhenti
+    page.goto(BASE + "#/", wait_until="load")
     page.wait_for_timeout(600)
-    log["loops-on-home"] = hook(page)["activeLoops"]
-    page.evaluate("() => { location.hash = '#/pelajaran/shuttle'; }")
-    page.wait_for_timeout(900)
-    log["loops-on-lesson"] = hook(page)["activeLoops"]
-    log["final-tasks"] = hook(page)["completedTasks"]
+    out["leftHook"] = js("() => !!window.__lessonSafety")
     browser.close()
 
-log["errors"] = errors
-print(json.dumps(log, indent=2, ensure_ascii=False))
+if len(out["done"]) != 5 or out["errors"] or out["smallTargets"] or out["leftHook"] or not out["pedWaitDwell"]:
+    out["problems"].append("tugas, console, target sentuh, atau loop tertinggal bermasalah")
+print(json.dumps(out, indent=1, ensure_ascii=False))
+sys.exit(1 if out["problems"] else 0)

@@ -1,111 +1,77 @@
-// Gambar untuk pelajaran Kendali: lintasan uji, jejak mobil, visual pure pursuit, peta mini,
-// dan penunjuk sudut setir. Semua fungsi hanya menggambar, model ada di ./sim.js.
+// Gambar untuk pelajaran Kendali: peta OpenStreetMap di sekitar boulevard Villa Puncak Tidar,
+// jalur acuan dan zona bundaran, jejak mobil, visual pure pursuit, peta mini, dan penunjuk sudut
+// setir. Semua fungsi hanya menggambar, model ada di ./sim.js.
 
 import { COLORS, FONT, MONO, withAlpha } from '../../engine/theme.js';
-import { Rng, fmt, fmtSigned, TAU } from '../../engine/math.js';
-import { offsetPolyline } from '../../engine/geometry.js';
-import {
-  drawGround,
-  drawRoadSurface,
-  drawRoadMarkings,
-  drawTree,
-  drawPath,
-  drawLine,
-  drawRing,
-  drawMarker,
-  drawCar,
-  roundRectPath,
-  polylinePath,
-} from '../../engine/draw.js';
+import { fmt, fmtSigned, TAU } from '../../engine/math.js';
+import { drawPath, drawLine, drawRing, drawMarker, drawCar, roundRectPath } from '../../engine/draw.js';
+import { createMapRenderer } from '../../engine/osm2d.js';
 import { arcPoints } from './sim.js';
-import { LANE_WIDTH } from './track.js';
 
 export const TRAIL_COLORS = { ok: COLORS.ok, warn: COLORS.warn, danger: COLORS.danger };
 export const ARC_COLOR = COLORS.pathAlt;
 export const CIRCLE_COLOR = '#e2e8f0';
-const KERB_RED = '#dc2626';
-const KERB_WHITE = '#f1f5f9';
+export const ZONE_COLOR = COLORS.warn;
 
 /** Kelas warna jejak menurut besar galat lintasan. */
 export const errorTone = (e) => (Math.abs(e) < 0.3 ? 'ok' : Math.abs(e) < 1 ? 'warn' : 'danger');
 
-export function createScene(track) {
+/** Lookahead untuk ditampilkan: satu angka desimal bila Ld bukan bilangan bulat. */
+export const fmtLd = (ld) => fmt(ld, Math.abs(ld - Math.round(ld)) > 0.05 ? 1 : 0, 'm');
+
+/** Potongan titik jalur tertutup dari s0 ke s1 (boleh melewati titik start). */
+function slicePath(path, s0, s1, step = 0.5) {
+  const L = path.length;
+  const len = (((s1 - s0) % L) + L) % L;
+  const pts = [];
+  for (let d = 0; d <= len; d += step) pts.push(path.sample(s0 + d));
+  pts.push(path.sample(s0 + len));
+  return pts.map((p) => ({ x: p.x, y: p.y }));
+}
+
+/** Kotak latar semi gelap untuk peta mini dan penunjuk setir (piksel CSS, transform layar). */
+function panel(g, rect) {
+  g.fillStyle = 'rgba(11, 18, 32, 0.82)';
+  roundRectPath(g, rect.x, rect.y, rect.w, rect.h, 10);
+  g.fill();
+  g.strokeStyle = 'rgba(148, 163, 184, 0.28)';
+  g.lineWidth = 1;
+  g.stroke();
+}
+
+export function createScene(track, map) {
   const ref = track.ref;
-  const loop = [...ref.points]; // untuk Path tertutup, titik terakhir sudah sama dengan titik pertama
+  const refPts = ref.points;
 
-  // ---------- kerb merah putih di tikungan (tepi luar jalan kiri dan kanan) ----------
-  const leftKerbLine = offsetPolyline(loop, LANE_WIDTH / 2 + 0.35);
-  const rightKerbLine = offsetPolyline(loop, -(LANE_WIDTH * 1.5 + 0.35));
-  const kerbs = [];
-  const n = track.curvature.length;
-  let startI = null;
-  for (let i = 0; i <= n; i++) {
-    const curvy = i < n && Math.abs(track.curvature[i]) > 1 / 45;
-    if (curvy && startI == null) startI = i;
-    if (!curvy && startI != null) {
-      // titik offset punya indeks yang sama dengan titik jalur acuan
-      kerbs.push(leftKerbLine.slice(startI, i + 1), rightKerbLine.slice(startI, i + 1));
-      startI = null;
-    }
-  }
+  // peta: nama jalan di tampilan dekat, nama kawasan (Villa Puncak Tidar, kampus) di tampilan seluruh lintasan
+  // (garis batas kampus dibuat abu-abu supaya tidak tertukar dengan jalur acuan yang hijau toska)
+  const renderer = createMapRenderer(map, { layers: { places: false }, style: { campusLine: 'rgba(203, 213, 225, 0.4)' } });
+  let placesOn = false;
 
-  // ---------- pepohonan di luar jalan (acak tetapi selalu sama) ----------
-  const rng = new Rng(11);
-  const trees = [];
-  const b = track.bounds;
-  const tries = 900;
-  for (let k = 0; k < tries && trees.length < 90; k++) {
-    const x = rng.range(b.minX - 40, b.maxX + 40);
-    const y = rng.range(b.minY - 40, b.maxY + 40);
-    const near = ref.closest(x, y);
-    if (near.dist < 11) continue;
-    const r = rng.range(1.4, 2.6);
-    if (trees.some((t) => Math.hypot(t.x - x, t.y - y) < t.r + r + 1.5)) continue;
-    trees.push({ x, y, r });
-  }
+  // zona bundaran sebagai garis, dan titik masuknya untuk label
+  const zones = track.zones.map((z) => ({ ...z, pts: slicePath(ref, z.s0, z.s1), entry: ref.sample(z.s0) }));
 
-  // ---------- garis start kotak-kotak melintang seluruh jalan ----------
+  // garis start melintang badan jalan
   const p0 = ref.sample(0);
   const start = { x: p0.x, y: p0.y, heading: p0.heading };
 
-  // ---------- peta mini: titik lintasan yang dijarangkan ----------
-  const miniPts = ref.points.filter((_, i) => i % 4 === 0);
+  // peta mini: titik lintasan yang dijarangkan
+  const miniPts = refPts.filter((_, i) => i % 6 === 0);
 
   function drawStartLine(g) {
     const cell = 0.5;
-    const across = LANE_WIDTH * 2;
+    const across = track.roadWidth;
     const cols = Math.round(across / cell);
     g.save();
     g.translate(start.x, start.y);
     g.rotate(start.heading);
-    // sisi kiri jalan ada di -y lokal (kiri arah gerak), tepi kiri = +1,75 m ke kiri dari jalur acuan
-    const top = -LANE_WIDTH / 2;
+    const top = -across / 2;
     for (let r = 0; r < 2; r++) {
       for (let c = 0; c < cols; c++) {
         g.fillStyle = (r + c) % 2 ? '#0f172a' : '#f8fafc';
         g.fillRect(-cell + r * cell, top + c * cell, cell, cell);
       }
     }
-    g.restore();
-  }
-
-  function drawKerbs(g, view) {
-    g.save();
-    g.lineCap = 'butt';
-    g.lineJoin = 'round';
-    for (const k of kerbs) {
-      if (k.length < 2) continue;
-      g.strokeStyle = KERB_WHITE;
-      g.lineWidth = 0.7;
-      g.setLineDash([]);
-      polylinePath(g, k);
-      g.stroke();
-      g.strokeStyle = KERB_RED;
-      g.setLineDash([1.2, 1.2]);
-      polylinePath(g, k);
-      g.stroke();
-    }
-    g.setLineDash([]);
     g.restore();
   }
 
@@ -123,6 +89,13 @@ export function createScene(track) {
     for (let i = 1; i < trail.length; i++) {
       const p = trail[i];
       const t = errorTone(p.cte);
+      // lompatan besar (misalnya sesudah Uji dari diam) tidak disambung
+      if (Math.hypot(p.x - trail[i - 1].x, p.y - trail[i - 1].y) > 5) {
+        g.stroke();
+        g.beginPath();
+        g.moveTo(p.x, p.y);
+        continue;
+      }
       g.lineTo(p.x, p.y);
       if (t !== tone) {
         g.stroke();
@@ -138,7 +111,7 @@ export function createScene(track) {
 
   /**
    * Apakah label (lebar kira-kira w piksel) di titik dunia (x, y), digeser dy piksel, muat utuh di
-   * kanvas dan tidak tertutup kotak lain (chip HUD, penunjuk setir, peta mini)?
+   * kanvas dan tidak tertutup kotak lain (chip HUD, penunjuk setir, peta mini, atribusi)?
    */
   function labelFits(view, x, y, text, { dy = 0, size = 11, avoid = [] } = {}) {
     const p = view.worldToScreen(x, y);
@@ -150,31 +123,38 @@ export function createScene(track) {
   }
 
   /**
-   * Gambar dunia. opts: { view, sim, overview, labels, avoid }
+   * Gambar dunia. opts: { view, sim, overview, labels, avoid, zoneKmh }
    * avoid: kotak-kotak layar (piksel CSS) yang tidak boleh ditimpa label.
    */
-  function draw(g, { view, sim, overview = false, labels, avoid = [] }) {
+  function draw(g, { view, sim, overview = false, labels, avoid = [], zoneKmh = 20 }) {
     const st = sim.state;
     const ego = sim.ego;
-    drawGround(g, view, { color: COLORS.ground, grid: overview ? 0 : 10, gridColor: 'rgba(255,255,255,0.03)' });
-
-    // pohon yang terlihat saja
-    const vb = view.visibleBounds();
-    for (const t of trees) {
-      if (t.x + t.r < vb.minX || t.x - t.r > vb.maxX || t.y + t.r < vb.minY || t.y - t.r > vb.maxY) continue;
-      drawTree(g, t.x, t.y, t.r);
+    if (placesOn !== overview) {
+      placesOn = overview;
+      renderer.set({ layers: { places: overview } });
     }
-
-    drawKerbs(g, view);
-    drawRoadSurface(g, track.road);
-    drawRoadMarkings(g, track.road, { center: 'dashed' });
+    renderer.draw(g, view, { attribution: false });
     drawStartLine(g);
 
-    // jalur acuan (tengah lajur kiri)
-    drawPath(g, ref.points, { color: withAlpha(COLORS.path, 0.75), width: overview ? 1.5 : 2, view, arrows: overview ? 0 : 24 });
+    // jalur acuan (tengah lajur kiri) dan bagian yang masuk zona bundaran
+    drawPath(g, refPts, { color: withAlpha(COLORS.path, 0.75), width: overview ? 1.5 : 2, view, arrows: overview ? 0 : 24 });
+    for (const z of zones) drawLine(g, z.pts, { color: ZONE_COLOR, width: overview ? 2 : 2.5, view, dash: [5, 5], alpha: 0.85 });
 
     // jejak sumbu roda belakang, diwarnai menurut galat
     drawTrail(g, view, st.trail, { width: overview ? 2.5 : 3.5 });
+
+    // label zona bundaran (hanya bila titik masuknya terlihat dan labelnya tidak menutupi kotak lain)
+    if (labels) {
+      const text = `bundaran, maks ${fmt(zoneKmh, 0)} km/jam`;
+      for (const z of zones) {
+        if (labelFits(view, z.entry.x, z.entry.y, text, { dy: -18, size: 11, avoid })) {
+          labels.add(z.entry.x, z.entry.y, text, { color: ZONE_COLOR, dy: -18, size: 11, optional: true, priority: -1 });
+        }
+      }
+      if (!overview && labelFits(view, start.x, start.y, 'garis start', { dy: 18, size: 11, avoid })) {
+        labels.add(start.x, start.y, 'garis start', { color: '#f8fafc', dy: 18, size: 11, optional: true, priority: -2 });
+      }
+    }
 
     // visual pure pursuit (pengendali yang sedang memegang setir)
     const active = st.takeover ? st.safePp : st.pp;
@@ -196,26 +176,25 @@ export function createScene(track) {
         const radiusPx = ld * view.camera.scale;
         const targetText = takeover ? 'tujuan cadangan' : 'titik tujuan';
         if (radiusPx > 70 && labelFits(view, active.target.x, active.target.y, targetText, { dy: -20, avoid })) {
-          labels.add(active.target.x, active.target.y, targetText, { color: takeover ? COLORS.warn : COLORS.target, dy: -20, size: 11 });
+          labels.add(active.target.x, active.target.y, targetText, { color: takeover ? COLORS.warn : COLORS.target, dy: -20, size: 11, priority: 2 });
         }
         if (!takeover) {
           // label Ld di tepi lingkaran: kiri mobil dulu (tidak menutupi jalur di depan), lalu kanan,
           // lalu belakang. Bila tidak ada yang muat, chip Ld di HUD sudah menampilkan nilainya.
           const h = ego.heading;
-          // sama dengan chip HUD: satu angka desimal bila Ld bukan bilangan bulat
-          const text = `Ld ${fmt(ld, Math.abs(ld - Math.round(ld)) > 0.05 ? 1 : 0, 'm')}`;
+          const text = `Ld ${fmtLd(ld)}`;
           const spots = [
             { x: ra.x + Math.sin(h) * ld, y: ra.y - Math.cos(h) * ld },
             { x: ra.x - Math.sin(h) * ld, y: ra.y + Math.cos(h) * ld },
             { x: ra.x - Math.cos(h) * ld, y: ra.y - Math.sin(h) * ld },
           ];
           const spot = spots.find((p) => labelFits(view, p.x, p.y, text, { avoid }));
-          if (spot) labels.add(spot.x, spot.y, text, { color: CIRCLE_COLOR, dy: 0, size: 11, mono: true });
+          if (spot) labels.add(spot.x, spot.y, text, { color: CIRCLE_COLOR, dy: 0, size: 11, mono: true, priority: 1 });
         }
       }
     }
 
-    drawCar(g, ego, { ego: true, braking: ego.braking, view, highlight: st.takeover ? COLORS.warn : null });
+    drawCar(g, ego, { ego: true, braking: ego.braking, view, minPx: overview ? 14 : 0, highlight: st.takeover ? COLORS.warn : null });
     // titik acuan pure pursuit: tengah sumbu roda belakang
     drawRing(g, ra.x, ra.y, view.px(overview ? 2 : 3), { color: '#0b1220', width: 1.5, view, fill: '#f8fafc' });
   }
@@ -231,27 +210,31 @@ export function createScene(track) {
     const Y = (y) => oy + y * sc;
     g.save();
     view.screen();
-    g.fillStyle = 'rgba(11, 18, 32, 0.82)';
-    roundRectPath(g, rect.x, rect.y, rect.w, rect.h, 10);
-    g.fill();
-    g.strokeStyle = 'rgba(148, 163, 184, 0.28)';
-    g.lineWidth = 1;
-    g.stroke();
+    panel(g, rect);
     // lintasan
     g.strokeStyle = '#3b4658';
-    g.lineWidth = 4;
+    g.lineWidth = 3;
     g.lineJoin = 'round';
     g.beginPath();
     miniPts.forEach((p, i) => (i ? g.lineTo(X(p.x), Y(p.y)) : g.moveTo(X(p.x), Y(p.y))));
     g.closePath();
     g.stroke();
+    // zona bundaran
+    g.strokeStyle = withAlpha(ZONE_COLOR, 0.8);
+    g.lineWidth = 2;
+    for (const z of zones) {
+      g.beginPath();
+      z.pts.forEach((p, i) => (i % 4 ? null : i ? g.lineTo(X(p.x), Y(p.y)) : g.moveTo(X(p.x), Y(p.y))));
+      g.stroke();
+    }
     // jejak
     const tr = sim.state.trail;
     g.lineWidth = 2;
     g.lineCap = 'round';
-    for (let i = 1; i < tr.length; i += 1) {
-      const a = tr[i - 1];
+    for (let i = 2; i < tr.length; i += 2) {
+      const a = tr[i - 2];
       const p = tr[i];
+      if (Math.hypot(p.x - a.x, p.y - a.y) > 5) continue;
       g.strokeStyle = TRAIL_COLORS[errorTone(p.cte)];
       g.beginPath();
       g.moveTo(X(a.x), Y(a.y));
@@ -264,7 +247,7 @@ export function createScene(track) {
     g.strokeStyle = '#f8fafc';
     g.lineWidth = 2;
     g.beginPath();
-    g.moveTo(X(start.x + nx * 3), Y(start.y + ny * 3));
+    g.moveTo(X(start.x + nx * 8), Y(start.y + ny * 8));
     g.lineTo(X(start.x - nx * 8), Y(start.y - ny * 8));
     g.stroke();
     // mobil
@@ -283,7 +266,8 @@ export function createScene(track) {
    * Penunjuk sudut setir: jarum hijau toska = sudut roda sebenarnya, segitiga merah muda = perintah
    * pengendali. Selisih keduanya memperlihatkan jeda dan batas kecepatan putar setir.
    */
-  function drawGauge(g, view, sim, rect, maxDeg = 20) {
+  function drawGauge(g, view, sim, rect) {
+    const maxDeg = 20;
     const st = sim.state;
     const cx = rect.x + rect.w / 2;
     const cy = rect.y + rect.h - 16;
@@ -291,12 +275,7 @@ export function createScene(track) {
     const ang = (deg) => -Math.PI / 2 + (Math.max(-maxDeg, Math.min(maxDeg, deg)) / maxDeg) * (Math.PI * 0.42);
     g.save();
     view.screen();
-    g.fillStyle = 'rgba(11, 18, 32, 0.82)';
-    roundRectPath(g, rect.x, rect.y, rect.w, rect.h, 10);
-    g.fill();
-    g.strokeStyle = 'rgba(148, 163, 184, 0.28)';
-    g.lineWidth = 1;
-    g.stroke();
+    panel(g, rect);
     // busur skala
     g.strokeStyle = 'rgba(148, 163, 184, 0.45)';
     g.lineWidth = 3;
@@ -305,7 +284,6 @@ export function createScene(track) {
     g.stroke();
     g.lineWidth = 1.5;
     for (const d of [-20, -10, 0, 10, 20]) {
-      if (Math.abs(d) > maxDeg) continue;
       const a = ang(d);
       g.beginPath();
       g.moveTo(cx + Math.cos(a) * (r - 6), cy + Math.sin(a) * (r - 6));
@@ -354,5 +332,6 @@ export function createScene(track) {
     g.restore();
   }
 
-  return { draw, drawMinimap, drawGauge, trees, kerbs };
+  // lencana "© Kontributor OpenStreetMap", dipanggil paling akhir di render()
+  return { draw, drawMinimap, drawGauge, drawAttribution: (g, view, opts) => renderer.drawAttribution(g, view, opts) };
 }

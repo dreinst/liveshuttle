@@ -1,56 +1,71 @@
-// Dunia simulasi pelajaran Level Otomasi: jalan tol dua lajur searah (lalu lintas kiri), mobil
-// otonom, satu mobil di depan, lalu lintas arah berlawanan di balik median, zona konstruksi, dan
-// rambu batas area operasi (ODD). File ini berisi model dan perilaku tiap level SAE J3016.
-// Teks, panel, dan deteksi tugas ada di ../level-otomasi.js.
+// Dunia simulasi pelajaran Level Otomasi: perjalanan dari kampus Universitas Ma Chung ke pusat kota
+// Malang di jalan bermedian dua lajur per arah (ilustrasi, lalu lintas kiri). Ada mobil otonom,
+// satu kendaraan di depan (angkot atau mobil kota), sepeda motor yang menyalip lewat lajur kanan,
+// lalu lintas arah berlawanan di balik median, zona pekerjaan jalan, dan batas area operasi (ODD)
+// level 4 di ujung kawasan kampus Ma Chung dan Villa Puncak Tidar.
+// File ini berisi model dan perilaku tiap level SAE J3016. Teks, panel, dan deteksi tugas ada di
+// ../level-otomasi.js, peta perjalanan di ./tripmap.js.
 //
 // Penyederhanaan yang disengaja (disebut juga di teks pelajaran):
-//   - Satu mobil depan dengan kecepatan berubah-ubah, tanpa lalu lintas lain di jalur kita.
-//   - Sensor dianggap sempurna: sistem langsung tahu jarak dan kecepatan mobil depan.
+//   - Satu kendaraan depan di lajur kiri. Sepeda motor di arah kita hanya menyalip lewat lajur kanan.
+//   - Sensor dianggap sempurna: sistem langsung tahu jarak dan kecepatan kendaraan depan.
 //   - Aturan tiap level dibuat sederhana dan angka seperti hitungan mundur 10 detik adalah pilihan
 //     untuk simulasi ini, bukan nilai baku.
+//   - Jalan ilustrasi ini tidak punya persimpangan, jadi juga tidak ada lampu pengatur simpang atau
+//     tempat orang menyeberang.
 //
-// Koordinat jalan (s, d) dijelaskan di ./road.js. Mobil otonom (ego) memakai model sepeda
-// kinematik di koordinat dunia; posisinya di jalan dihitung ulang setiap langkah.
+// Koordinat jalan (s, d) dijelaskan di ./road.js. Jarak perjalanan di rute nyata: trip = s + tripOffset.
+// Mobil otonom memakai model sepeda kinematik di koordinat dunia; posisinya di jalan dihitung ulang.
 
 import { Vehicle } from '../../engine/vehicle.js';
 import { Path, boxesOverlap, pointInBox } from '../../engine/geometry.js';
 import { purePursuit } from '../../engine/control.js';
 import { followingSpeed } from '../../engine/traffic.js';
-import { clamp, smoothstep, approach, kmhToMs, angleDiff, Rng, TAU, fmt } from '../../engine/math.js';
-import { COLORS, withAlpha } from '../../engine/theme.js';
-import { drawCar, drawBus, drawCone, drawPath, drawSensorCone, drawRing, drawBracketBox, drawLine, roundRectPath } from '../../engine/draw.js';
+import { clamp, smoothstep, approach, kmhToMs, angleDiff, Rng, TAU, fmt, toWorld } from '../../engine/math.js';
+import { COLORS, SIZES, withAlpha } from '../../engine/theme.js';
+import { drawCar, drawVehicle, drawCone, drawPath, drawSensorCone, drawRing, drawBracketBox, drawLine, drawLidarRange, drawSpeedSign, roundRectPath } from '../../engine/draw.js';
 import { createRoad, PERIOD, LEFT_LANE, RIGHT_LANE, SHOULDER, EDGE_LEFT, EDGE_RIGHT, SHOULDER_OUT, MEDIAN_IN, OPP_LANES } from './road.js';
+import { TRIP } from './data/trip.js';
 
-export const V_SET = kmhToMs(60); // kecepatan yang dipilih untuk sistem (ACC dan level 2 sampai 5)
-export const TIME_GAP = 1.5; // jarak waktu ACC (detik)
-export const MIN_GAP = 4; // jarak saat berhenti (m)
-export const ACC_RANGE = 90; // jangkauan radar ACC di simulasi (m)
-export const TOR_TIME = 10; // hitungan mundur permintaan ambil alih level 3 (detik)
+export const V_CITY = kmhToMs(40); // batas kecepatan jalan kota di simulasi ini
+export const V_KAWASAN = kmhToMs(30); // batas kecepatan di kawasan kampus dan perumahan
+export const V_SET = V_CITY; // kecepatan tertinggi yang dipilih untuk sistem (ACC dan level 2 sampai 5)
+const TIME_GAP = 1.5; // jarak waktu ACC (detik)
+const MIN_GAP = 4; // jarak saat berhenti (m)
+const ACC_RANGE = 90; // jangkauan radar ACC di simulasi (m)
+const TOR_TIME = 10; // hitungan mundur permintaan ambil alih level 3 (detik)
 export const MANUAL_DIST = 150; // tugas level 0 (m)
+export const ODD_EXIT = TRIP.oddExit; // jarak di rute nyata tempat rute keluar dari area operasi level 4 (m)
 
 const L3_MRM_DECEL = 2.2; // perlambatan berhenti darurat di lajur (m/s^2)
 const L4_MRM_DECEL = 1.3; // perlambatan saat menepi (m/s^2)
+const L4_MRM_LANE = 30; // panjang perpindahan ke tepi kiri saat menepi (m)
+const ZONE_SPEED = kmhToMs(25); // kecepatan sistem saat melewati zona pekerjaan jalan
 const ATT_FIRST = 3.5; // detik sampai pesan pertama "Pegang kemudi" setelah level 2 aktif
 const ATT_EVERY = 12; // selang pesan berikutnya
 const ATT_PROMPT = 4; // lama pesan sebelum peringatan keras
 const ATT_WARN = 4; // lama peringatan keras sebelum kemudi diserahkan
 const HUMAN_FCW_TTC = 2.6; // peringatan tabrakan depan (detik)
+const BIKE_D = RIGHT_LANE - 0.45; // posisi lateral sepeda motor yang menyalip (sedikit ke kanan lajur kanan)
+const BIKE_HL = SIZES.motor.length / 2;
+const BIKE_HW = SIZES.motor.width / 2;
 
 /** Jarak (m) sebelum kejadian di luar ODD saat level 3 harus mulai meminta ambil alih. */
-export function torDistance(v) {
-  return v * TOR_TIME + (v * v) / (2 * L3_MRM_DECEL) + 20;
-}
+const torDistance = (v) => v * TOR_TIME + (v * v) / (2 * L3_MRM_DECEL) + 20;
+/** Jarak (m) sebelum titik henti saat level 4 mulai menepi. */
+const l4MrmDistance = (v) => Math.max((v * v) / (2 * L4_MRM_DECEL) + 8, L4_MRM_LANE + 14);
 
 export function createScene() {
   const road = createRoad();
   const rngLead = new Rng(101);
   const rngTraffic = new Rng(202);
+  const rngBike = new Rng(303);
 
   const ego = new Vehicle({
     id: 'ego',
     ego: true,
     label: 'Mobil otonom',
-    maxSpeed: kmhToMs(90),
+    maxSpeed: kmhToMs(70),
     maxAccel: 2.5,
     maxBrake: 8,
     maxSteer: 0.5,
@@ -58,60 +73,31 @@ export function createScene() {
   });
   const EGO_HL = ego.length / 2;
 
-  const lead = {
-    id: 'mobil-depan',
-    kind: 'car',
-    active: false,
-    s: 0,
-    d: LEFT_LANE,
-    v: 0,
-    vSched: kmhToMs(48),
-    timer: 0,
-    waiting: false,
-    length: 4.5,
-    width: 1.8,
-    color: '#7d8fb0',
-    braking: false,
-    x: 0,
-    y: 0,
-    heading: 0,
-  };
+  // Keadaan pelaku dan simulasi diisi oleh applyPreset() di akhir createScene().
+  // kendaraan di depan (lajur kiri): angkot atau mobil kota, bergantung pada langkah
+  const lead = { id: 'kendaraan-depan' };
 
+  // sepeda motor searah yang menyalip lewat lajur kanan
+  const bikes = [
+    { helmet: COLORS.helmets[2], jacket: '#1e3a8a', passenger: false, color: '#475569' },
+    { helmet: COLORS.helmets[0], jacket: '#7c2d12', passenger: true, color: '#1f2937', passengerHelmet: COLORS.helmets[4], passengerJacket: '#9d174d' },
+  ].map((look, i) => ({ ...look, id: `motor-searah-${i}`, kind: 'motor', length: SIZES.motor.length, width: SIZES.motor.width }));
+
+  // lalu lintas arah berlawanan: lajur dekat median, lajur normal, dan sepeda motor di tepi kiri mereka
+  const OPP_BIKE = -15.4;
   const opp = [
-    { d: OPP_LANES[1], kind: 'car', length: 4.5, width: 1.8, color: COLORS.vehicles[0], base: 15 },
-    { d: OPP_LANES[1], kind: 'bus', length: 12, width: 2.5, color: COLORS.bus, base: 12.5 },
-    { d: OPP_LANES[0], kind: 'car', length: 4.5, width: 1.8, color: COLORS.vehicles[4], base: 21 },
-    { d: OPP_LANES[1], kind: 'car', length: 4.6, width: 1.8, color: COLORS.vehicles[3], base: 16 },
-    { d: OPP_LANES[0], kind: 'car', length: 4.5, width: 1.8, color: COLORS.vehicles[5], base: 22 },
-  ].map((c, i) => ({ ...c, id: `lawan-${i}`, s: 0, v: c.base, vNow: c.base, x: 0, y: 0, heading: Math.PI }));
+    { d: OPP_LANES[1], kind: 'angkot', code: 'AL', base: 9.5 },
+    { d: OPP_LANES[0], kind: 'city', color: COLORS.vehicles[0], base: 12 },
+    { d: OPP_BIKE, kind: 'motor', helmet: COLORS.helmets[3], jacket: '#334155', base: 10.5 },
+    { d: OPP_LANES[1], kind: 'mpv', color: '#94a3b8', base: 10.5 },
+    { d: OPP_BIKE, kind: 'motor', helmet: COLORS.helmets[1], jacket: '#b45309', passenger: true, passengerHelmet: COLORS.helmets[5], base: 9.8 },
+    { d: OPP_LANES[0], kind: 'car', color: COLORS.vehicles[4], base: 12.5 },
+    { d: OPP_LANES[1], kind: 'minibus', color: '#d9d2c3', base: 9 },
+    { d: OPP_BIKE, kind: 'motor', helmet: COLORS.helmets[4], jacket: '#0f766e', base: 10.2 },
+    { d: OPP_LANES[1], kind: 'angkot', code: 'GL', base: 9.2 },
+  ].map((c, i) => ({ ...c, id: `lawan-${i}`, length: SIZES[c.kind].length, width: SIZES[c.kind].width }));
 
-  const st = {
-    t: 0,
-    level: 0,
-    engaged: false,
-    egoS: PERIOD,
-    egoD: LEFT_LANE,
-    headErr: 0,
-    input: { left: false, right: false, gas: false, brake: false },
-    signal: { left: false, right: false, hazard: false },
-    acc: { mode: 'off', gap: Infinity, want: 0 },
-    attention: { stage: 'ok', timer: 0, next: ATT_FIRST },
-    ads: { phase: 'drive', left: 0, reason: null, eventS: null, stopS: null },
-    plan: { d0: LEFT_LANE, d1: LEFT_LANE, s0: 0, s1: 1 },
-    laneOverride: false,
-    aeb: { active: false, hold: 0, target: null },
-    fcw: false,
-    ldw: null,
-    obs: null,
-    flash: null,
-    events: [],
-    counters: { manualDist: 0, accFollow: 0, mrcHold: 0 },
-    zone: null,
-    boundary: null,
-    keepZone: false,
-    keepBoundary: false,
-    crashes: 0,
-  };
+  const st = { t: 0, signal: { left: false, right: false, hazard: false }, events: [], obs: null };
 
   // ---------- bantuan ----------
 
@@ -120,7 +106,15 @@ export function createScene() {
   }
   const flashKey = () => (st.flash && st.t < st.flash.until ? st.flash.key : null);
   const humanDrives = () => st.level <= 2 || !st.engaged;
-  const nearestLane = (d) => (Math.abs(d - LEFT_LANE) <= Math.abs(d - RIGHT_LANE) ? LEFT_LANE : RIGHT_LANE);
+
+  /** Jarak perjalanan di rute nyata (m) untuk posisi jalan s. */
+  const tripAt = (s) => s + st.tripOffset;
+  /** Apakah posisi s masih di dalam kawasan (area operasi level 4). */
+  const inKawasan = (s) => tripAt(s) < ODD_EXIT;
+  /** Batas kecepatan (m/s) di posisi jalan s: kawasan kampus dan perumahan, atau jalan kota. */
+  const limitAt = (s) => (inKawasan(s) ? V_KAWASAN : V_CITY);
+  /** Kecepatan pilihan sistem saat ini: mengikuti batas di posisi bagian depan mobil. */
+  const vSetNow = () => Math.min(V_SET, limitAt(st.egoS + EGO_HL));
 
   function planD(s) {
     const p = st.plan;
@@ -135,14 +129,14 @@ export function createScene() {
 
   /** Arahkan rencana ke tengah lajur terdekat (dipakai saat sistem mulai menyetir). */
   function snapPlan() {
-    const target = st.egoD > EDGE_LEFT ? LEFT_LANE : nearestLane(st.egoD);
+    const target = st.egoD >= 0 ? LEFT_LANE : RIGHT_LANE;
     const dd = Math.abs(target - st.egoD);
     st.plan = { d0: st.egoD, d1: target, s0: st.egoS, s1: st.egoS + (dd < 0.3 ? 1 : Math.max(25, ego.speed * 2.2)) };
   }
 
-  const laneChangeLen = (v) => Math.max(40, v * 3);
+  const laneChangeLen = (v) => Math.max(35, v * 3);
 
-  // ---------- zona konstruksi dan batas ODD ----------
+  // ---------- zona pekerjaan jalan dan batas ODD ----------
 
   /** Posisi lateral garis kerucut: lajur kiri ditutup di antara s0 dan s1. */
   function coneLine(z, s) {
@@ -166,27 +160,33 @@ export function createScene() {
     return z;
   }
 
-  function oddEventAhead() {
+  /**
+   * Kejadian di luar ODD di depan mobil. kinds: 'zona' (pekerjaan jalan), 'batas' (ujung kawasan,
+   * batas ODD level 4). Mengembalikan { kind, s, dist } yang terdekat atau null.
+   */
+  function oddEventAhead(kinds = ['zona', 'batas']) {
     const front = st.egoS + EGO_HL;
     let ev = null;
     const z = st.zone;
-    if (z && front < z.s1 + 2) ev = { kind: 'zona', s: z.s0, dist: Math.max(0, z.s0 - front) };
+    if (kinds.includes('zona') && z && front < z.s1 + 2) ev = { kind: 'zona', s: z.s0, dist: Math.max(0, z.s0 - front) };
     const b = st.boundary;
-    if (b && front < b.s + 2) {
+    if (kinds.includes('batas') && b && front < b.s + 2) {
       const dist = Math.max(0, b.s - front);
       if (!ev || dist < ev.dist) ev = { kind: 'batas', s: b.s, dist };
     }
     return ev;
   }
 
-  const outsideOdd = () => !!st.boundary && st.egoS > st.boundary.s - 1;
+  /** Kejadian yang relevan untuk level yang dipilih (level 3: zona saja, level 4: zona dan batas). */
+  const eventForLevel = (L = st.level) => oddEventAhead(L === 3 ? ['zona'] : undefined);
 
   // ---------- level dan keterlibatan sistem ----------
 
   function freshState() {
-    st.ads = { phase: 'drive', left: 0, reason: null, eventS: null, stopS: null };
+    st.ads = { phase: 'drive', left: 0, eventS: null, stopS: null };
     st.attention = { stage: 'ok', timer: 0, next: ATT_FIRST };
     st.laneOverride = false;
+    st.wantRight = false;
     st.counters.accFollow = 0;
     st.counters.mrcHold = 0;
   }
@@ -196,25 +196,13 @@ export function createScene() {
     freshState();
     snapPlan();
     const n = st.level;
-    if (n === 0) {
-      st.engaged = false;
-      return false;
-    }
-    if ((n === 3 || n === 4) && outsideOdd()) {
-      st.engaged = false;
-      flash('odd-outside', 4.5);
-      return false;
-    }
-    if (n === 3) {
-      const ev = oddEventAhead();
-      if (ev && ev.dist <= torDistance(Math.max(ego.speed, V_SET))) {
-        st.engaged = false;
-        flash('l3-refuse', 4.5);
-        return false;
-      }
-    }
-    st.engaged = true;
-    return true;
+    const ev = n === 3 && eventForLevel(3);
+    // level 4 hanya aktif di dalam kawasan, level 3 menolak bila kejadian di luar ODD sudah terlalu dekat
+    const refuse =
+      n === 4 && tripAt(st.egoS) > ODD_EXIT - 1 ? 'odd-outside' : ev && ev.dist <= torDistance(Math.max(ego.speed, vSetNow())) ? 'l3-refuse' : null;
+    if (refuse) flash(refuse, 4.5);
+    st.engaged = n > 0 && !refuse;
+    return st.engaged;
   }
 
   function setLevel(n) {
@@ -230,10 +218,9 @@ export function createScene() {
     st.events.push(reason);
   }
 
-  /** Tombol "Pegang kemudi". Mengembalikan true bila menjawab pesan level 2 yang sedang tampil. */
+  /** Tombol "Pegang kemudi" (hanya berlaku saat level 2 aktif). */
   function pressHold() {
-    if (st.level !== 2 || !st.engaged) return false;
-    return answerHands();
+    if (st.level === 2 && st.engaged) answerHands();
   }
 
   function answerHands() {
@@ -246,19 +233,17 @@ export function createScene() {
       flash('l2-thanks', 2.5);
       st.events.push('l2-answered');
     }
-    return asked;
   }
 
-  /** Tombol "Ambil alih". Mengembalikan fase level 3 saat ditekan, atau null bila tidak berlaku. */
+  /** Tombol "Ambil alih" (hanya berlaku saat level 3 aktif). */
   function pressTakeover() {
-    if (st.level !== 3 || !st.engaged) return null;
+    if (st.level !== 3 || !st.engaged) return;
     const phase = st.ads.phase;
     st.engaged = false;
     freshState();
     snapPlan();
     flash(phase === 'drive' ? 'l3-taken-free' : 'l3-taken', 5);
     st.events.push(phase === 'tor' ? 'takeover-tor' : 'takeover');
-    return phase;
   }
 
   function setInput(key, on) {
@@ -269,14 +254,8 @@ export function createScene() {
 
   /** Tombol mana yang sedang dipegang pengemudi (true = boleh dipakai). */
   function controlsFor() {
-    const manual = st.level === 0 || !st.engaged;
-    return {
-      steer: manual || st.level <= 2,
-      gas: manual || st.level <= 2,
-      brake: manual || st.level <= 2,
-      hold: st.engaged && st.level === 2,
-      takeover: st.engaged && st.level === 3,
-    };
+    const human = humanDrives();
+    return { steer: human, gas: human, brake: human, hold: st.engaged && st.level === 2, takeover: st.engaged && st.level === 3 };
   }
 
   // ---------- pengendali ----------
@@ -293,7 +272,7 @@ export function createScene() {
     const v = ego.speed;
     let accel = -(0.15 + 0.0006 * v * v); // hambatan gulir dan udara saat gas dilepas
     let brake = 0;
-    if (st.input.gas && !st.input.brake) accel = 2.4 * (1 - v / 26);
+    if (st.input.gas && !st.input.brake) accel = 2.4 * (1 - v / 18);
     if (st.input.brake) {
       brake = 6;
       accel = 0;
@@ -301,7 +280,7 @@ export function createScene() {
     return { accel, brake, steer: manualSteer() };
   }
 
-  /** ACC: jaga kecepatan pilihan, atau jarak waktu di belakang mobil depan bila ada. */
+  /** ACC: jaga kecepatan pilihan, atau jarak waktu di belakang kendaraan depan bila ada. */
   function accAccel(obs, vSet) {
     const v = ego.speed;
     let a = clamp(0.7 * (vSet - v), -2.5, 1.4);
@@ -340,8 +319,7 @@ export function createScene() {
     const pts = [];
     for (let k = -1; k <= 14; k++) {
       const s = st.egoS + k * 4;
-      const w = road.toWorld(s, planD(s));
-      pts.push({ x: w.x, y: w.y });
+      pts.push(road.toWorld(s, planD(s)));
     }
     return purePursuit(ego, new Path(pts), { lookahead: 5, gain: 0.55 }).steer;
   }
@@ -362,7 +340,7 @@ export function createScene() {
 
   function controlL1(obs) {
     const m = manualCmd();
-    let a = accAccel(obs, V_SET);
+    let a = accAccel(obs, vSetNow());
     if (st.input.gas) a = Math.max(a, m.accel);
     return { accel: a, brake: 0, steer: m.steer };
   }
@@ -372,12 +350,12 @@ export function createScene() {
     if (!st.engaged) return manualCmd();
     const z = st.zone;
     if (z && z.s0 - (st.egoS + EGO_HL) < 100 && st.egoS < z.s1) {
-      // level 2 tidak dirancang untuk zona konstruksi: kemudi diserahkan ke pengemudi
+      // level 2 tidak dirancang untuk zona pekerjaan jalan: kemudi diserahkan ke pengemudi
       disengage('l2-zone');
       return manualCmd();
     }
     const m = manualCmd();
-    let a = accAccel(obs, V_SET);
+    let a = accAccel(obs, vSetNow());
     if (st.attention.stage === 'warn') a = Math.min(a, ego.speed > 8 ? -1.6 : 0);
     if (st.input.gas) a = Math.max(a, m.accel);
     let steer;
@@ -396,15 +374,30 @@ export function createScene() {
     return { accel: a, brake: 0, steer };
   }
 
+  /**
+   * Perintah sistem level 3 sampai 5. Saat manuver risiko minimal (fase mrm) mobil berhenti di
+   * ads.stopS, lalu tetap berhenti (fase mrc). Level 3 menyalakan hazard sejak mrm, level 4 saat mrc.
+   */
+  function systemCmd(obs, vSet, decel, tag) {
+    const ads = st.ads;
+    const cmd = { accel: Math.min(accAccel(obs, vSet), staticGuard(obs)), brake: 0, steer: systemSteer() };
+    if (ads.phase !== 'mrm' && ads.phase !== 'mrc') return cmd;
+    cmd.accel = Math.min(cmd.accel, stopCap(ads.stopS, decel));
+    if (ads.phase === 'mrm' && ego.speed < 0.05 && ads.stopS - (st.egoS + EGO_HL) < 3) {
+      ads.phase = 'mrc';
+      st.events.push(`${tag}-mrc`);
+    }
+    if (tag === 'l3' || ads.phase === 'mrc') st.signal.hazard = true;
+    return ads.phase === 'mrc' ? { accel: 0, brake: 8, steer: 0 } : cmd;
+  }
+
   function controlL3(dt, obs) {
-    const v = ego.speed;
     const ads = st.ads;
     if (ads.phase === 'drive') {
-      const ev = oddEventAhead();
-      if (ev && ev.dist <= torDistance(v)) {
+      const ev = eventForLevel(3);
+      if (ev && ev.dist <= torDistance(ego.speed)) {
         ads.phase = 'tor';
         ads.left = TOR_TIME;
-        ads.reason = ev.kind;
         ads.eventS = ev.s;
         st.events.push('tor');
       }
@@ -418,68 +411,57 @@ export function createScene() {
         st.events.push('l3-mrm');
       }
     }
-    let a = Math.min(accAccel(obs, V_SET), staticGuard(obs));
-    let brake = 0;
-    let steer = systemSteer();
-    if (ads.phase === 'mrm' || ads.phase === 'mrc') {
-      st.signal.hazard = true;
-      a = Math.min(a, stopCap(ads.stopS, L3_MRM_DECEL));
-      const left = ads.stopS - (st.egoS + EGO_HL);
-      if (ads.phase === 'mrm' && ego.speed < 0.05 && left < 3) {
-        ads.phase = 'mrc';
-        st.events.push('l3-mrc');
+    return systemCmd(obs, vSetNow(), L3_MRM_DECEL, 'l3');
+  }
+
+  /**
+   * Lajur kanan cukup kosong untuk pindah lajur: tidak ada sepeda motor di samping, dan motor di
+   * belakang masih sempat mengalah (mengerem pelan) sebelum mencapai buritan mobil.
+   */
+  function rightLaneClear() {
+    const rear = st.egoS - EGO_HL;
+    const front = st.egoS + EGO_HL;
+    for (const m of bikes) {
+      if (!m.active) continue;
+      if (m.s - BIKE_HL > front + 6) continue; // sudah jauh di depan
+      if (m.s + BIKE_HL < rear - 1) {
+        const closing = Math.max(0, m.v - ego.speed);
+        const gap = rear - (m.s + BIKE_HL);
+        if ((closing * closing) / (2 * 4) < gap - 2) continue;
       }
-      if (ads.phase === 'mrc') {
-        a = 0;
-        brake = 8;
-        steer = 0;
-      }
+      return false;
     }
-    return { accel: a, brake, steer };
+    return true;
   }
 
   function controlL45(obs) {
     const v = ego.speed;
     const ads = st.ads;
     const z = st.zone;
-    let target = LEFT_LANE;
-    let vSet = V_SET;
-    // zona konstruksi: pindah ke lajur kanan lebih awal dan pelankan
-    if (z && st.egoS > z.s0 - 110 && st.egoS < z.s1 + 6) target = RIGHT_LANE;
-    if (z && st.egoS > z.s0 - 60 && st.egoS < z.s1 + 4) vSet = kmhToMs(40);
+    // zona pekerjaan jalan: pindah ke lajur kanan lebih awal (bila lajurnya kosong) dan pelankan
+    let target = z && st.egoS > z.s0 - 110 && st.egoS < z.s1 + 6 ? RIGHT_LANE : LEFT_LANE;
+    let vSet = vSetNow();
+    if (z && st.egoS > z.s0 - 60 && st.egoS < z.s1 + 4) vSet = Math.min(vSet, ZONE_SPEED);
     if (st.level === 4) {
       const b = st.boundary;
       if (ads.phase === 'drive' && b && st.egoS < b.s) {
         const stopS = b.s - 12;
         const d = stopS - (st.egoS + EGO_HL);
-        if (d <= (v * v) / (2 * L4_MRM_DECEL) + 8) {
+        if (d <= l4MrmDistance(v)) {
           ads.phase = 'mrm';
           ads.stopS = stopS;
-          ads.reason = 'batas';
           st.events.push('l4-mrm');
         }
       }
       if (ads.phase === 'mrm' || ads.phase === 'mrc') target = SHOULDER;
     }
-    setLaneTarget(target, laneChangeLen(v));
-    let a = Math.min(accAccel(obs, vSet), staticGuard(obs));
-    let brake = 0;
-    let steer = systemSteer();
-    if (ads.phase === 'mrm' || ads.phase === 'mrc') {
-      a = Math.min(a, stopCap(ads.stopS, L4_MRM_DECEL));
-      const left = ads.stopS - (st.egoS + EGO_HL);
-      if (ads.phase === 'mrm' && ego.speed < 0.05 && left < 3) {
-        ads.phase = 'mrc';
-        st.events.push('l4-mrc');
-      }
-      if (ads.phase === 'mrc') {
-        st.signal.hazard = true;
-        a = 0;
-        brake = 8;
-        steer = 0;
-      }
-    }
-    return { accel: a, brake, steer };
+    st.wantRight = false;
+    if (target === RIGHT_LANE && st.plan.d1 !== RIGHT_LANE && st.egoD > 0) {
+      // nyalakan sein dulu; pindah setelah lajur kanan kosong
+      st.wantRight = true;
+      setLaneTarget(rightLaneClear() ? RIGHT_LANE : LEFT_LANE, laneChangeLen(v));
+    } else setLaneTarget(target, target === SHOULDER ? Math.min(laneChangeLen(v), L4_MRM_LANE) : laneChangeLen(v));
+    return systemCmd(obs, vSet, L4_MRM_DECEL, 'l4');
   }
 
   function planSignals() {
@@ -490,6 +472,7 @@ export function createScene() {
       if (p.d1 > p.d0) st.signal.left = true;
       else st.signal.right = true;
     }
+    if (st.wantRight) st.signal.right = true;
   }
 
   // ---------- rintangan, peringatan, dan rem darurat ----------
@@ -505,6 +488,7 @@ export function createScene() {
       if (!best || gap < best.gap) best = { gap, v, kind, s, d, hl, ref: o };
     };
     if (lead.active) consider(lead, lead.s, lead.d, lead.length / 2, lead.width / 2, lead.v, 'car');
+    for (const m of bikes) if (m.active) consider(m, m.s, m.d, BIKE_HL, BIKE_HW, m.v, 'car');
     if (st.zone) {
       for (const o of st.zone.obstacles) {
         if (o.hit || o.s < st.egoS - 5 || o.s > st.egoS + 160) continue;
@@ -547,21 +531,33 @@ export function createScene() {
 
   // ---------- pelaku lain ----------
 
-  function syncPose(o) {
+  /** Pose dunia dari (s, d). back = true untuk kendaraan yang melaju ke arah s mengecil. */
+  function syncPose(o, back = false) {
     const w = road.toWorld(o.s, o.d);
     o.x = w.x;
     o.y = w.y;
-    o.heading = o.v < 0 ? w.heading + Math.PI : w.heading;
+    o.heading = back ? w.heading + Math.PI : w.heading;
+  }
+
+  function setLeadKind(kind, code) {
+    lead.kind = kind;
+    lead.code = kind === 'angkot' ? code || 'ADL' : '';
+    const size = SIZES[kind] || SIZES.car;
+    lead.length = size.length;
+    lead.width = size.width;
+    lead.color = kind === 'angkot' ? undefined : '#7d8fb0';
   }
 
   function updateLead(dt) {
     if (!lead.active) return;
     lead.timer -= dt;
     if (lead.timer <= 0) {
-      lead.vSched = rngLead.range(kmhToMs(38), kmhToMs(56));
-      lead.timer = rngLead.range(6, 11);
+      // angkot di kota berjalan lebih pelan dan lebih sering berubah kecepatan
+      const [lo, hi] = lead.kind === 'angkot' ? [kmhToMs(18), kmhToMs(36)] : [kmhToMs(26), kmhToMs(40)];
+      lead.vSched = rngLead.range(lo, hi);
+      lead.timer = rngLead.range(5, 10);
     }
-    let vCmd = lead.vSched;
+    let vCmd = Math.min(lead.vSched, limitAt(lead.s));
     if (lead.waiting) {
       vCmd = 0;
       if (ego.speed > 0.4) lead.waiting = false;
@@ -578,13 +574,93 @@ export function createScene() {
     lead.v = approach(lead.v, vCmd, (vCmd > lead.v ? 1.3 : 3) * dt);
     lead.braking = lead.v < before - 0.002 || lead.v < 0.05;
     lead.s += lead.v * dt;
-    // tertinggal jauh di belakang: muncul lagi sebagai mobil lain di depan
+    // tertinggal jauh di belakang: muncul lagi sebagai kendaraan lain di depan
     if (lead.s < st.egoS - 45) {
       lead.s = st.egoS + 130;
-      lead.v = Math.min(Math.max(ego.speed, 8), kmhToMs(45));
+      lead.v = Math.min(Math.max(ego.speed, 8), kmhToMs(34));
       lead.waiting = false;
     }
     syncPose(lead);
+  }
+
+  // --- sepeda motor searah ---
+
+  /** Lebar setengah mobil otonom dalam arah d, termasuk sudut karena arah mobil tidak sejajar jalan. */
+  const egoHalfWidth = () => ego.width / 2 + Math.abs(Math.sin(st.headErr)) * EGO_HL;
+
+  function bikeCruise(m) {
+    // sedikit lebih cepat dari batas kecepatan, seperti banyak sepeda motor di jalan sungguhan
+    return limitAt(m.s) + m.extra;
+  }
+
+  function spawnBike(m) {
+    m.wait = rngBike.range(2.5, 8);
+    // hanya bila mobil otonom lebih lambat dari sepeda motor (kalau tidak, motor tidak akan menyusul)
+    const extra = rngBike.range(kmhToMs(6), kmhToMs(12));
+    if (ego.speed > limitAt(st.egoS) + extra - 1) return;
+    if (st.egoD - egoHalfWidth() < 0.4) return; // mobil sedang di lajur kanan
+    const s = st.egoS - rngBike.range(34, 50);
+    if (bikes.some((o) => o !== m && o.active && Math.abs(o.s - s) < 14)) return;
+    const z = st.zone;
+    if (z && s > z.s0 - 170 && s < z.s1 + 20) return;
+    m.active = true;
+    m.extra = extra;
+    m.s = s;
+    m.d = BIKE_D;
+    m.v = bikeCruise(m);
+    m.braking = false;
+    syncPose(m);
+  }
+
+  function updateBikes(dt) {
+    const egoRear = st.egoS - EGO_HL;
+    const egoFront = st.egoS + EGO_HL;
+    const hw = egoHalfWidth();
+    const egoRightSide = st.egoD - hw; // sisi kanan mobil (d mengecil ke kanan)
+    const z = st.zone;
+    // dekat zona pekerjaan jalan mobil kemungkinan pindah ke lajur kanan (kecuali sedang berhenti)
+    const egoNearZone = z && st.egoS > z.s0 - 160 && st.egoS < z.s1 + 20 && ego.speed > 1;
+    // motor tidak menyusul ke samping mobil bila mobil mungkin pindah ke lajur kanan
+    const egoMayMoveRight = egoRightSide < 0.35 || st.signal.right || st.wantRight || egoNearZone;
+    for (const m of bikes) {
+      if (!m.active) {
+        m.wait -= dt;
+        if (m.wait <= 0) spawnBike(m);
+        continue;
+      }
+      const cruise = bikeCruise(m);
+      let vWant = cruise;
+      let dWant = BIKE_D;
+      const lateralConflict = m.d + BIKE_HW + 0.5 > egoRightSide;
+      const behind = m.s + BIKE_HL < egoRear - 0.5;
+      const alongside = !behind && m.s - BIKE_HL < egoFront + 0.5;
+      if (behind && (lateralConflict || egoMayMoveRight)) {
+        // tetap di belakang mobil dengan jarak aman
+        const gap = egoRear - (m.s + BIKE_HL);
+        vWant = Math.min(vWant, followingSpeed(Math.max(0, gap), Math.max(0, ego.speed), { cruise, minGap: 3, timeGap: 0.9, decel: 5, strict: true }));
+      } else if (alongside && (lateralConflict || egoRightSide < BIKE_D + BIKE_HW + 1.2)) {
+        // mobil masuk ke jalurnya saat motor di samping: menepi ke kanan lalu menjauh ke depan atau ke belakang
+        dWant = EDGE_RIGHT - 0.2;
+        const ahead = m.s - st.egoS + (m.v - ego.speed) * 0.8 > -1;
+        vWant = ahead ? Math.max(cruise, ego.speed + 3) + 1 : Math.max(0, ego.speed - 5);
+      }
+      // motor lain di depannya di jalur yang sama
+      for (const o of bikes) {
+        if (o === m || !o.active || o.s <= m.s) continue;
+        const gap = o.s - BIKE_HL - (m.s + BIKE_HL);
+        if (gap < 30) vWant = Math.min(vWant, followingSpeed(Math.max(0, gap), o.v, { cruise, minGap: 3, timeGap: 0.8, decel: 5, strict: true }));
+      }
+      const before = m.v;
+      m.v = approach(m.v, Math.max(0, vWant), (vWant > m.v ? 2.2 : 6) * dt);
+      m.braking = m.v < before - 0.004;
+      m.s += m.v * dt;
+      m.d = approach(m.d, dWant, (dWant < m.d ? 2 : 0.8) * dt);
+      syncPose(m);
+      if (m.s > st.egoS + 72 || m.s < st.egoS - 95) {
+        m.active = false;
+        m.wait = rngBike.range(3, 9);
+      }
+    }
   }
 
   function respawnOpp(c, base) {
@@ -600,10 +676,10 @@ export function createScene() {
 
   function updateOpp(dt) {
     for (const c of opp) {
-      // mobil di depannya (arah barat = s mengecil) di lajur yang sama
+      // kendaraan di depannya (arah barat = s mengecil) di jalur yang sama
       let ahead = null;
       for (const o of opp) if (o !== c && o.d === c.d && o.s < c.s && (!ahead || o.s > ahead.s)) ahead = o;
-      let v = c.v;
+      let v = c.v * (inKawasan(c.s) ? 0.8 : 1);
       if (ahead) {
         const gap = c.s - c.length / 2 - (ahead.s + ahead.length / 2);
         if (gap < 28) v = Math.min(v, ahead.vNow * (gap < 12 ? 0.8 : 1));
@@ -615,10 +691,7 @@ export function createScene() {
         c.vNow = c.v;
         respawnOpp(c, st.egoS + 140 + rngTraffic.range(0, 140));
       }
-      const w = road.toWorld(c.s, c.d);
-      c.x = w.x;
-      c.y = w.y;
-      c.heading = w.heading + Math.PI;
+      syncPose(c, true);
     }
   }
 
@@ -633,13 +706,29 @@ export function createScene() {
     st.headErr = 0;
   }
 
+  function crash(kind, key) {
+    st.crashes++;
+    st.crashLog[kind]++;
+    flash(key, 4);
+    st.events.push('crash');
+  }
+
   function checkCollisions() {
     if (lead.active && boxesOverlap(ego, lead)) {
-      st.crashes++;
+      crash('lead', 'crash');
       placeEgo(st.egoS - 3, st.egoD, 0);
-      flash('crash', 4);
-      st.events.push('crash');
       return;
+    }
+    for (const m of bikes) {
+      if (!m.active || Math.abs(m.s - st.egoS) > 6) continue;
+      if (boxesOverlap(ego, m)) {
+        // hanya mungkin saat pelajar sendiri membanting setir ke samping sepeda motor
+        crash('motor', 'crash-motor');
+        m.active = false;
+        m.wait = 6;
+        ego.speed = Math.min(ego.speed, 1);
+        return;
+      }
     }
     if (st.zone) {
       for (const o of st.zone.obstacles) {
@@ -651,11 +740,9 @@ export function createScene() {
             : boxesOverlap(ego, { x: w.x, y: w.y, heading: w.heading, length: o.hl * 2, width: o.hw * 2 });
         if (hit) {
           if (o.kind === 'cone') o.hit = true;
-          st.crashes++;
+          crash('zone', 'crash-zone');
           ego.speed = 0;
           if (o.kind !== 'cone') placeEgo(st.egoS - 2, st.egoD, 0);
-          flash('crash-zone', 4);
-          st.events.push('crash');
           return;
         }
       }
@@ -664,7 +751,18 @@ export function createScene() {
 
   function checkOffroad() {
     if (st.egoD > SHOULDER_OUT - 0.3 || st.egoD < MEDIAN_IN - 0.2 || Math.abs(st.headErr) > 1.1) {
-      placeEgo(st.egoS, st.egoD > 0 ? LEFT_LANE : RIGHT_LANE, 0);
+      const d = st.egoD > 0 ? LEFT_LANE : RIGHT_LANE;
+      let s = st.egoS;
+      // jangan menaruh mobil di atas kendaraan lain di lajur tujuan
+      if (lead.active && d === LEFT_LANE && Math.abs(lead.s - s) < lead.length / 2 + EGO_HL + 2) s = lead.s - lead.length / 2 - EGO_HL - 3;
+      placeEgo(s, d, 0);
+      for (const m of bikes) {
+        if (m.active && d === RIGHT_LANE && Math.abs(m.s - s) < BIKE_HL + EGO_HL + 2) {
+          m.s = s - EGO_HL - BIKE_HL - 3;
+          m.v = 0;
+          syncPose(m);
+        }
+      }
       snapPlan();
       flash('offroad', 4);
       st.events.push('offroad');
@@ -679,8 +777,17 @@ export function createScene() {
     ego.x -= S.x;
     ego.y -= S.y;
     st.egoS -= PERIOD;
+    st.tripOffset += PERIOD;
     lead.s -= PERIOD;
-    for (const c of opp) c.s -= PERIOD;
+    if (lead.active) syncPose(lead);
+    for (const m of bikes) {
+      m.s -= PERIOD;
+      if (m.active) syncPose(m);
+    }
+    for (const c of opp) {
+      c.s -= PERIOD;
+      syncPose(c, true);
+    }
     if (st.zone) {
       const z = st.zone;
       z.s0 -= PERIOD;
@@ -699,7 +806,6 @@ export function createScene() {
     if (st.zone && st.egoS > st.zone.s1 + 150) st.zone = null;
     if (st.boundary && st.egoS > st.boundary.s + 250) st.boundary = null;
     if (st.keepZone && !st.zone) st.zone = makeZone(st.egoS + 400);
-    if (st.keepBoundary && !st.boundary) st.boundary = { s: st.egoS + 400 };
   }
 
   // ---------- langkah simulasi ----------
@@ -708,6 +814,7 @@ export function createScene() {
     st.t += dt;
     updateLead(dt);
     updateOpp(dt);
+    updateBikes(dt);
 
     const obs = frontObstacle();
     st.obs = obs;
@@ -722,7 +829,6 @@ export function createScene() {
     else if (st.level === 2) cmd = controlL2(dt, obs);
     else if (st.level === 3) cmd = controlL3(dt, obs);
     else cmd = controlL45(obs);
-    if (!st.engaged) st.acc.mode = 'off';
     planSignals();
 
     // peringatan untuk pengemudi manusia (level 0 sampai 2, atau saat sistem mati)
@@ -732,7 +838,7 @@ export function createScene() {
       const closing = closingSpeed(obs);
       st.fcw = closing > 0.3 && obs.gap / closing < HUMAN_FCW_TTC;
     }
-    st.ldw = human && !(st.engaged && st.level === 2 && !st.laneOverride) && ego.speed > kmhToMs(30) ? crossingLine() : null;
+    st.ldw = human && !(st.engaged && st.level === 2 && !st.laneOverride) && ego.speed > kmhToMs(25) ? crossingLine() : null;
 
     applyAeb(cmd, obs, dt);
     ego.step(dt, cmd);
@@ -757,44 +863,55 @@ export function createScene() {
   // ---------- preset langkah ----------
 
   /**
-   * Susun ulang skenario. p = { level, egoAt (m dalam satu periode), speed (m/s),
-   * lead: { gap, speed, wait } | null, zone: jarak (m) | null, boundary: jarak (m) | null }
+   * Susun ulang skenario. p = { level, egoAt (m dalam satu periode tikungan), trip (m di rute nyata),
+   * speed (m/s), lead: { kind, code, gap, speed, wait } | null, zone: jarak (m) | null,
+   * boundary: jarak (m) ke batas kawasan, dipakai bila trip tidak diberikan }
+   * Tanpa trip dan boundary, skenario dimulai di jalan kota 500 m setelah batas kawasan.
    */
   function applyPreset(p) {
     rngLead.reseed(101);
     rngTraffic.reseed(202);
+    rngBike.reseed(303);
     const s = PERIOD + p.egoAt;
+    const trip = p.trip ?? (p.boundary != null ? ODD_EXIT - p.boundary : ODD_EXIT + 500);
+    st.tripOffset = trip - s;
     placeEgo(s, LEFT_LANE, p.speed || 0);
+    lead.active = !!p.lead;
     if (p.lead) {
-      lead.active = true;
+      setLeadKind(p.lead.kind || 'city', p.lead.code);
       lead.d = LEFT_LANE;
       lead.s = s + EGO_HL + p.lead.gap + lead.length / 2;
       lead.v = p.lead.speed;
-      lead.vSched = p.lead.speed > 1 ? p.lead.speed : kmhToMs(48);
+      lead.vSched = p.lead.speed > 1 ? p.lead.speed : kmhToMs(28);
       lead.timer = 7;
       lead.waiting = !!p.lead.wait;
       lead.braking = lead.v < 0.05;
       syncPose(lead);
-    } else {
-      lead.active = false;
     }
+    bikes.forEach((m, i) => {
+      m.active = false;
+      m.wait = 2 + i * 4.5;
+    });
     opp.forEach((c, i) => {
       c.v = c.base;
       c.vNow = c.base;
-      c.s = s - 70 + i * 52 + rngTraffic.range(0, 18);
+      c.s = s - 70 + i * 40 + rngTraffic.range(0, 16);
     });
-    st.zone = p.zone ? makeZone(s + p.zone) : null;
-    st.boundary = p.boundary ? { s: s + p.boundary } : null;
-    st.keepZone = !!p.zone;
-    st.keepBoundary = !!p.boundary;
-    for (const k of Object.keys(st.input)) st.input[k] = false;
-    st.aeb = { active: false, hold: 0, target: null };
-    st.fcw = false;
-    st.ldw = null;
+    const bS = ODD_EXIT - st.tripOffset;
+    Object.assign(st, {
+      zone: p.zone ? makeZone(s + p.zone) : null,
+      keepZone: !!p.zone,
+      boundary: bS > s - 250 ? { s: bS } : null,
+      input: { left: false, right: false, gas: false, brake: false },
+      aeb: { active: false, hold: 0, target: null },
+      acc: { mode: 'off', gap: Infinity, want: 0 },
+      counters: { manualDist: 0, accFollow: 0, mrcHold: 0 },
+      crashLog: { lead: 0, motor: 0, zone: 0 },
+      crashes: 0,
+      fcw: false,
+      ldw: null,
+    });
     st.events.length = 0;
-    st.counters = { manualDist: 0, accFollow: 0, mrcHold: 0 };
-    st.crashes = 0;
-    st.acc = { mode: 'off', gap: Infinity, want: 0 };
     updateOpp(0);
     return setLevel(p.level);
   }
@@ -819,7 +936,7 @@ export function createScene() {
     g.restore();
   }
 
-  /** Label hanya dipasang bila titiknya terlihat (label di luar layar akan terjepit di tepi). */
+  /** Label hanya dipasang bila titiknya terlihat. */
   function inView(view, p, margin = 1.5) {
     const b = view.visibleBounds();
     return p.x > b.minX + margin && p.x < b.maxX - margin && p.y > b.minY + margin && p.y < b.maxY - margin;
@@ -902,16 +1019,13 @@ export function createScene() {
     drawTruck(g, z.truck, blink);
     for (const o of z.obstacles) {
       if (o.kind !== 'cone') continue;
-      const w = road.toWorld(o.s, o.d + (o.hit ? 0.5 : 0));
-      if (o.hit) {
-        g.save();
-        g.globalAlpha = 0.6;
-        drawCone(g, { x: w.x, y: w.y, radius: 0.3 }, { view, minPx: 7 });
-        g.restore();
-      } else drawCone(g, { x: w.x, y: w.y, radius: 0.3 }, { view, minPx: 7 });
+      // kerucut yang tertabrak bergeser dan memudar
+      g.globalAlpha = o.hit ? 0.6 : 1;
+      drawCone(g, road.toWorld(o.s, o.d + (o.hit ? 0.5 : 0)), { view, minPx: 7 });
     }
+    g.globalAlpha = 1;
     // rambu peringatan 150 m sebelum zona
-    const sw = road.toWorld(z.signS, SHOULDER_OUT + 1.6);
+    const sw = road.toWorld(z.signS, SHOULDER_OUT + 1.2);
     g.save();
     g.translate(sw.x, sw.y);
     g.rotate(Math.PI / 4);
@@ -924,7 +1038,7 @@ export function createScene() {
     g.restore();
     if (inView(view, sw)) labels.add(sw.x, sw.y, 'Pekerjaan jalan 150 m', { color: '#fdba74', dy: -20, size: 11 });
     const bw = road.toWorld(z.s0 + 30, EDGE_LEFT + 1.5);
-    if (inView(view, bw)) labels.add(bw.x, bw.y, 'Zona konstruksi', { color: '#fdba74', dy: -22, size: 11 });
+    if (inView(view, bw)) labels.add(bw.x, bw.y, 'Zona pekerjaan jalan', { color: '#fdba74', dy: -22, size: 11 });
   }
 
   function drawBoundary(g, view, labels) {
@@ -937,8 +1051,8 @@ export function createScene() {
     const p1 = road.toWorld(b.s, SHOULDER_OUT);
     const p2 = road.toWorld(b.s, MEDIAN_IN);
     drawLine(g, [p1, p2], { color: COLORS.target, width: 3, view, dash: [9, 6] });
-    // rambu di tepi kiri
-    const sp = road.toWorld(b.s, SHOULDER_OUT + 1.7);
+    // rambu di trotoar kiri
+    const sp = road.toWorld(b.s, SHOULDER_OUT + 1.3);
     g.save();
     g.translate(sp.x, sp.y);
     g.rotate(sp.heading);
@@ -949,7 +1063,21 @@ export function createScene() {
     g.fillStyle = COLORS.target;
     g.fillRect(-0.15, -1.15, 0.3, 2.3);
     g.restore();
-    if (inView(view, sp)) labels.add(sp.x, sp.y, 'Batas area operasi', { color: COLORS.target, dy: -22, size: 12 });
+    if (inView(view, sp)) labels.add(sp.x, sp.y, 'Batas area operasi level 4', { color: COLORS.target, dy: -22, size: 12, priority: 2 });
+    // di balik batas: jalan kota dengan batas kecepatan 40 km/jam
+    const lp = road.toWorld(b.s + 14, SHOULDER_OUT + 1.2);
+    drawSpeedSign(g, { x: lp.x, y: lp.y, text: '40', radius: 0.45 }, { view, minPx: 18 });
+  }
+
+  /** Nama kawasan di deretan rumah, hanya di dalam kawasan (area operasi level 4). */
+  function drawKawasanLabels(view, labels, sA, sB) {
+    const STEP = 110;
+    for (let k = Math.floor(tripAt(sA) / STEP); k <= Math.ceil(tripAt(sB) / STEP); k++) {
+      const t = k * STEP + 30;
+      if (t > ODD_EXIT - 25) continue;
+      const p = road.toWorld(t - st.tripOffset, SHOULDER_OUT + 11);
+      if (inView(view, p, 4)) labels.add(p.x, p.y, 'Villa Puncak Tidar', { color: '#99f6e4', dy: 0, size: 11, optional: true });
+    }
   }
 
   function drawSignals(g, view, blink) {
@@ -957,9 +1085,7 @@ export function createScene() {
     if (!blink || !(sig.left || sig.right || sig.hazard)) return;
     const L = ego.length / 2;
     const W = ego.width / 2;
-    const c = Math.cos(ego.heading);
-    const s = Math.sin(ego.heading);
-    const at = (fx, fy) => ({ x: ego.x + c * fx - s * fy, y: ego.y + s * fx + c * fy });
+    const at = (fx, fy) => toWorld(ego, { x: fx, y: fy });
     const spots = [];
     // lokal y negatif = kiri
     if (sig.left || sig.hazard) spots.push(at(L - 0.2, -W + 0.1), at(-L + 0.2, -W + 0.1));
@@ -979,20 +1105,24 @@ export function createScene() {
   }
 
   /** Apakah sistem sedang menyetir (untuk menampilkan rencana jalur). */
-  function systemSteering() {
-    if (!st.engaged || st.level < 2) return false;
-    if (st.level === 2 && st.laneOverride) return false;
-    return st.ads.phase !== 'mrc';
-  }
+  const systemSteering = () => st.engaged && st.level >= 2 && !(st.level === 2 && st.laneOverride) && st.ads.phase !== 'mrc';
+
+  const leadName = () => (lead.kind === 'angkot' ? 'angkot' : 'mobil depan');
 
   function draw(g, view, labels, { time }) {
     const vb = view.visibleBounds();
     const c = road.project(view.camera.x, view.camera.y, st.egoS + (view.camera.x - ego.x));
     const half = (vb.maxX - vb.minX) / 2 + 40;
-    road.draw(g, view, c.s - half, c.s + half);
+    road.draw(g, view, c.s - half, c.s + half, {
+      tripOffset: st.tripOffset,
+      oddExit: ODD_EXIT,
+      limitText: (s) => (inKawasan(s) ? '30' : '40'),
+    });
     const blink = Math.floor(time * 2.6) % 2 === 0;
+    const motorPx = view.width < 500 ? 22 : 30;
 
     drawBoundary(g, view, labels);
+    drawKawasanLabels(view, labels, c.s - half, c.s + half);
     drawZone(g, view, labels, blink);
 
     // garis peringatan keluar lajur
@@ -1018,10 +1148,11 @@ export function createScene() {
       drawLine(g, [a, bb], { color: COLORS.danger, width: 4, view });
     }
 
-    // jarak ACC ke mobil depan
-    if (st.engaged && st.acc.mode === 'follow' && lead.active && st.obs?.kind === 'car') {
+    // jarak ACC ke kendaraan depan
+    if (st.engaged && st.acc.mode === 'follow' && st.obs?.kind === 'car') {
+      const o = st.obs;
       const s0 = st.egoS + EGO_HL + 0.3;
-      const s1 = lead.s - lead.length / 2 - 0.3;
+      const s1 = o.s - o.hl - 0.3;
       if (s1 > s0 + 1) {
         const pts = [];
         const dd = st.egoD + 1.2; // di sisi kiri lajur supaya tidak menimpa rencana jalur
@@ -1034,22 +1165,20 @@ export function createScene() {
       }
     }
 
-    for (const o of opp) {
-      if (o.kind === 'bus') drawBus(g, o);
-      else drawCar(g, o, { color: o.color });
-    }
+    for (const o of opp) drawVehicle(g, o, { view, minPx: o.kind === 'motor' ? motorPx : 0 });
+    for (const m of bikes) if (m.active) drawVehicle(g, m, { view, minPx: motorPx });
     if (lead.active) {
-      drawCar(g, lead, { color: lead.color, braking: lead.braking });
-      if ((st.level <= 2 || !st.engaged) && inView(view, lead)) labels.add(lead.x, lead.y, 'mobil depan', { color: COLORS.muted, dy: -18, size: 11 });
+      drawVehicle(g, lead, { view, braking: lead.braking });
+      if ((st.level <= 2 || !st.engaged) && inView(view, lead)) labels.add(lead.x, lead.y, leadName(), { color: COLORS.muted, dy: -18, size: 11 });
     }
 
-    // sensor sistem: radar ACC (level 1 dan 2), pemantauan penuh (level 3 ke atas)
+    // sensor sistem: radar ACC (level 1 dan 2), cakupan pemantauan penuh (level 3 ke atas), diam tanpa animasi
     if (st.engaged && (st.level === 1 || st.level === 2)) {
       const f = ego.front();
       drawSensorCone(g, f, ego.heading, 0.3, 55, COLORS.radar, { view, fillAlpha: 0.045, strokeAlpha: 0.2, width: 1 });
     }
     if (st.engaged && st.level >= 3) {
-      drawSensorCone(g, ego, 0, TAU, 20, COLORS.lidar, { view, fillAlpha: 0.035, strokeAlpha: 0.3, width: 1, dash: [4, 6] });
+      drawLidarRange(g, ego, 20, COLORS.lidar, { view, alpha: 0.05, edgeAlpha: 0.28, dash: [4, 6] });
     }
 
     drawCar(g, ego, { ego: true, braking: ego.braking });
@@ -1058,7 +1187,7 @@ export function createScene() {
     // peringatan tabrakan depan dan rem darurat
     const target = st.aeb.active ? st.aeb.target : st.fcw ? st.obs?.ref : null;
     if (target) {
-      if (target === lead) drawBracketBox(g, lead, COLORS.danger, { view, pad: 0.5 });
+      if (target === lead || bikes.includes(target)) drawBracketBox(g, target, COLORS.danger, { view, pad: 0.5 });
       else {
         const w = road.toWorld(target.s, target.d);
         drawRing(g, w.x, w.y, Math.max(1.2, view.px(14)), { color: COLORS.danger, width: 2, view });
@@ -1069,39 +1198,32 @@ export function createScene() {
     const edgeX = vb.maxX - view.px(20);
     const edgeS = road.project(edgeX, view.camera.y, c.s + (edgeX - view.camera.x)).s;
     const ahead = [];
-    if (st.zone && st.zone.s0 > edgeS) ahead.push({ s: st.zone.s0, text: 'Zona konstruksi', color: '#fdba74' });
-    if (st.boundary && st.boundary.s > edgeS) ahead.push({ s: st.boundary.s, text: 'Batas area operasi', color: COLORS.target });
+    if (st.zone && st.zone.s0 > edgeS) ahead.push({ s: st.zone.s0, text: 'Pekerjaan jalan', color: '#fdba74' });
+    if (st.boundary && st.boundary.s > edgeS + 2) ahead.push({ s: st.boundary.s, text: 'Batas ODD level 4', color: COLORS.target });
     for (const e of ahead) {
       const dist = e.s - (st.egoS + EGO_HL);
       if (dist > 450) continue;
       const p = road.toWorld(edgeS, EDGE_LEFT + 1);
-      labels.add(p.x, p.y, `${e.text} ${fmt(dist, 0)} m ›`, { color: e.color, align: 'right', dx: 0, dy: -30, size: 11 });
+      labels.add(p.x, p.y, `${e.text} ${fmt(dist, 0)} m ›`, { color: e.color, align: 'right', dx: 0, dy: -30, size: 11, offscreen: 'clamp' });
     }
   }
 
+  /** Ringkasan pelaku untuk pengujian: jenis dan jumlah (hanya kendaraan). */
+  function actorKinds() {
+    const kinds = {};
+    const add = (k) => (kinds[k] = (kinds[k] || 0) + 1);
+    add('ego');
+    if (lead.active) add(lead.kind);
+    for (const m of bikes) if (m.active) add('motor');
+    for (const o of opp) add(o.kind);
+    return kinds;
+  }
+
   // tampilan awal
-  applyPreset({ level: 0, egoAt: 10, speed: 0, lead: { gap: 30, speed: 0, wait: true } });
+  applyPreset({ level: 0, egoAt: 10, trip: ODD_EXIT + 1500, speed: 0, lead: { kind: 'angkot', code: 'ADL', gap: 30, speed: 0, wait: true } });
 
   return {
-    road,
-    ego,
-    lead,
-    opp,
-    st,
-    update,
-    draw,
-    applyPreset,
-    setLevel,
-    engage,
-    setInput,
-    pressHold,
-    pressTakeover,
-    controlsFor,
-    oddEventAhead,
-    outsideOdd,
-    flashKey,
-    humanDrives,
-    systemSteering,
-    EGO_HL,
+    road, ego, lead, bikes, opp, st, update, draw, applyPreset, setLevel, engage, setInput, pressHold, pressTakeover,
+    controlsFor, oddEventAhead, eventForLevel, flashKey, tripAt, limitAt, inKawasan, actorKinds, leadName, EGO_HL,
   };
 }

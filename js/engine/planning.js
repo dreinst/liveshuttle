@@ -6,49 +6,63 @@
 //   heuristic(a, b) -> perkiraan biaya a ke b (tidak boleh melebihi biaya sebenarnya)
 // GridMap dan Graph di bawah sudah memenuhi kontrak ini.
 
-/** Antrean prioritas min-heap. */
+/**
+ * Antrean prioritas min-heap. push(item, priority, tie = 0): bila prioritas sama, nilai `tie`
+ * yang lebih kecil keluar lebih dulu (dipakai untuk tie-breaking A*).
+ */
 export class PriorityQueue {
   constructor() {
     this._items = [];
     this._prio = [];
+    this._tie = [];
   }
   get size() {
     return this._items.length;
   }
-  push(item, priority) {
-    const items = this._items;
-    const prio = this._prio;
-    items.push(item);
-    prio.push(priority);
-    let i = items.length - 1;
+  _less(i, j) {
+    const p = this._prio;
+    return p[i] < p[j] || (p[i] === p[j] && this._tie[i] < this._tie[j]);
+  }
+  _swap(i, j) {
+    const a = this._items;
+    const p = this._prio;
+    const t = this._tie;
+    [a[i], a[j]] = [a[j], a[i]];
+    [p[i], p[j]] = [p[j], p[i]];
+    [t[i], t[j]] = [t[j], t[i]];
+  }
+  push(item, priority, tie = 0) {
+    this._items.push(item);
+    this._prio.push(priority);
+    this._tie.push(tie);
+    let i = this._items.length - 1;
     while (i > 0) {
       const p = (i - 1) >> 1;
-      if (prio[p] <= prio[i]) break;
-      [items[p], items[i]] = [items[i], items[p]];
-      [prio[p], prio[i]] = [prio[i], prio[p]];
+      if (!this._less(i, p)) break;
+      this._swap(i, p);
       i = p;
     }
   }
   pop() {
     const items = this._items;
-    const prio = this._prio;
     if (!items.length) return undefined;
     const top = items[0];
     const lastItem = items.pop();
-    const lastPrio = prio.pop();
+    const lastPrio = this._prio.pop();
+    const lastTie = this._tie.pop();
     if (items.length) {
       items[0] = lastItem;
-      prio[0] = lastPrio;
+      this._prio[0] = lastPrio;
+      this._tie[0] = lastTie;
       let i = 0;
       for (;;) {
         const l = 2 * i + 1;
         const r = l + 1;
         let m = i;
-        if (l < items.length && prio[l] < prio[m]) m = l;
-        if (r < items.length && prio[r] < prio[m]) m = r;
+        if (l < items.length && this._less(l, m)) m = l;
+        if (r < items.length && this._less(r, m)) m = r;
         if (m === i) break;
-        [items[m], items[i]] = [items[i], items[m]];
-        [prio[m], prio[i]] = [prio[i], prio[m]];
+        this._swap(m, i);
         i = m;
       }
     }
@@ -227,20 +241,23 @@ export class Graph {
  *
  * @param {object} space ruang pencarian (GridMap, Graph, atau objek dengan neighbors/heuristic)
  * @param {*} start @param {*} goal
- * @param {object} [opts] { algorithm: 'astar' | 'dijkstra', heuristic, weight (pengali heuristik, default 1) }
+ * @param {object} [opts] { algorithm: 'astar' | 'dijkstra', heuristic, weight (pengali heuristik, default 1),
+ *   tieBreak: false | 'g' (bila f sama, perluas node dengan g terbesar dulu, yaitu yang lebih dekat ke tujuan;
+ *   rute tetap optimal, hanya urutan perluasan yang berubah) }
  * Properti yang bisa dibaca untuk animasi:
  *   open (Set node di antrean), closed (Set node selesai), current (node terakhir diperluas),
  *   g (Map biaya terbaik), cameFrom (Map), expanded (jumlah node diperluas),
  *   done, found, path (Array node), cost
  */
-export function createSearch(space, start, goal, { algorithm = 'astar', heuristic = null, weight = 1 } = {}) {
+export function createSearch(space, start, goal, { algorithm = 'astar', heuristic = null, weight = 1, tieBreak = false } = {}) {
   const h = algorithm === 'dijkstra' ? () => 0 : heuristic || ((a, b) => space.heuristic(a, b));
   const pq = new PriorityQueue();
   const g = new Map([[start, 0]]);
   const cameFrom = new Map();
   const open = new Set([start]);
   const closed = new Set();
-  pq.push(start, weight * h(start, goal));
+  const tie = (gv) => (tieBreak ? -gv : 0);
+  pq.push(start, weight * h(start, goal), tie(0));
 
   const search = {
     algorithm,
@@ -286,7 +303,7 @@ export function createSearch(space, start, goal, { algorithm = 'astar', heuristi
           g.set(next, cand);
           cameFrom.set(next, node);
           open.add(next);
-          pq.push(next, cand + weight * h(next, goal));
+          pq.push(next, cand + weight * h(next, goal), tie(cand));
         }
       }
       return false;
@@ -299,6 +316,15 @@ export function createSearch(space, start, goal, { algorithm = 'astar', heuristi
         n++;
       }
       return this;
+    },
+    /** Iterator: setiap langkah menghasilkan node yang baru diperluas. for (const n of search.steps()) {...} */
+    *steps() {
+      while (!this.done) {
+        const before = this.expanded;
+        this.step();
+        // antrean habis tanpa node baru (tujuan tak terjangkau): jangan ulangi node terakhir
+        if (this.expanded > before) yield this.current;
+      }
     },
     /** Jalur sementara dari start ke node tertentu (untuk animasi). */
     pathTo(node) {

@@ -1,23 +1,45 @@
-// Pelajaran 3: Persepsi dan Fusi Sensor.
+// Pelajaran 3: Persepsi dan Fusi Sensor, berlatar Jalan Karangampel Timur dekat Universitas Ma Chung.
 //
 // Struktur mengikuti pelajaran contoh (sensor.js):
 //   1. Teks pelajaran (intro, steps, summary) di objek default export.
-//   2. Model dunia di ./persepsi/scene.js (jalan kota yang bergulir, pelaku, mobil otonom).
-//   3. Model persepsi di ./persepsi/perception.js (deteksi tiap sensor, fusi, pelacakan, prediksi).
-//   4. File ini menyusun kanvas, panel kontrol, gambar lapisan persepsi, deteksi tugas, dan
+//   2. Kerangka jalan nyata dari OpenStreetMap di ./persepsi/street.js.
+//   3. Model dunia di ./persepsi/scene.js (lalu lintas campuran Malang, perisai keselamatan).
+//   4. Model persepsi di ./persepsi/perception.js (deteksi tiap sensor, fusi, pelacakan, prediksi).
+//   5. File ini menyusun kanvas, peta, panel kontrol, gambar lapisan persepsi, deteksi tugas, dan
 //      preset tiap langkah.
 // Semua tahap persepsi selalu berjalan di dalam simulasi. Sakelar hanya memilih tahap mana
 // yang digambar, sama seperti layar diagnosis di mobil uji.
+//
+// LiDAR digambar dengan gaya tenang (ENGINE.md 8.4): titik yang memudar pelan, cakupan diam, dan
+// sapuan lembut yang berputar sekali tiap 10 detik. Tidak ada garis per sinar.
 
 import { COLORS, withAlpha } from '../engine/theme.js';
-import { fmt, fmtSigned, msToKmh, TAU } from '../engine/math.js';
-import { drawSensorCone, drawPointCloud, drawBracketBox, drawRing, drawLine, drawArrow, drawScaleBar, createLabelLayer } from '../engine/draw.js';
+import { fmt, fmtSigned, fmtPercent as pct, msToKmh, clamp, TAU } from '../engine/math.js';
+import {
+  drawSensorCone,
+  drawBracketBox,
+  drawRing,
+  drawLine,
+  drawArrow,
+  drawScaleBar,
+  drawSoftPoints,
+  polygonPath,
+  createLabelLayer,
+  createLidarTrail,
+  drawLidarRange,
+  drawLidarSweep,
+  lidarSweepAngle,
+} from '../engine/draw.js';
+import { createMapRenderer } from '../engine/osm2d.js';
 import { icon } from '../engine/icons.js';
 import * as ui from '../engine/ui.js';
-import { createScene, LANE_Y } from './persepsi/scene.js';
+import { buildStreet } from './persepsi/street.js';
+import { createScene } from './persepsi/scene.js';
+import { createSmoother, createAttachedCloud } from './persepsi/smooth.js';
 import {
   createPerception,
   CLASS_NAMES,
+  CLASS_SIZE,
   CAMERA,
   LIDAR,
   RADAR,
@@ -28,6 +50,7 @@ import {
   trackMotion,
   findConflict,
   predictable,
+  mountPose as sensorPose,
 } from './persepsi/perception.js';
 
 const FUSED = '#f8fafc';
@@ -36,10 +59,11 @@ const DANGER = COLORS.danger;
 const DANGER_TEXT = '#fecaca';
 const DANGER_BG = 'rgba(69, 10, 10, 0.9)';
 const CORRIDOR_LEN = 35; // m, panjang jalur rencana yang diperiksa
+const CORRIDOR_MARGIN = 0.45; // m, tambahan lebar jalur rencana di tiap sisi mobil
 const SENSOR_KEYS = ['kamera', 'lidar', 'radar'];
 const SENSOR_LABELS = { kamera: 'Kamera', lidar: 'LiDAR', radar: 'Radar' };
 const SENSOR_HINTS = { kamera: 'Kotak berlabel kelas', lidar: 'Titik dan klaster', radar: 'Titik dan kecepatan relatif' };
-const SUBJECT = { pedestrian: 'Pejalan kaki', cyclist: 'Pesepeda', car: 'Mobil', unknown: 'Objek' };
+const SUBJECT = { pedestrian: 'Pejalan kaki', cyclist: 'Pesepeda', car: 'Mobil', angkot: 'Angkot', motor: 'Sepeda motor', unknown: 'Objek' };
 const STAGES = [
   { key: 'raw', name: 'Data mentah', sub: 'titik, pantulan, gambar' },
   { key: 'det', name: 'Deteksi', sub: 'kotak, klaster, target' },
@@ -59,8 +83,16 @@ const STEP_PRESETS = [
 ];
 const DEFAULT_THRESHOLD = 50; // persen
 const DEFAULT_NOISE = 1;
-
-const pct = (p) => `${fmt(p * 100, 0)}%`;
+// LiDAR tenang: titik latar (gedung, halte) memudar selama 2,4 detik; titik pada objek menempel
+// pada objeknya dan memudar dalam 0,35 detik; sapuan lembut berputar sekali tiap 10 detik
+const LIDAR_FADE_BG = 2.4;
+const LIDAR_KEEP_OBJ = 0.35;
+const SWEEP_PERIOD = 10;
+// Peringatan yang tampil (spanduk, baris status, warna merah) memakai histeresis: baru muncul
+// setelah bertahan 0,25 detik dan masih tampil 0,4 detik setelah hilang. Tanpa ini spanduk
+// berkedip saat satu pindaian keliru atau saat dua objek bergantian masuk jalur.
+const WARN_ON = 0.25;
+const WARN_OFF = 0.4;
 
 export default {
   id: 'persepsi',
@@ -68,17 +100,18 @@ export default {
   layout: 'sim',
   intro:
     '<p>Sensor hanya memberi data mentah: gambar kamera, titik LiDAR, dan pantulan radar. Mobil otonom harus mengubahnya menjadi daftar objek yang jelas, yaitu jenisnya, letaknya, arah geraknya, dan seberapa yakin mobil tentang semua itu. Proses ini disebut <strong>persepsi</strong>.</p>' +
-    '<p>Di pelajaran ini mobilmu melaju pelan di jalan kota. Kamu akan menyalakan tahap persepsi satu per satu dan melihat hasilnya.</p>',
+    '<p>Di pelajaran ini mobilmu melaju pelan ke timur di Jalan Karangampel Timur, dari arah barat menuju sisi utara kampus Universitas Ma Chung. Lalu lintasnya campuran seperti di Malang: mobil, angkot, sepeda motor, pesepeda, dan pejalan kaki. Kamu akan menyalakan tahap persepsi satu per satu dan melihat hasilnya.</p>' +
+    '<p class="note">Jalan dan gedungnya diambil dari OpenStreetMap. Trotoar, zebra cross, halte, dan semua pengguna jalan di sini adalah tambahan simulasi.</p>',
   steps: [
     {
       title: 'Data mentah tiga sensor',
       body:
         '<p>Tiap sensor mengolah data mentahnya menjadi deteksi. Hasilnya berbeda-beda.</p>' +
-        '<ul><li><span class="chip chip-kamera">Kamera</span> memberi kotak berlabel jenis objek, misalnya pejalan kaki, lengkap dengan persen keyakinan. Jaraknya ditebak dari gambar, jadi kotaknya bergeser maju mundur.</li>' +
+        '<ul><li><span class="chip chip-kamera">Kamera</span> memberi kotak berlabel jenis objek, misalnya pejalan kaki, sepeda motor, atau angkot, lengkap dengan persen keyakinan. Jaraknya ditebak dari gambar, jadi kotaknya bergeser maju mundur.</li>' +
         '<li><span class="chip chip-lidar">LiDAR</span> memberi kumpulan titik (klaster) dengan posisi sangat tepat, tetapi tidak tahu jenis objeknya.</li>' +
         '<li><span class="chip chip-radar">Radar</span> memberi titik beserta kecepatan relatif. Jaraknya tepat, tetapi posisinya ke kiri dan kanan kurang tepat.</li></ul>' +
         '<p>Elips tipis di sekitar deteksi kamera dan radar menunjukkan besar ketidakpastian posisinya. Elips kamera memanjang searah pandang, sedangkan elips radar melebar ke samping.</p>' +
-        '<p class="note">Mobilmu melaju sekitar 18 km/jam. Karena itu radar mencatat benda diam, misalnya mobil parkir, seolah mendekat dengan kecepatan hampir sama.</p>',
+        '<p class="note">Mobilmu melaju sekitar 18 km/jam. Karena itu radar mencatat benda diam, misalnya mobil parkir di bahu jalan, seolah mendekat dengan kecepatan hampir sama. Titik LiDAR sengaja digambar memudar pelan supaya layar tetap tenang, padahal LiDAR memindai 10 kali per detik.</p>',
       task: { id: 'raw-view', text: 'Nyalakan data mentah <strong>LiDAR</strong> dan <strong>radar</strong> sehingga ketiga sensor tampil bersamaan, lalu cari objek yang terlihat oleh ketiganya.' },
     },
     {
@@ -90,7 +123,7 @@ export default {
         '<li>Keyakinannya digabung dengan anggapan kesalahan tiap sensor tidak saling berkaitan. Makin banyak sensor yang sepakat, makin tinggi keyakinannya.</li></ol>' +
         '<div class="formula">w = 1/σ²<br>x = (w₁x₁ + w₂x₂) / (w₁ + w₂)<br>p = 1 − (1 − p₁)(1 − p₂)(1 − p₃)</div>' +
         '<p>Hasilnya satu kotak putih per objek. Jenisnya datang dari kamera, posisinya hampir sama dengan LiDAR karena LiDAR paling tepat. Garis tipis menunjukkan deteksi mana saja yang digabung.</p>' +
-        '<p>Coba juga naikkan <strong>Derau sensor</strong>. Makin besar derau, makin sering deteksi dipasangkan dengan objek yang salah.</p>',
+        '<p>Coba juga naikkan <strong>Derau sensor</strong>. Makin besar derau, makin sering deteksi dipasangkan dengan objek yang salah, misalnya sepeda motor yang menyelip rapat di samping mobil lain.</p>',
       task: { id: 'fusion-on', text: 'Nyalakan <strong>Fusi</strong> dan lihat deteksi dari beberapa sensor menyatu menjadi satu kotak putih per objek.' },
     },
     {
@@ -107,7 +140,7 @@ export default {
         '<p>Setiap objek hasil fusi punya nilai keyakinan. Mobil hanya meneruskan objek yang keyakinannya mencapai <strong>ambang</strong> ke tahap perencanaan.</p>' +
         '<ul><li>Ambang yang terlalu rendah membuat benda yang bukan objek ikut dilaporkan. Ini disebut <strong>positif palsu</strong>. Coba turunkan ambang sampai sekitar 25% saat mobil mendekati halte. Kamera mengira gambar orang di papan iklan sebagai pejalan kaki.</li>' +
         '<li>Ambang yang terlalu tinggi membuat objek nyata terbuang. Ini disebut <strong>negatif palsu</strong>, dan akibatnya jauh lebih berbahaya.</li></ul>' +
-        '<p>Pejalan kaki dan pesepeda paling cepat hilang. Tubuhnya kecil, jadi titik LiDAR-nya sedikit dan pantulan radarnya lemah.</p>' +
+        '<p>Pejalan kaki, pesepeda, dan sepeda motor paling cepat hilang. Ukurannya kecil, jadi titik LiDAR-nya sedikit dan pantulan radarnya lemah. Hal ini penting di jalan Malang yang ramai sepeda motor.</p>' +
         '<p class="note">Tulisan merah <em>terlewat</em> dan <em>palsu</em> adalah kunci jawaban dari simulasi. Mobil sendiri tidak tahu mana objek yang nyata.</p>',
       task: { id: 'threshold', text: 'Naikkan <strong>Ambang keyakinan</strong> sampai minimal 90%, lalu perhatikan objek nyata yang tidak lagi dilaporkan (ditandai <em>terlewat</em>).' },
     },
@@ -116,7 +149,8 @@ export default {
       body:
         '<p><strong>Pelacakan</strong> menghubungkan objek dari satu pengukuran ke pengukuran berikutnya. Setiap objek mendapat nomor ID dan jejak. Filter Kalman dengan model kecepatan konstan menghaluskan posisi, lalu memperkirakan kecepatan dan arah gerak. Pelacakan juga mengingat jenis objek, jadi mobil parkir tetap dikenali walau sudah keluar dari pandangan kamera. Bila objek tertutup benda lain lebih dari sekitar 1 detik, jejaknya dihapus, dan objek itu mendapat ID baru saat terlihat lagi.</p>' +
         '<p><strong>Prediksi</strong> meneruskan gerak objek yang sedang bergerak sampai 3 detik ke depan. Pita di sekitar garis prediksi makin lebar karena makin jauh ke depan, makin tidak pasti. Elips putus-putus di ujungnya menunjukkan sebaran posisi pada detik ketiga. Bila prediksi memotong jalur rencana mobilmu (daerah hijau toska di depan mobil), perencana mendapat peringatan lebih awal.</p>' +
-        '<p class="note">Model kecepatan konstan menganggap objek terus bergerak lurus dengan kecepatan yang sama. Prediksi di mobil sungguhan juga memakai peta, aturan lalu lintas, dan kebiasaan pengguna jalan.</p>',
+        '<p class="note">Model kecepatan konstan menganggap objek terus bergerak lurus dengan kecepatan yang sama. Sepeda motor yang menyelip lalu kembali ke lajur membuat prediksi seperti ini cepat meleset. Prediksi di mobil sungguhan juga memakai peta, aturan lalu lintas, dan kebiasaan pengguna jalan.</p>' +
+        '<p>Mobilmu selalu memberi jalan kepada penyeberang. Di simulasi ini ada juga perisai keselamatan, lapisan terakhir yang mengerem kendaraan mana pun sebelum menabrak pejalan kaki.</p>',
       task: { id: 'predict', text: 'Nyalakan <strong>Prediksi</strong>, lalu tunggu sampai mobil mendekati zebra cross dan muncul peringatan bahwa pejalan kaki akan masuk jalurmu.' },
     },
   ],
@@ -125,9 +159,9 @@ export default {
     '<ul><li>Tiap sensor menghasilkan deteksinya sendiri. Kamera tahu jenis objek, LiDAR tahu posisi yang tepat, dan radar tahu kecepatan relatif.</li>' +
     '<li>Fusi memasangkan deteksi dengan asosiasi tetangga terdekat, merata-ratakan posisi dengan bobot kebalikan varians, lalu menggabungkan keyakinan.</li>' +
     '<li>Deteksi yang hanya datang dari radar di daerah yang juga diawasi kamera dan LiDAR ditolak sebagai hantu.</li>' +
-    '<li>Ambang keyakinan menentukan keseimbangan antara positif palsu dan negatif palsu. Negatif palsu lebih berbahaya, terutama untuk pejalan kaki dan pesepeda.</li>' +
+    '<li>Ambang keyakinan menentukan keseimbangan antara positif palsu dan negatif palsu. Negatif palsu lebih berbahaya, terutama untuk pejalan kaki, pesepeda, dan sepeda motor.</li>' +
     '<li>Pelacakan memberi ID, jejak, dan kecepatan. Prediksi memperkirakan posisi beberapa detik ke depan, lengkap dengan ketidakpastiannya.</li></ul>' +
-    '<p class="note">Simulasi ini disederhanakan supaya mudah diamati: tampak atas dua dimensi, ketiga sensor dibaca bersamaan 10 kali per detik, dan jangkauan sensor dipendekkan agar muat di layar.</p>',
+    '<p class="note">Simulasi ini disederhanakan supaya mudah diamati: tampak atas dua dimensi, ketiga sensor dibaca bersamaan 10 kali per detik, dan jangkauan sensor dipendekkan agar muat di layar. Jalan, gedung, dan nama jalan berasal dari OpenStreetMap. Lebar jalan adalah perkiraan. Trotoar, zebra cross, halte, papan iklan, tutup gorong-gorong, dan mobil parkir ditambahkan untuk latihan, jadi letaknya tidak sama dengan aslinya.</p>',
 
   // Gaya khusus pelajaran ini, selalu diawali .lesson-persepsi.
   styles: `
@@ -180,26 +214,55 @@ export default {
     }
   `,
 
-  mount(ctx) {
-    // ---------- model ----------
-    const scene = createScene({ seed: 11 });
+  async mount(ctx) {
+    // ---------- peta dan model ----------
+    const map = await ctx.loadMap('machung');
+    if (ctx.signal.aborted) return {};
+    const street = buildStreet(map);
+    const scene = createScene({ street, seed: 11 });
     const perc = createPerception({ seed: 23 });
     const show = { kamera: true, lidar: false, radar: false, fusion: false, tracking: false, prediction: false };
     let threshold = DEFAULT_THRESHOLD / 100;
     let acc = 0;
     let items = []; // objek hasil fusi atau pelacakan yang sedang ditampilkan
-    let conflict = null;
+    let conflict = null; // hasil findConflict saat ini (mentah)
+    let shown = null; // peringatan yang sedang ditampilkan (sesudah histeresis)
+    let warnCand = null; // { key, since }: calon peringatan baru yang belum cukup lama
+    let warnSeen = -Infinity; // waktu terakhir peringatan yang tampil masih terdeteksi
+    let lastLap = scene.state.lap;
+    let lapNoticeUntil = -1;
     const holds = {};
+    const now = () => scene.state.time;
+
+    // gambar yang dihaluskan (hanya tampilan, model tetap memakai hasil pindaian)
+    const smCam = createSmoother();
+    const smRad = createSmoother();
+    const smLid = createSmoother();
+    const smFused = createSmoother();
+    const trailBg = createLidarTrail({ fade: LIDAR_FADE_BG, max: 9000, decimate: 2 });
+    const cloudObj = createAttachedCloud({ keep: LIDAR_KEEP_OBJ });
+
+    // uji otomatis membaca penghitung keselamatan di sini (harus selalu 0)
+    window.__lessonSafety = scene.safety;
+    ctx.onCleanup(() => {
+      if (window.__lessonSafety === scene.safety) delete window.__lessonSafety;
+    });
 
     // ---------- kanvas dan loop ----------
     const labels = createLabelLayer();
+    const baseMap = createMapRenderer(map, { layers: { buildings: false, labels: false } });
+    const topMap = createMapRenderer(map, {
+      layers: { green: false, water: false, campus: false, footways: false, roads: false, islands: false, markings: false, arrows: false, buildings: true, labels: true, places: false },
+    });
     const bounds = (v) => {
-      const x = scene.ego.x;
-      return v.aspect < 1.4 ? { minX: x - 6, minY: -10, maxX: x + 31, maxY: 8 } : { minX: x - 10, minY: -10.5, maxX: x + 44, maxY: 8.5 };
+      const narrow = v.aspect < 1.4;
+      const c = street.pose(scene.ego.s + (narrow ? 11 : 17), 0.4);
+      return narrow ? { minX: c.x - 18.5, minY: c.y - 9, maxX: c.x + 18.5, maxY: c.y + 9 } : { minX: c.x - 27, minY: c.y - 9.5, maxX: c.x + 27, maxY: c.y + 9.5 };
     };
     const view = ctx.createView({
-      label: 'Jalan kota tampak atas. Mobil otonom berwarna hijau toska melaju ke kanan di lajur kiri, melewati mobil parkir, pejalan kaki, pesepeda, dan mobil dari arah berlawanan.',
-      background: COLORS.sidewalk,
+      label:
+        'Jalan Karangampel Timur dekat Universitas Ma Chung, tampak atas. Mobil otonom berwarna hijau toska melaju ke timur di lajur kiri, bersama mobil, angkot, sepeda motor, pesepeda, dan pejalan kaki.',
+      background: COLORS.ground,
       bounds,
       padding: 10,
     });
@@ -207,14 +270,52 @@ export default {
     banner.innerHTML = `${icon('alert')}<span></span>`;
     ctx.stage.append(banner);
 
+    const objectsById = () => new Map([...scene.traffic, ...scene.peds, ...street.parked].map((o) => [o.id, o]));
+
+    function afterScan() {
+      const L = perc.last;
+      const t = now();
+      const byId = objectsById();
+      const anchor = (d) => (d.truth != null ? byId.get(d.truth) || null : null);
+      smCam.scan(L.camera.dets.map((d) => ({ key: d.key, x: d.x, y: d.y, det: d, anchor: anchor(d), value: d.conf })), t);
+      smRad.scan(L.radar.dets.map((d) => ({ key: d.key, x: d.x, y: d.y, det: d, anchor: anchor(d), value: d.relSpeed })), t);
+      smLid.scan(L.lidar.dets.map((d) => ({ key: d.key, x: d.x, y: d.y, det: d, anchor: anchor(d), box: d.box })), t);
+      smFused.scan(L.fused.map((f) => ({ key: f.key, x: f.x, y: f.y, det: f, anchor: anchor(f), value: f.conf })), t);
+      const bg = [];
+      const rel = [];
+      for (const p of L.lidar.points) (p.rel ? rel : bg).push(p);
+      trailBg.add(bg, t);
+      cloudObj.add(rel, byId, t);
+    }
+
+    function clearVisuals() {
+      for (const sm of [smCam, smRad, smLid, smFused]) sm.clear();
+      trailBg.clear();
+      cloudObj.clear();
+      clearWarning();
+    }
+
     perc.tick(scene.world());
+    afterScan();
     ctx.createLoop({
       update(dt) {
         scene.update(dt);
+        if (scene.state.lap !== lastLap) {
+          // putaran baru dari ujung barat ruas: persepsi mulai dari nol di tempat baru
+          lastLap = scene.state.lap;
+          perc.restart();
+          clearVisuals();
+          acc = 0;
+          lapNoticeUntil = now() + 4;
+          perc.tick(scene.world());
+          afterScan();
+          return;
+        }
         acc += dt;
         while (acc >= SCAN_DT - 1e-9) {
           acc -= SCAN_DT;
           perc.tick(scene.world(), SCAN_DT);
+          afterScan();
         }
       },
       render,
@@ -336,10 +437,15 @@ export default {
       refreshPanels(0);
     }
 
+    function rescanPaused() {
+      perc.rescan(scene.world());
+      afterScan();
+    }
+
     function setNoise(v) {
       perc.setNoise(v);
       noiseSlider.set(v);
-      if (ctx.paused) perc.rescan(scene.world());
+      if (ctx.paused) rescanPaused();
     }
 
     function setThreshold(v) {
@@ -351,29 +457,36 @@ export default {
     function spawnGhost() {
       const g = perc.spawnGhost(scene.world());
       if (!g) {
-        ctx.toast('Belum ada tutup gorong-gorong di depan radar. Coba lagi sebentar lagi.', { tone: 'warn' });
+        ctx.toast('Belum ada tutup gorong-gorong di depan radar. Coba lagi dalam beberapa detik.', { tone: 'warn' });
         return;
       }
       if (!show.radar && !show.fusion) setRaw('radar', true);
-      if (ctx.paused) perc.rescan(scene.world());
+      if (ctx.paused) rescanPaused();
       refreshPanels(0);
     }
 
     // ---------- membaca hasil persepsi ----------
+    const egoS = () => scene.ego.s;
+    const frenetOf = (x, y) => street.frenet(x, y, egoS(), 140);
+
     function perceived() {
       if (!show.fusion) return [];
       const ego = scene.ego;
       const dist = (x, y) => Math.hypot(x - ego.x, y - ego.y);
       if (show.tracking) {
+        // posisi digambar dengan prediksi Kalman sejak pengukuran terakhir, supaya gerak kotak mulus
+        const since = Math.max(0, Math.min(0.2, now() - perc.last.time));
         return perc.tracks
           .filter((t) => t.confirmed)
           .map((t) => {
             const m = trackMotion(t);
+            const x = t.x[0] + t.x[2] * since;
+            const y = t.x[1] + t.x[3] * since;
             return {
               track: t,
               id: t.id,
-              x: t.x[0],
-              y: t.x[1],
+              x,
+              y,
               cls: t.cls,
               conf: t.conf,
               speed: m.speed,
@@ -382,24 +495,33 @@ export default {
               size: t.size,
               truth: t.truth,
               members: t.last ? t.last.members : [],
-              dist: dist(t.x[0], t.x[1]),
+              dist: dist(x, y),
+              since,
             };
           });
       }
-      return perc.last.fused.map((f) => ({
-        track: null,
-        id: null,
-        x: f.x,
-        y: f.y,
-        cls: f.cls,
-        conf: f.conf,
-        speed: null,
-        heading: f.heading,
-        size: f.size,
-        truth: f.truth,
-        members: f.members,
-        dist: dist(f.x, f.y),
-      }));
+      const drawn = new Map(smFused.items(now()).map((it) => [it.key, it]));
+      return perc.last.fused.map((f) => {
+        const it = drawn.get(f.key);
+        const x = it ? it.x : f.x;
+        const y = it ? it.y : f.y;
+        return {
+          track: null,
+          id: null,
+          x,
+          y,
+          cls: f.cls,
+          conf: f.conf,
+          confShown: it && Number.isFinite(it.value) ? it.value : f.conf,
+          speed: null,
+          heading: f.heading,
+          size: f.size,
+          truth: f.truth,
+          members: f.members,
+          dist: dist(f.x, f.y),
+          since: 0,
+        };
+      });
     }
 
     // dibandingkan dalam persen bulat, sama dengan angka yang tampil di layar
@@ -411,18 +533,46 @@ export default {
       const b = view.visibleBounds();
       return x >= b.minX - margin && x <= b.maxX + margin && y >= b.minY - margin && y <= b.maxY + margin;
     };
-    const halfWidth = (o) => (o.cls === 'pedestrian' || o.cls === 'cyclist' ? 0.35 : o.size.width / 2);
+    const halfWidth = (o) => (o.cls === 'pedestrian' || o.cls === 'cyclist' ? 0.35 : o.cls === 'motor' ? 0.36 : o.size.width / 2);
 
     function corridor() {
       const ego = scene.ego;
-      const x0 = ego.x + ego.length / 2;
-      return { x0, x1: x0 + CORRIDOR_LEN, y: LANE_Y, half: ego.width / 2 + 0.6 };
+      const s0 = ego.s + ego.length / 2;
+      return { frenet: (x, y, hint) => street.frenet(x, y, hint, 60), heading: street.heading, s0, s1: s0 + CORRIDOR_LEN, d: ego.d, half: ego.width / 2 + CORRIDOR_MARGIN, egoSpeed: ego.v };
     }
 
     function computeConflict() {
       if (!show.prediction) return null;
       const cands = items.filter((o) => reported(o) && canPredict(o)).map((o) => ({ track: o.track, cls: o.cls, halfWidth: halfWidth(o) }));
       return findConflict(cands, corridor(), HORIZON);
+    }
+
+    function clearWarning() {
+      shown = null;
+      warnCand = null;
+      warnSeen = -Infinity;
+    }
+
+    // Histeresis peringatan (hanya tampilan). Objek yang sama boleh langsung memperbarui
+    // peringatannya (misalnya dari "diprediksi masuk" menjadi "sedang berada di jalurmu").
+    function updateWarning() {
+      if (!show.prediction) return clearWarning();
+      const t = now();
+      if (t < warnSeen - 1e-6 || (warnCand && t < warnCand.since - 1e-6)) clearWarning(); // Ulangi
+      if (conflict && shown && conflict.track === shown.track) {
+        shown = conflict;
+        warnSeen = t;
+        warnCand = null;
+      } else if (conflict) {
+        const key = `${conflict.track.id}|${conflict.inPath ? 1 : 0}`;
+        if (!warnCand || warnCand.key !== key) warnCand = { key, since: t };
+        if (t - warnCand.since >= WARN_ON - 1e-9) {
+          shown = conflict;
+          warnSeen = t;
+          warnCand = null;
+        }
+      } else warnCand = null;
+      if (shown && t - warnSeen > WARN_OFF) shown = null;
     }
 
     function seenByAllThree() {
@@ -438,8 +588,12 @@ export default {
       'raw-view': { hold: 1.5, test: () => show.kamera && show.lidar && show.radar && seenByAllThree() },
       'fusion-on': { hold: 1.5, test: () => show.fusion && perc.last.fused.filter((f) => f.sensors.size >= 2).length >= 2 },
       'ghost-rejected': { hold: 0.3, test: () => show.fusion && !!perc.manualGhostRejected() },
-      threshold: { hold: 1, test: () => show.fusion && threshold >= 0.9 - 1e-9 && items.some((o) => o.truth != null && !reported(o) && o.x > scene.ego.x && onScreen(o.x, o.y, -1)) },
-      predict: { hold: 0.4, test: () => show.prediction && !!conflict && !conflict.inPath && conflict.cls === 'pedestrian' },
+      threshold: {
+        hold: 1,
+        test: () => show.fusion && threshold >= 0.9 - 1e-9 && items.some((o) => o.truth != null && !reported(o) && frenetOf(o.x, o.y).s > egoS() && onScreen(o.x, o.y, -1)),
+      },
+      // memakai peringatan yang tampil di layar, jadi tugas tidak tuntas oleh kedipan satu pindaian
+      predict: { hold: 0.4, test: () => show.prediction && !!shown && !shown.inPath && shown.cls === 'pedestrian' },
     };
 
     function checkTasks(realDt) {
@@ -455,7 +609,7 @@ export default {
     // ---------- pembaruan panel (dari render, sekitar 8 kali per detik) ----------
     let lastPanel = 0;
     function confHtml(p) {
-      const w = Math.round(Math.max(0, Math.min(1, p)) * 100);
+      const w = Math.round(clamp(p, 0, 1) * 100);
       const t = Math.round(threshold * 100);
       return `<span class="conf"><span class="conf-bar" aria-hidden="true"><i style="width: ${w}%"></i><b style="left: ${t}%"></b></span>${pct(p)}</span>`;
     }
@@ -464,6 +618,7 @@ export default {
       if (realDt === 0) {
         items = perceived();
         conflict = computeConflict();
+        updateWarning();
       }
       // alur persepsi
       const rawOn = SENSOR_KEYS.some((k) => show[k]);
@@ -528,18 +683,19 @@ export default {
     }
 
     function conflictText() {
-      if (!conflict) return '';
-      const who = SUBJECT[conflict.cls] || SUBJECT.unknown;
-      return conflict.inPath ? `${who} sedang berada di jalurmu` : `${who} diprediksi masuk jalurmu dalam ${fmt(conflict.tau, 1, 'detik')}`;
+      if (!shown) return '';
+      const who = SUBJECT[shown.cls] || SUBJECT.unknown;
+      return shown.inPath ? `${who} sedang berada di jalurmu` : `${who} diprediksi masuk jalurmu dalam ${fmt(shown.tau, 1, 'detik')}`;
     }
 
     // ---------- baris status ----------
     function updateStatus(nRep, nFilt) {
       const parts = [];
       const text = conflictText();
+      if (now() < lapNoticeUntil) parts.push('Putaran baru: mobil mulai lagi dari ujung barat Jalan Karangampel Timur');
       if (text) parts.push(text);
       if (scene.state.yielding) parts.push('Mobil melambat untuk memberi jalan pejalan kaki');
-      else if (!text) parts.push(`Mobil melaju ${fmt(msToKmh(scene.ego.speed), 0, 'km/jam')}`);
+      else if (!text) parts.push(`Mobil melaju ${fmt(msToKmh(scene.ego.speed), 0, 'km/jam')} di Jalan Karangampel Timur`);
       const L = perc.last;
       if (show.fusion) {
         parts.push(`Fusi melaporkan ${nRep} objek${nFilt ? `, ${nFilt} di bawah ambang ${pct(threshold)}` : ''}`);
@@ -556,11 +712,26 @@ export default {
     }
 
     // ---------- menggambar ----------
-    function render() {
+    function followCamera() {
       view.fit(bounds); // kamera mengikuti mobil otonom
+      // bulatkan pusat kamera ke piksel layar supaya peta (dari cache) dan lapisan di atasnya bergerak serempak
+      const k = view.camera.scale * view.dpr;
+      if (k > 0) {
+        view.camera.x = Math.round(view.camera.x * k) / k;
+        view.camera.y = Math.round(view.camera.y * k) / k;
+      }
+    }
+
+    function render() {
+      followCamera();
       items = perceived();
       conflict = computeConflict();
-      const g = view.begin(COLORS.sidewalk);
+      updateWarning();
+      const g = view.begin(COLORS.ground);
+      baseMap.draw(g, view, { attribution: false });
+      street.drawBase(g, view);
+      topMap.draw(g, view, { attribution: false });
+      street.drawProps(g, view);
       scene.draw(g, { view, underlay: show.prediction ? drawCorridor : null });
       addConflictLabel();
       drawRaw(g);
@@ -568,19 +739,17 @@ export default {
       drawPrediction(g);
       labels.draw(g, view);
       drawScaleBar(g, view);
+      baseMap.drawAttribution(g, view);
       updateBanner();
 
-      const now = performance.now();
-      if (now - lastPanel > 120) {
-        refreshPanels(lastPanel ? Math.min(0.5, (now - lastPanel) / 1000) : 0.001);
-        lastPanel = now;
+      const t = performance.now();
+      if (t - lastPanel > 120) {
+        refreshPanels(lastPanel ? Math.min(0.5, (t - lastPanel) / 1000) : 0.001);
+        lastPanel = t;
       }
     }
 
-    function mountPose(forward) {
-      const e = scene.ego;
-      return { x: e.x + Math.cos(e.heading) * forward, y: e.y + Math.sin(e.heading) * forward, heading: e.heading };
-    }
+    const mountPose = (forward) => sensorPose(scene.ego, forward);
 
     function drawEllipse(g, x, y, cov, color, { alpha = 1, fill = 0.08, stroke = 0.6, width = 1, dash = null } = {}) {
       const e = ellipseOf(cov);
@@ -623,81 +792,103 @@ export default {
     // Sisi label: 1 = di bawah objek, -1 = di atasnya. Label menjauhi tengah jalan supaya mobilmu
     // dan lajurnya tidak tertutup. Objek yang bergerak melintang (misalnya menyeberang) diberi
     // label di sisi belakang geraknya supaya panah dan garis prediksinya tetap terlihat.
+    function sideOfRoad(x, y) {
+      const f = frenetOf(x, y);
+      if (!f) return 1;
+      // di dekat mobilmu, label menjauh dari mobilmu supaya mobilmu tidak tertutup
+      const ref = Math.abs(f.s - egoS()) < 9 ? scene.ego.d : 0;
+      return f.d > ref ? -1 : 1;
+    }
     function labelSide(o) {
       if (show.tracking && canPredict(o)) {
         const vx = o.track.x[2];
         const vy = o.track.x[3];
-        if (Math.abs(vy) > Math.abs(vx)) return vy < 0 ? 1 : -1;
+        const f = frenetOf(o.x, o.y);
+        const nearEgo = f && Math.abs(f.s - egoS()) < 9;
+        if (!nearEgo && Math.abs(vy) > Math.abs(vx)) return vy < 0 ? 1 : -1;
       }
-      return o.y > 0 ? 1 : -1;
+      return sideOfRoad(o.x, o.y);
     }
 
     function drawCorridor(g) {
       const c = corridor();
-      g.save();
-      g.fillStyle = withAlpha(COLORS.accent, conflict ? 0.16 : 0.1);
-      g.fillRect(c.x0, c.y - c.half, c.x1 - c.x0, c.half * 2);
-      g.restore();
+      const left = [];
+      const right = [];
+      for (let s = c.s0; s <= c.s1 + 1e-6; s += 1) {
+        left.push(street.pose(s, c.d + c.half));
+        right.push(street.pose(s, c.d - c.half));
+      }
+      g.fillStyle = withAlpha(COLORS.accent, shown ? 0.16 : 0.1);
+      polygonPath(g, [...left, ...right.slice().reverse()]);
+      g.fill();
       const edge = { color: withAlpha(COLORS.accent, 0.75), width: 1.5, view, dash: [7, 5] };
-      drawLine(g, [{ x: c.x0, y: c.y - c.half }, { x: c.x1, y: c.y - c.half }], edge);
-      drawLine(g, [{ x: c.x0, y: c.y + c.half }, { x: c.x1, y: c.y + c.half }], edge);
+      drawLine(g, left, edge);
+      drawLine(g, right, edge);
     }
 
     function drawRaw(g) {
-      const L = perc.last;
+      const t = now();
       const a = show.fusion ? 0.4 : 1;
       const labelRaw = !show.fusion;
       if (show.radar) {
         const p = mountPose(RADAR.forward);
-        drawSensorCone(g, p, p.heading, RADAR.fov, RADAR.range, COLORS.radar, { view, fillAlpha: 0.06, strokeAlpha: 0.35 });
+        drawSensorCone(g, p, p.heading, RADAR.fov, RADAR.range, COLORS.radar, { view, fillAlpha: 0.05, strokeAlpha: 0.3 });
       }
       if (show.kamera) {
         const p = mountPose(CAMERA.forward);
-        drawSensorCone(g, p, p.heading, CAMERA.fov, CAMERA.range, COLORS.kamera, { view, fillAlpha: 0.04, strokeAlpha: 0.3 });
+        drawSensorCone(g, p, p.heading, CAMERA.fov, CAMERA.range, COLORS.kamera, { view, fillAlpha: 0.035, strokeAlpha: 0.26 });
       }
       if (show.lidar) {
+        // LiDAR tenang: cakupan diam, sapuan lembut yang pelan, titik yang memudar (tanpa garis sinar)
         const p = mountPose(LIDAR.forward);
-        drawRing(g, p.x, p.y, LIDAR.range, { color: withAlpha(COLORS.lidar, 0.4), width: 1, view, dash: [4, 6] });
-        const bg = [];
-        const rel = [];
-        for (const pt of L.lidar.points) (pt.rel ? rel : bg).push(pt);
-        drawPointCloud(g, bg, COLORS.lidar, { view, size: 2, alpha: 0.55 * a });
-        drawPointCloud(g, rel, COLORS.lidar, { view, size: 2.8, alpha: a });
-        for (const d of L.lidar.dets) {
-          if (!d.box) continue;
+        drawLidarRange(g, p, LIDAR.range, COLORS.lidar, { view, alpha: 0.035, edgeAlpha: 0.22 });
+        if (!ctx.reducedMotion) drawLidarSweep(g, p, lidarSweepAngle(t, { period: SWEEP_PERIOD }), LIDAR.range, COLORS.lidar, { alpha: 0.08, width: 0.8 });
+        trailBg.draw(g, t, COLORS.lidar, { view, size: 2, alpha: 0.55 * a, halo: 0.4, spacing: 1.8 });
+        cloudObj.draw(g, t, (gg, pts, k) => drawSoftPoints(gg, pts, COLORS.lidar, { view, size: 2.6, alpha: 0.9 * a * k, halo: 0.5 * k }));
+        for (const it of smLid.items(t)) {
+          const b = it.box;
+          if (!b) continue;
           const pad = 0.3;
           g.save();
-          g.globalAlpha *= 0.8 * a;
+          g.globalAlpha *= 0.75 * a * it.alpha;
           g.strokeStyle = COLORS.lidar;
           g.lineWidth = view.px(1.2);
           g.setLineDash([view.px(3), view.px(3)]);
-          g.strokeRect(d.box.minX - pad, d.box.minY - pad, d.box.maxX - d.box.minX + 2 * pad, d.box.maxY - d.box.minY + 2 * pad);
+          g.strokeRect(b.minX - pad, b.minY - pad, b.maxX - b.minX + 2 * pad, b.maxY - b.minY + 2 * pad);
           g.restore();
         }
       }
       if (show.kamera) {
-        for (const d of L.camera.dets) {
-          drawEllipse(g, d.x, d.y, d.cov, COLORS.kamera, { alpha: a });
-          const size = { length: d.cls === 'car' ? 4.5 : d.cls === 'cyclist' ? 1.8 : 0.8, width: d.cls === 'car' ? 1.8 : d.cls === 'cyclist' ? 0.7 : 0.8 };
-          drawBracketBox(g, boxOf(d, size), COLORS.kamera, { view, pad: 0.3, width: 1.8, alpha: a });
+        for (const it of smCam.items(t)) {
+          const d = it.det;
+          const aa = a * it.alpha;
+          drawEllipse(g, it.x, it.y, d.cov, COLORS.kamera, { alpha: aa });
+          const size = CLASS_SIZE[d.cls === 'cyclist' ? 'motor' : d.cls] || CLASS_SIZE.pedestrian;
+          drawBracketBox(g, boxOf({ x: it.x, y: it.y, heading: d.heading }, size), COLORS.kamera, { view, pad: 0.3, width: 1.8, alpha: aa });
           // label kamera menjauhi tengah jalan, label radar ke arah sebaliknya
-          const side = d.y > 0 ? 1 : -1;
-          if (labelRaw && onScreen(d.x, d.y)) labels.add(d.x, d.y, `${CLASS_NAMES[d.cls]} ${pct(d.conf)}`, { color: COLORS.kamera, dy: side * (halfPx(size, d.heading) + 10), size: 10.5 });
+          const side = sideOfRoad(it.x, it.y);
+          const conf = Number.isFinite(it.value) ? it.value : d.conf;
+          if (labelRaw && !it.fading && onScreen(it.x, it.y)) labels.add(it.x, it.y, `${CLASS_NAMES[d.cls]} ${pct(conf)}`, { color: COLORS.kamera, dy: side * (halfPx(size, d.heading) + 10), size: 10.5 });
         }
       }
       if (show.radar) {
-        for (const d of L.radar.dets) {
-          drawEllipse(g, d.x, d.y, d.cov, COLORS.radar, { alpha: a });
-          drawDiamond(g, d.x, d.y, COLORS.radar, a);
-          const side = d.y > 0 ? -1 : 1;
-          if (labelRaw && onScreen(d.x, d.y)) labels.add(d.x, d.y, fmtSigned(msToKmh(d.relSpeed), 0, 'km/jam'), { color: COLORS.radar, dy: side * 17, size: 10.5, mono: true });
+        for (const it of smRad.items(t)) {
+          const d = it.det;
+          const aa = a * it.alpha;
+          drawEllipse(g, it.x, it.y, d.cov, COLORS.radar, { alpha: aa });
+          drawDiamond(g, it.x, it.y, COLORS.radar, aa);
+          const side = -sideOfRoad(it.x, it.y);
+          const rel = Number.isFinite(it.value) ? it.value : d.relSpeed;
+          if (labelRaw && !it.fading && onScreen(it.x, it.y)) labels.add(it.x, it.y, fmtSigned(msToKmh(rel), 0, 'km/jam'), { color: COLORS.radar, dy: side * 17, size: 10.5, mono: true });
         }
       }
     }
 
     function drawFusion(g) {
       if (!show.fusion) return;
+      const t = now();
       const rawOn = SENSOR_KEYS.some((k) => show[k]);
+      const smOf = { kamera: smCam, radar: smRad, lidar: smLid };
       for (const o of items) {
         if (!reported(o)) {
           if (o.truth != null && answerKey() && onScreen(o.x, o.y)) {
@@ -711,11 +902,12 @@ export default {
         if (rawOn) {
           for (const m of o.members) {
             if (!show[m.sensor]) continue;
-            drawLine(g, [{ x: m.x, y: m.y }, { x: o.x, y: o.y }], { color: FUSED, width: 1, view, alpha: 0.55 });
+            const mp = smOf[m.sensor].get(m.key, t) || m;
+            drawLine(g, [{ x: mp.x, y: mp.y }, { x: o.x, y: o.y }], { color: FUSED, width: 1, view, alpha: 0.45 });
           }
         }
         if (show.tracking && o.track && o.track.trail.length > 1) {
-          drawLine(g, o.track.trail, { color: FUSED, width: 1.5, view, alpha: 0.3 });
+          drawLine(g, [...o.track.trail, { x: o.x, y: o.y }], { color: FUSED, width: 1.5, view, alpha: 0.3 });
         }
         drawBracketBox(g, boxOf(o), FUSED, { view, pad: 0.35, width: 2.2 });
         if (show.tracking && !show.prediction && canPredict(o)) {
@@ -724,8 +916,10 @@ export default {
         if (!onScreen(o.x, o.y)) continue;
         const hp = halfPx(o.size, o.heading);
         const side = labelSide(o);
-        const text = show.tracking ? `#${o.id} ${CLASS_NAMES[o.cls]}` : `${CLASS_NAMES[o.cls]} ${pct(o.conf)}`;
-        labels.add(o.x, o.y, text, { color: FUSED, dy: side * (hp + 11), size: 11 });
+        const text = show.tracking ? `#${o.id} ${CLASS_NAMES[o.cls]}` : `${CLASS_NAMES[o.cls]} ${pct(o.confShown ?? o.conf)}`;
+        // objek di belakang mobilmu cukup diberi label bila masih ada tempat
+        const behind = (frenetOf(o.x, o.y)?.s ?? Infinity) < egoS() + 1;
+        labels.add(o.x, o.y, text, { color: FUSED, dy: side * (hp + 11), size: 11, optional: behind, priority: behind ? -1 : 0 });
         // tanda kunci jawaban ditumpuk di sisi yang sama, sedikit lebih jauh
         if (o.truth == null && answerKey()) labels.add(o.x, o.y, 'positif palsu', { color: DANGER_TEXT, bg: DANGER_BG, dy: side * (hp + 32), size: 10.5 });
       }
@@ -742,9 +936,9 @@ export default {
       if (!show.prediction) return;
       for (const o of items) {
         if (!reported(o) || !canPredict(o)) continue;
-        const isConflict = conflict && conflict.track === o.track;
+        const isConflict = shown && shown.track === o.track;
         const color = isConflict ? DANGER : PRED;
-        const pts = predictTrack(o.track, HORIZON, 0.25);
+        const pts = predictTrack(o.track, HORIZON, 0.25, o.since || 0);
         // pita ketidakpastian: lebarnya satu simpangan baku ke samping arah gerak, makin jauh makin lebar
         const v = Math.hypot(o.track.x[2], o.track.x[3]) || 1;
         const nx = -o.track.x[3] / v;
@@ -775,16 +969,16 @@ export default {
           if (p.t > 0 && Math.abs(p.t - Math.round(p.t)) < 1e-6) drawRing(g, p.x, p.y, view.px(p.t === HORIZON ? 3.5 : 2.5), { color, width: 1.5, view, fill: color });
         }
       }
-      if (conflict && !conflict.inPath) {
-        drawRing(g, conflict.x, conflict.y, view.px(7), { color: DANGER, width: 2.5, view, fill: withAlpha(DANGER, 0.35) });
+      if (shown && !shown.inPath) {
+        drawRing(g, shown.x, shown.y, view.px(7), { color: DANGER, width: 2.5, view, fill: withAlpha(DANGER, 0.35) });
       }
     }
 
     // Label waktu konflik ditambahkan paling awal supaya lapisan label memberinya tempat persis
     // di kanan titik konflik (di lajur mobilmu, bukan di atas pejalan kakinya).
     function addConflictLabel() {
-      if (!show.prediction || !conflict || conflict.inPath || !onScreen(conflict.x, conflict.y)) return;
-      labels.add(conflict.x, conflict.y, fmt(conflict.tau, 1, 'detik'), { color: DANGER_TEXT, bg: DANGER_BG, dx: 12, dy: 0, align: 'left', size: 11, mono: true });
+      if (!show.prediction || !shown || shown.inPath || !onScreen(shown.x, shown.y)) return;
+      labels.add(shown.x, shown.y, fmt(shown.tau, 1, 'detik'), { color: DANGER_TEXT, bg: DANGER_BG, dx: 12, dy: 0, align: 'left', size: 11, mono: true });
     }
 
     // ---------- antarmuka ke shell ----------
@@ -806,14 +1000,14 @@ export default {
       reset() {
         scene.reset();
         perc.reset();
+        clearVisuals();
         acc = 0;
+        lastLap = scene.state.lap;
+        lapNoticeUntil = -1;
         perc.tick(scene.world());
+        afterScan();
         for (const k of Object.keys(holds)) holds[k] = 0;
         refreshPanels(0);
-      },
-      destroy() {
-        // Kanvas, loop, dan listener dibersihkan otomatis oleh ctx. Banner ada di dalam stage
-        // yang ikut dibuang bersama halaman.
       },
     };
   },

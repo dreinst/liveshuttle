@@ -4,12 +4,14 @@ import { LESSONS } from '../lessons/index.js';
 import { progress } from './progress.js';
 import { icon } from '../engine/icons.js';
 
-export const LOGO_SVG = `<svg class="logo-mark" viewBox="0 0 32 32" width="32" height="32" aria-hidden="true" focusable="false">
+const LOGO_SVG = `<svg class="logo-mark" viewBox="0 0 32 32" width="32" height="32" aria-hidden="true" focusable="false">
   <rect x="1" y="1" width="30" height="30" rx="9" fill="#0d2826" stroke="#2dd4bf" stroke-opacity=".4"/>
-  <path d="M8.5 12.2a10 10 0 0 1 15 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".5"/>
-  <path d="M11.2 15a6 6 0 0 1 9.6 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".9"/>
-  <rect x="12.2" y="16.6" width="7.6" height="11" rx="2.6" fill="#2dd4bf"/>
-  <rect x="13.5" y="18.5" width="5" height="2.4" rx=".8" fill="#042f2e"/>
+  <path d="M8.5 11.6a10 10 0 0 1 15 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".45"/>
+  <path d="M11.2 14.4a6 6 0 0 1 9.6 0" stroke="#2dd4bf" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".85"/>
+  <rect x="10.2" y="16" width="11.6" height="11.6" rx="4" fill="#2dd4bf"/>
+  <rect x="12" y="17.7" width="8" height="2.6" rx="1" fill="#042f2e"/>
+  <rect x="12" y="24" width="8" height="1.9" rx=".8" fill="#042f2e" opacity=".75"/>
+  <circle cx="16" cy="22.1" r="1.15" fill="#042f2e"/>
 </svg>`;
 
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
@@ -28,11 +30,11 @@ function ring(done, total) {
 export function createHeader(root) {
   root.innerHTML = `
     <div class="header-inner">
-      <a class="brand" href="#/" aria-label="SimOtonom, kembali ke beranda">${LOGO_SVG}<span class="brand-name">SimOtonom</span></a>
+      <a class="brand" href="#/" aria-label="LiveShuttle, kembali ke beranda">${LOGO_SVG}<span class="brand-name">LiveShuttle</span></a>
       <div class="header-context" data-el="context"></div>
       <nav class="main-nav" aria-label="Navigasi utama">
         <a class="nav-link" href="#/" data-nav="home">${icon('home')}<span>Beranda</span></a>
-        <a class="nav-link" href="#/simulator/tutorial" data-nav="sim">${icon('cube')}<span>Simulator 3D</span></a>
+        <a class="nav-link" href="#/shuttle-3d/panduan" data-nav="sim">${icon('cube')}<span>Shuttle 3D</span></a>
         <button class="nav-link nav-lessons" type="button" aria-expanded="false" aria-controls="nav-panel" data-nav="lesson">
           ${icon('book')}<span>Pelajaran</span>${icon('chevronDown')}
         </button>
@@ -43,7 +45,7 @@ export function createHeader(root) {
     <div class="nav-panel" id="nav-panel" hidden>
       <div class="nav-panel-links">
         <a class="nav-panel-link" href="#/">${icon('home')}<span>Beranda</span></a>
-        <a class="nav-panel-link" href="#/simulator/tutorial">${icon('cube')}<span>Simulator 3D</span></a>
+        <a class="nav-panel-link" href="#/shuttle-3d/panduan">${icon('cube')}<span>Shuttle 3D</span></a>
       </div>
       <p class="nav-panel-title">Pelajaran</p>
       <ol class="nav-lesson-list" data-el="list"></ol>
@@ -136,11 +138,11 @@ export function createHeader(root) {
         ? `<span class="crumb-num">Pelajaran ${i + 1} dari ${LESSONS.length}</span><span class="crumb-sep" aria-hidden="true">·</span><span class="crumb-title">${esc(l.title)}</span>`
         : '';
     } else if (r.name === 'sim') {
-      contextEl.innerHTML = '<span class="crumb-title">Simulator Kota 3D</span>';
+      contextEl.innerHTML = `<span class="crumb-title">Shuttle 3D Ma Chung</span><span class="crumb-sep" aria-hidden="true">·</span><span class="crumb-num">${r.mode === 'jelajah' ? 'Jelajah' : 'Panduan'}</span>`;
     } else contextEl.innerHTML = '';
     renderProgress();
   }
 
   renderProgress();
-  return { update, close };
+  return { update };
 }

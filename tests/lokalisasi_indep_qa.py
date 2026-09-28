@@ -20,7 +20,7 @@ MOBILE = "--mobile" in sys.argv
 PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8134"
 SKIP_IDLE = "--skip-idle" in sys.argv
 BASE = f"http://127.0.0.1:{PORT}/"
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/lokalisasi-qa/"
+SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/lokalisasi-malang/lama-qa/"
 TAG = "m" if MOBILE else "d"
 os.makedirs(SHOTS, exist_ok=True)
 
@@ -286,7 +286,7 @@ with sync_playwright() as pw:
     stage_shot(page, "s5-peta")
     toggle(page, "Kemudikan")
     page.wait_for_timeout(9000)
-    R["steerMap"] = {"keluar": readout(page, "Keluar lajur"), "ambil": readout(page, "Diambil alih"), "simpangan": readout(page, "Simpangan lajur")}
+    R["steerMap"] = {"keluar": readout(page, "Keluar lajur"), "ambil": readout(page, "Diambil alih"), "simpangan": readout(page, "Jarak ke tengah lajur")}
     stage_shot(page, "s5-kemudi-peta")
     page_shot(page, "s5-peta")
     # matikan estimasi yang dipakai kemudi: kemudi harus ikut mati
@@ -301,7 +301,7 @@ with sync_playwright() as pw:
     R["summary"] = {"stepIndex": h["stepIndex"], "completed": h["completedTasks"],
                     "title": page.locator(".step-title").inner_text()}
     page_shot(page, "ringkasan", full=False)
-    R["progressStored"] = page.evaluate("() => localStorage.getItem('simotonom.progress.v1')")
+    R["progressStored"] = page.evaluate("() => localStorage.getItem('liveshuttle.progress.v1')")
     hops = [0, 4, 2, 5, 1, 3, 0]
     for i in hops:
         go_dot(page, i)

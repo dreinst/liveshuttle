@@ -1,142 +1,42 @@
-// Kota statis: tanah, jalan, marka, trotoar, bangunan, pohon, dan lampu jalan.
-// Geometri statis digabung per material supaya jumlah draw call kecil.
+// Kota statis dari data OSM: tanah, area hijau, trotoar, jalan, persimpangan, bundaran, marka,
+// gedung (rumah beratap limasan, gedung kampus berwarna aksen, masjid dengan kubah), pohon,
+// lampu jalan, label, dan halte. Geometri statis digabung per material (sedikit draw call).
 // Benda yang berulang (pohon, kepala lampu) memakai InstancedMesh.
+// Tanah dibuat datar. Aslinya daerah Ma Chung berbukit (disebutkan di panel Tentang peta).
 import * as THREE from '../vendor/three.bundle.min.js';
-import { GRID, DX, DZ } from './roadgraph.js';
+import { GeoBuf, TiledBuf } from './geobuf.js';
 import { mulberry32 } from './util.js';
+import { halte as halteModel } from './models/index.js';
+
+export const Y = { ground: 0, area: 0.015, walk: 0.035, road: 0.06, mark: 0.075 };
+/** Ukuran petak geometri statis (m). Peta sekitar 1 km x 1 km menjadi 3 x 3 petak. */
+const TILE = 350;
 
 const col = (hex) => new THREE.Color(hex);
 
-/** Penampung geometri gabungan: posisi, normal, warna per titik, dan UV. */
-export class GeoBuf {
-  constructor() {
-    this.pos = [];
-    this.nor = [];
-    this.col = [];
-    this.uv = [];
-    this.idx = [];
-    this.n = 0;
-  }
-  quad(a, b, c, d, nx, ny, nz, color, uvs) {
-    const ux = b[0] - a[0];
-    const uy = b[1] - a[1];
-    const uz = b[2] - a[2];
-    const vx = c[0] - a[0];
-    const vy = c[1] - a[1];
-    const vz = c[2] - a[2];
-    const cx = uy * vz - uz * vy;
-    const cy = uz * vx - ux * vz;
-    const cz = ux * vy - uy * vx;
-    const flip = cx * nx + cy * ny + cz * nz < 0;
-    const base = this.n;
-    for (const p of [a, b, c, d]) {
-      this.pos.push(p[0], p[1], p[2]);
-      this.nor.push(nx, ny, nz);
-      this.col.push(color.r, color.g, color.b);
-    }
-    if (uvs) this.uv.push(...uvs);
-    else this.uv.push(0, 0, 0, 0, 0, 0, 0, 0);
-    if (flip) this.idx.push(base, base + 2, base + 1, base, base + 3, base + 2);
-    else this.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
-    this.n += 4;
-  }
-  /** Segitiga dengan normal (nx, ny, nz). Urutan titik dibalik bila perlu. */
-  tri(a, b, c, nx, ny, nz, color) {
-    const ux = b[0] - a[0];
-    const uy = b[1] - a[1];
-    const uz = b[2] - a[2];
-    const vx = c[0] - a[0];
-    const vy = c[1] - a[1];
-    const vz = c[2] - a[2];
-    const cx = uy * vz - uz * vy;
-    const cy = uz * vx - ux * vz;
-    const cz = ux * vy - uy * vx;
-    const flip = cx * nx + cy * ny + cz * nz < 0;
-    const base = this.n;
-    for (const p of [a, b, c]) {
-      this.pos.push(p[0], p[1], p[2]);
-      this.nor.push(nx, ny, nz);
-      this.col.push(color.r, color.g, color.b);
-      this.uv.push(0, 0);
-    }
-    if (flip) this.idx.push(base, base + 2, base + 1);
-    else this.idx.push(base, base + 1, base + 2);
-    this.n += 3;
-  }
-  /**
-   * Blok trotoar dengan sudut membulat (jari-jari r). Atas berwarna top, sisi (kerb) berwarna side.
-   */
-  roundedBlock(x0, z0, x1, z1, r, y0, y1, top, side) {
-    const pts = [];
-    const seg = 6;
-    const corners = [
-      [x1 - r, z1 - r, 0],
-      [x0 + r, z1 - r, Math.PI / 2],
-      [x0 + r, z0 + r, Math.PI],
-      [x1 - r, z0 + r, (Math.PI * 3) / 2],
-    ];
-    for (const [cx, cz, a0] of corners) {
-      for (let i = 0; i <= seg; i++) {
-        const a = a0 + (i / seg) * (Math.PI / 2);
-        pts.push([cx + Math.cos(a) * r, cz + Math.sin(a) * r]);
-      }
-    }
-    const mx = (x0 + x1) / 2;
-    const mz = (z0 + z1) / 2;
-    const n = pts.length;
-    for (let i = 0; i < n; i++) {
-      const [ax, az] = pts[i];
-      const [bx, bz] = pts[(i + 1) % n];
-      this.tri([mx, y1, mz], [ax, y1, az], [bx, y1, bz], 0, 1, 0, top);
-      let nx = bz - az;
-      let nz = -(bx - ax);
-      const l = Math.hypot(nx, nz) || 1;
-      nx /= l;
-      nz /= l;
-      // normal harus menghadap keluar dari pusat blok
-      if (nx * (ax - mx) + nz * (az - mz) < 0) {
-        nx = -nx;
-        nz = -nz;
-      }
-      if (Math.hypot(bx - ax, bz - az) > 1e-4) this.quad([ax, y0, az], [bx, y0, bz], [bx, y1, bz], [ax, y1, az], nx, 0, nz, side);
-    }
-  }
-  /** Persegi datar menghadap ke atas. */
-  flat(x0, z0, x1, z1, y, color) {
-    this.quad([x0, y, z0], [x0, y, z1], [x1, y, z1], [x1, y, z0], 0, 1, 0, color);
-  }
-  /** Kotak sejajar sumbu. opts.side = warna sisi, opts.bottom = buat alas. */
-  box(x0, y0, z0, x1, y1, z1, color, opts = {}) {
-    const side = opts.side || color;
-    if (opts.top !== false) this.quad([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0], 0, 1, 0, color);
-    this.quad([x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1], 1, 0, 0, side);
-    this.quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0], -1, 0, 0, side);
-    this.quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], 0, 0, 1, side);
-    this.quad([x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0], 0, 0, -1, side);
-    if (opts.bottom) this.quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], 0, -1, 0, side);
-  }
-  /** Dinding vertikal dari (xa,za) ke (xb,zb) dengan UV untuk tekstur jendela. */
-  wall(xa, za, xb, zb, y0, y1, nx, nz, color, u0, v0) {
-    const len = Math.hypot(xb - xa, zb - za);
-    const u1 = u0 + len / 32;
-    const v1 = v0 + (y1 - y0) / 28;
-    this.quad([xa, y0, za], [xb, y0, zb], [xb, y1, zb], [xa, y1, za], nx, 0, nz, color, [u0, v0, u1, v0, u1, v1, u0, v1]);
-  }
-  build() {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));
-    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.nor, 3));
-    g.setAttribute('color', new THREE.Float32BufferAttribute(this.col, 3));
-    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
-    g.setIndex(this.n > 65000 ? new THREE.Uint32BufferAttribute(this.idx, 1) : new THREE.Uint16BufferAttribute(this.idx, 1));
-    g.computeBoundingSphere();
-    return g;
-  }
-}
+const AREA_COL = {
+  grass: '#bddb93',
+  park: '#a9d487',
+  garden: '#b3da8e',
+  wood: '#93c67d',
+  scrub: '#a8cf8a',
+  orchard: '#b7d88c',
+  farmland: '#e4e0b0',
+  pitch: '#9fd08a',
+  water: '#94c8ea',
+  cemetery: '#c6d8a8',
+  campus: '#efe6d6',
+};
+const HOUSE_WALL = ['#f5e6cc', '#f3d6c6', '#e2ecda', '#dae8f1', '#efe2ef', '#f7edc9', '#eadfcc', '#f3dbb8'];
+const HOUSE_ROOF = ['#c9694b', '#b95d45', '#d47b58', '#aa5540', '#c26f55'];
+// warna aksen gedung kampus (hijau toska lembut, serasi dengan LiveShuttle), beda jelas dari atap rumah
+const CAMPUS_WALL = '#9ed8cd';
+const CAMPUS_ROOF = '#c4ebe3';
+const CAMPUS_TRIM = '#4fae9f';
 
 function windowTextures(res) {
   const size = 256;
-  const cells = 8;
+  const cells = 4;
   const cs = size / cells;
   const c1 = document.createElement('canvas');
   const c2 = document.createElement('canvas');
@@ -150,18 +50,19 @@ function windowTextures(res) {
   const rng = mulberry32(77);
   for (let j = 0; j < cells; j++) {
     for (let i = 0; i < cells; i++) {
-      const x = i * cs + cs * 0.18;
-      const y = j * cs + cs * 0.2;
-      const w = cs * 0.64;
-      const h = cs * 0.55;
-      g1.fillStyle = '#56647d';
+      const x = i * cs + cs * 0.3;
+      const y = j * cs + cs * 0.28;
+      const w = cs * 0.4;
+      const h = cs * 0.42;
+      g1.fillStyle = '#c7d2d8';
+      g1.fillRect(x - 3, y - 3, w + 6, h + 6);
+      g1.fillStyle = '#7f95a3';
       g1.fillRect(x, y, w, h);
-      g1.fillStyle = '#7d8aa3';
-      g1.fillRect(x, y, w, 2);
-      if (rng() < 0.45) {
-        const warm = rng() < 0.78;
-        const b = 0.55 + rng() * 0.45;
-        g2.fillStyle = warm ? `rgba(255,196,120,${b})` : `rgba(185,215,255,${b})`;
+      g1.fillStyle = '#a9bcc7';
+      g1.fillRect(x, y, w, 4);
+      if (rng() < 0.55) {
+        const b = 0.6 + rng() * 0.4;
+        g2.fillStyle = `rgba(255,${190 + Math.floor(rng() * 30)},120,${b})`;
         g2.fillRect(x, y, w, h);
       }
     }
@@ -176,328 +77,620 @@ function windowTextures(res) {
   return { map, emi };
 }
 
-/**
- * Membangun kota statis. Mengembalikan data jejak (footprint) sederhana untuk
- * sinar LiDAR dan tabrakan, serta material yang diubah oleh cuaca.
- */
-export function buildWorld(scene, res, graph) {
-  const { S, HALF, SIDE, CONN, CROSS, CROSS_W, CURB_R } = GRID;
+function labelTexture(res, text, opts) {
+  const c = document.createElement('canvas');
+  const g = c.getContext('2d');
+  const font = opts.font;
+  g.font = font;
+  const w = Math.ceil(g.measureText(text).width) + opts.pad * 2;
+  c.width = Math.min(2048, w);
+  c.height = opts.h;
+  g.font = font;
+  g.textBaseline = 'middle';
+  if (opts.bg) {
+    g.fillStyle = opts.bg;
+    const r = opts.h / 2;
+    g.beginPath();
+    g.moveTo(r, 0);
+    g.lineTo(c.width - r, 0);
+    g.arc(c.width - r, r, r, -Math.PI / 2, Math.PI / 2);
+    g.lineTo(r, opts.h);
+    g.arc(r, r, r, Math.PI / 2, (Math.PI * 3) / 2);
+    g.fill();
+  }
+  if (opts.stroke) {
+    g.lineWidth = opts.strokeW;
+    g.strokeStyle = opts.stroke;
+    g.lineJoin = 'round';
+    g.strokeText(text, opts.pad, opts.h / 2 + 2);
+  }
+  g.fillStyle = opts.color;
+  g.fillText(text, opts.pad, opts.h / 2 + 2);
+  const tex = res.add(new THREE.CanvasTexture(c));
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 8;
+  return { tex, aspect: c.width / c.height };
+}
+
+export function buildWorld(app) {
+  const { scene, res, city } = app;
+  const data = city.data;
   const rng = mulberry32(20260928);
-  const nodes = graph.nodes;
-  const minC = nodes[0].x;
-  const maxC = nodes[nodes.length - 1].x;
-  const out = { buildings: [], trees: [], poles: [], mats: {}, lamps: [], bounds: { min: minC - HALF - SIDE, max: maxC + HALF + SIDE } };
-  const group = new THREE.Group();
+  const out = { mats: {}, poles: [], group: new THREE.Group(), labels: [] };
+  const group = out.group;
   group.name = 'kota';
   scene.add(group);
+  const b = city.bounds;
+  const cx = (b.minX + b.maxX) / 2;
+  const cz = (b.minZ + b.maxZ) / 2;
 
-  // Tanah
-  const groundGeo = res.add(new THREE.PlaneGeometry(1600, 1600));
+  // ===== tanah =====
+  const groundGeo = res.add(new THREE.PlaneGeometry(b.maxX - b.minX + 1600, b.maxZ - b.minZ + 1600));
   groundGeo.rotateX(-Math.PI / 2);
-  const groundMat = res.add(new THREE.MeshLambertMaterial({ color: '#2a4636' }));
+  const groundMat = res.add(new THREE.MeshLambertMaterial({ color: '#dadcc2' }));
   const ground = new THREE.Mesh(groundGeo, groundMat);
-  ground.position.y = -0.04;
+  ground.position.set(cx, Y.ground, cz);
   ground.receiveShadow = true;
   group.add(ground);
   out.mats.ground = groundMat;
 
-  // Aspal: satu persegi per ruas, diperpanjang menutup kotak persimpangan.
-  const road = new GeoBuf();
-  const white = col('#ffffff');
-  for (const r of graph.roads) {
-    const a = r.a;
-    const b = r.b;
-    if (r.k === 0) road.flat(a.x - HALF, a.z - HALF, b.x + HALF, a.z + HALF, 0, white);
-    else road.flat(a.x - HALF, a.z - HALF, a.x + HALF, b.z + HALF, 0, white);
+  // ===== area hijau dan halaman kampus =====
+  // geometri statis dibagi ke petak 350 m supaya petak di luar pandangan tidak digambar
+  const tiled = () => new TiledBuf(TILE, b.minX, b.minZ);
+  const addTiles = (buf, mat, opts = {}) => {
+    for (const g of buf.build()) {
+      const m = new THREE.Mesh(res.add(g), mat);
+      m.receiveShadow = opts.receive !== false;
+      m.castShadow = !!opts.cast;
+      group.add(m);
+    }
+  };
+  // Area yang saling tumpang tindih (hutan di atas rumput, dan sebagainya) digambar dalam SATU mesh,
+  // berurutan dari bawah ke atas, tanpa menulis kedalaman dan sesudah benda lain (renderOrder 1).
+  // Jadi urutan gambar yang menentukan mana yang tampak, tanpa kedip z-fighting dari jauh.
+  const areas = new GeoBuf();
+  const order = ['campus', 'farmland', 'grass', 'cemetery', 'park', 'garden', 'pitch', 'scrub', 'orchard', 'wood', 'water'];
+  const sorted = data.areas.slice().sort((a, c) => order.indexOf(a.k) - order.indexOf(c.k));
+  sorted.forEach((a) => areas.flatPoly(a.p, Y.area, col(AREA_COL[a.k] || '#c9d9b0')));
+  const areaMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4 }));
+  const areaMesh = new THREE.Mesh(res.add(areas.build()), areaMat);
+  areaMesh.receiveShadow = true;
+  areaMesh.renderOrder = 1;
+  group.add(areaMesh);
+  out.mats.area = areaMat;
+
+  // ===== trotoar =====
+  const walk = tiled();
+  const walkCol = col('#ebe5d8');
+  const midOf = (pts) => pts[Math.floor(pts.length / 2)];
+  for (const e of data.walks.edges) {
+    if (e.k !== 'w') continue;
+    const m = midOf(e.p);
+    walk.at(m[0], m[1]).ribbon(e.p, 1.8, Y.walk, walkCol);
   }
-  // Aspal di bawah lengkung kerb tiap sudut blok (bagian sudut yang tidak tertutup trotoar).
-  for (let bj = 0; bj < GRID.N - 1; bj++) {
-    for (let bi = 0; bi < GRID.N - 1; bi++) {
-      const x0 = minC + bi * S + HALF;
-      const x1 = minC + (bi + 1) * S - HALF;
-      const z0 = minC + bj * S + HALF;
-      const z1 = minC + (bj + 1) * S - HALF;
-      road.flat(x0, z0, x0 + CURB_R, z0 + CURB_R, 0, white);
-      road.flat(x1 - CURB_R, z0, x1, z0 + CURB_R, 0, white);
-      road.flat(x0, z1 - CURB_R, x0 + CURB_R, z1, 0, white);
-      road.flat(x1 - CURB_R, z1 - CURB_R, x1, z1, 0, white);
+  // potongan trotoar hiasan (terlalu dekat jalur belok untuk dilalui, atau garis trotoar asli di
+  // sudut yang jalurnya digeser); bagian yang menimpa aspal tertutup aspal karena aspal digambar di atas
+  for (const pl of data.walks.deco || []) {
+    if (pl.length < 2) continue;
+    const m = midOf(pl);
+    walk.at(m[0], m[1]).ribbon(pl, 1.8, Y.walk, walkCol);
+  }
+  const walkMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  addTiles(walk, walkMat);
+  out.mats.walk = walkMat;
+
+  // ===== aspal: ruas, persimpangan, bundaran =====
+  const road = tiled();
+  const asphalt = col('#ffffff');
+  const trimmed = (r) => {
+    const pts = r.p;
+    // potong t0 dari awal dan t1 dari akhir polyline
+    const L = [];
+    let acc = 0;
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++) {
+      acc += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+      cum.push(acc);
+    }
+    const s0 = r.route && r.ja !== 'batas' ? Math.max(0, r.t0 - 0.05) : 0;
+    const s1 = r.route && r.jb !== 'batas' ? acc - Math.max(0, r.t1 - 0.05) : acc;
+    if (s1 - s0 < 0.2) return null;
+    const at = (s) => {
+      for (let i = 1; i < pts.length; i++) {
+        if (cum[i] >= s) {
+          const t = (s - cum[i - 1]) / (cum[i] - cum[i - 1] || 1);
+          return [pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * t, pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * t];
+        }
+      }
+      return pts[pts.length - 1];
+    };
+    L.push(at(s0));
+    for (let i = 1; i < pts.length - 1; i++) if (cum[i] > s0 && cum[i] < s1) L.push(pts[i]);
+    L.push(at(s1));
+    return L;
+  };
+  const roadPaths = new Map();
+  for (const r of data.roads) {
+    const pts = r.route ? trimmed(r) : r.p;
+    if (!pts || pts.length < 2) continue;
+    roadPaths.set(r.id, pts);
+    const m = midOf(pts);
+    road.at(m[0], m[1]).ribbon(pts, r.half * 2, Y.road, asphalt);
+  }
+  for (const j of data.junctions) if (j.poly.length >= 3) road.at(j.x, j.z).flatPoly(j.poly, Y.road, asphalt);
+  // aspal tambahan di jejak sapuan kendaraan (tikungan tajam, putar balik di ujung buntu)
+  for (const link of city.links) {
+    const sp = city.sweptPath(link);
+    if (!sp) continue;
+    // tiap sisi digambar terpisah: pusat ke tepi kiri, pusat ke tepi kanan
+    const n = sp.x.length;
+    const L = [];
+    const R = [];
+    const C = [];
+    for (let i = 0; i < n; i++) {
+      const nx = -Math.sin(sp.h[i]);
+      const nz = Math.cos(sp.h[i]);
+      C.push([sp.x[i], Y.road, sp.z[i]]);
+      L.push([sp.x[i] - nx * sp.left[i], Y.road, sp.z[i] - nz * sp.left[i]]);
+      R.push([sp.x[i] + nx * sp.right[i], Y.road, sp.z[i] + nz * sp.right[i]]);
+    }
+    // hanya bagian yang belum tertutup aspal lain (hemat segitiga)
+    const cov = (p) => city.onBaseRoad(p[0], p[2]);
+    for (let i = 0; i < n - 1; i++) {
+      const rb = road.at(C[i][0], C[i][2]);
+      if (!(cov(L[i]) && cov(L[i + 1]))) rb.quad(L[i], L[i + 1], C[i + 1], C[i], 0, 1, 0, asphalt);
+      if (!(cov(R[i]) && cov(R[i + 1]))) rb.quad(C[i], C[i + 1], R[i + 1], R[i], 0, 1, 0, asphalt);
     }
   }
-  const roadMat = res.add(new THREE.MeshStandardMaterial({ color: '#3a414f', roughness: 0.92, metalness: 0 }));
-  const roadMesh = new THREE.Mesh(res.add(road.build()), roadMat);
-  roadMesh.receiveShadow = true;
-  group.add(roadMesh);
+  for (const rb of data.roundabouts) {
+    const ro = rb.r + rb.w / 2;
+    const ri = rb.r - rb.w / 2;
+    const n = 64;
+    for (let k = 0; k < n; k++) {
+      const a0 = (k / n) * Math.PI * 2;
+      const a1 = ((k + 1) / n) * Math.PI * 2;
+      road.at(rb.x, rb.z).quad([rb.x + Math.cos(a0) * ri, Y.road, rb.z + Math.sin(a0) * ri], [rb.x + Math.cos(a0) * ro, Y.road, rb.z + Math.sin(a0) * ro], [rb.x + Math.cos(a1) * ro, Y.road, rb.z + Math.sin(a1) * ro], [rb.x + Math.cos(a1) * ri, Y.road, rb.z + Math.sin(a1) * ri], 0, 1, 0, asphalt);
+    }
+  }
+  const roadMat = res.add(new THREE.MeshStandardMaterial({ color: '#80868f', roughness: 0.92, metalness: 0, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }));
+  addTiles(road, roadMat);
   out.mats.road = roadMat;
 
-  // Trotoar dan kavling blok
-  const pave = new GeoBuf();
-  const walkTop = col('#6f7784');
-  const curb = col('#a3aab5');
-  const grass = col('#335a40');
-  const plaza = col('#465264');
-  const parks = new Set(['1,2', '3,0']);
-  const blockTypes = [];
-  for (let bj = 0; bj < GRID.N - 1; bj++) {
-    for (let bi = 0; bi < GRID.N - 1; bi++) {
-      const x0 = minC + bi * S + HALF;
-      const x1 = minC + (bi + 1) * S - HALF;
-      const z0 = minC + bj * S + HALF;
-      const z1 = minC + (bj + 1) * S - HALF;
-      pave.roundedBlock(x0, z0, x1, z1, CURB_R, -0.04, 0.15, walkTop, curb);
-      const park = parks.has(`${bi},${bj}`);
-      pave.flat(x0 + SIDE, z0 + SIDE, x1 - SIDE, z1 - SIDE, 0.17, park ? grass : plaza);
-      blockTypes.push({ bi, bj, x0: x0 + SIDE, x1: x1 - SIDE, z0: z0 + SIDE, z1: z1 - SIDE, park });
+  // pulau tengah bundaran (rumput dengan tepi terang)
+  const island = new GeoBuf();
+  for (const rb of data.roundabouts) {
+    const ri = rb.r - rb.w / 2 - 0.15;
+    const pts = [];
+    for (let k = 0; k < 40; k++) pts.push([rb.x + Math.cos((k / 40) * Math.PI * 2) * ri, rb.z + Math.sin((k / 40) * Math.PI * 2) * ri]);
+    island.flatPoly(pts.slice().reverse(), 0.16, col('#a4d183'));
+    for (let k = 0; k < 40; k++) {
+      const a0 = (k / 40) * Math.PI * 2;
+      const a1 = ((k + 1) / 40) * Math.PI * 2;
+      const p0 = [rb.x + Math.cos(a0) * ri, rb.z + Math.sin(a0) * ri];
+      const p1 = [rb.x + Math.cos(a1) * ri, rb.z + Math.sin(a1) * ri];
+      island.quad([p0[0], Y.road, p0[1]], [p1[0], Y.road, p1[1]], [p1[0], 0.16, p1[1]], [p0[0], 0.16, p0[1]], Math.cos((a0 + a1) / 2), 0, Math.sin((a0 + a1) / 2), col('#ece8df'));
     }
   }
-  // Trotoar luar di sekeliling kota
-  const o0 = minC - HALF - SIDE;
-  const o1 = maxC + HALF + SIDE;
-  pave.box(o0, -0.04, o0, o1, 0.15, o0 + SIDE, walkTop, { side: curb });
-  pave.box(o0, -0.04, o1 - SIDE, o1, 0.15, o1, walkTop, { side: curb });
-  pave.box(o0, -0.04, o0 + SIDE, o0 + SIDE, 0.15, o1 - SIDE, walkTop, { side: curb });
-  pave.box(o1 - SIDE, -0.04, o0 + SIDE, o1, 0.15, o1 - SIDE, walkTop, { side: curb });
-  const paveMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true }));
-  const paveMesh = new THREE.Mesh(res.add(pave.build()), paveMat);
-  paveMesh.receiveShadow = true;
-  group.add(paveMesh);
+  if (!island.empty) {
+    const islandMesh = new THREE.Mesh(res.add(island.build()), res.add(new THREE.MeshLambertMaterial({ vertexColors: true })));
+    islandMesh.receiveShadow = true;
+    group.add(islandMesh);
+  }
 
-  // Marka jalan
-  const mk = new GeoBuf();
-  const yellow = col('#f5c518');
-  const mw = col('#e5e7eb');
-  const y = 0.02;
-  const rect = (x0, z0, x1, z1, c) => mk.flat(Math.min(x0, x1), Math.min(z0, z1), Math.max(x0, x1), Math.max(z0, z1), y, c);
-  // Sumbu u sepanjang jalan, w melintang. Fungsi ini memetakan (u,w) ke (x,z).
-  for (const r of graph.roads) {
-    const a = r.a;
-    const horiz = r.k === 0;
-    const P = (u, w) => (horiz ? [a.x + u, a.z + w] : [a.x + w, a.z + u]);
-    const R = (u0, w0, u1, w1, c) => {
-      const p0 = P(u0, w0);
-      const p1 = P(u1, w1);
-      rect(p0[0], p0[1], p1[0], p1[1], c);
+  // ===== marka =====
+  const mk = tiled();
+  const white = col('#fbfbf6');
+  const kerb = col('#e2dccf');
+  const dashAlong = (pts, off, dash, gap, w, color, skip0 = 1.5, skip1 = 1.5) => {
+    // garis putus-putus di sepanjang polyline dengan geser lateral off
+    let acc = 0;
+    const segs = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const L = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+      segs.push([acc, L]);
+      acc += L;
+    }
+    const total = acc;
+    const at = (s) => {
+      for (let i = 0; i < segs.length; i++) {
+        const [a, L] = segs[i];
+        if (s <= a + L || i === segs.length - 1) {
+          const t = Math.max(0, Math.min(1, (s - a) / (L || 1)));
+          const x = pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t;
+          const z = pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t;
+          const h = Math.atan2(pts[i + 1][1] - pts[i][1], pts[i + 1][0] - pts[i][0]);
+          return [x + Math.sin(h) * off, z - Math.cos(h) * off, h];
+        }
+      }
+      return [pts[0][0], pts[0][1], 0];
     };
-    const uA = CONN;
-    const uB = S - CONN;
-    // Garis tengah ganda kuning
-    R(uA, -0.22, uB, -0.1, yellow);
-    R(uA, 0.1, uB, 0.22, yellow);
-    // Garis tepi
-    R(uA, -6.85, uB, -6.7, mw);
-    R(uA, 6.7, uB, 6.85, mw);
-    // Garis putus-putus pemisah lajur searah
-    for (let u = uA + 3; u < uB - 3; u += 8) {
-      const e = Math.min(u + 3, uB - 2);
-      R(u, -3.56, e, -3.44, mw);
-      R(u, 3.44, e, 3.56, mw);
+    for (let s = skip0; s + dash <= total - skip1; s += dash + gap) {
+      const [x, z, h] = at(s + dash / 2);
+      mk.at(x, z).rect(x, z, h, dash, w, Y.mark, color);
+    }
+  };
+  const solidAlong = (pts, off, w, color) => {
+    const shifted = pts.map((p, i) => {
+      const a = pts[Math.max(0, i - 1)];
+      const c = pts[Math.min(pts.length - 1, i + 1)];
+      const h = Math.atan2(c[1] - a[1], c[0] - a[0]);
+      return [p[0] + Math.sin(h) * off, p[1] - Math.cos(h) * off];
+    });
+    const m = midOf(shifted);
+    mk.at(m[0], m[1]).ribbon(shifted, w, Y.mark, color);
+  };
+  for (const r of data.roads) {
+    const pts = roadPaths.get(r.id);
+    if (!pts) continue;
+    let L = 0;
+    for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    // tepi aspal terang supaya batas jalan dan trotoar terbaca
+    solidAlong(pts, r.half - 0.09, 0.18, kerb);
+    solidAlong(pts, -(r.half - 0.09), 0.18, kerb);
+    if (!r.route || L < 6) continue;
+    if (!r.ow) dashAlong(pts, 0, r.cls === 'tertiary' ? 3 : 2.5, r.cls === 'tertiary' ? 4 : 4.5, 0.12, white);
+    else if (r.nf === 2) dashAlong(pts, 0, 2.5, 4.5, 0.12, white);
+    if (r.cls === 'tertiary') {
+      solidAlong(pts, r.half - 0.45, 0.12, white);
+      solidAlong(pts, -(r.half - 0.45), 0.12, white);
     }
   }
-  // Garis henti dan zebra cross di persimpangan berlampu
-  for (const n of nodes) {
-    if (!n.signalized) continue;
-    for (let k = 0; k < 4; k++) {
-      if (n.nb[k] < 0) continue;
-      // lengan persimpangan ke arah k; kendaraan yang MASUK bergerak ke arah oppDir(k)
-      const dx = DX[k];
-      const dz = DZ[k];
-      const px = -dz; // tegak lurus
-      const pz = dx;
-      const Pt = (u, w) => [n.x + dx * u + px * w, n.z + dz * u + pz * w];
-      const Rr = (u0, w0, u1, w1, c) => {
-        const p0 = Pt(u0, w0);
-        const p1 = Pt(u1, w1);
-        rect(p0[0], p0[1], p1[0], p1[1], c);
-      };
-      // Kendaraan masuk bergerak ke arah -d. Kiri dari -d adalah (-dz, dx)... = (px, pz) dengan tanda:
-      // kiri(v) = (vz, -vx); v = (-dx, -dz) -> kiri = (-dz, dx) = (px, pz). Lajur masuk ada di w > 0.
-      Rr(CONN - 0.2, 0.3, CONN + 0.35, HALF - 0.2, mw);
-      // Zebra cross: garis-garis sejajar arah jalan
-      const u0 = CROSS - CROSS_W / 2;
-      const u1 = CROSS + CROSS_W / 2;
-      for (let w = -HALF + 0.5; w < HALF - 0.4; w += 1.1) Rr(u0, w, u1, w + 0.55, mw);
+  // garis henti di lengan berlampu
+  for (const s of data.signals) {
+    for (const a of s.arms) {
+      const lefts = [];
+      const h = a.h;
+      const lx = Math.sin(h);
+      const lz = -Math.cos(h);
+      for (const lid of a.lanes) {
+        const lane = city.lanes[lid];
+        const P = lane.poly;
+        const ex = P.x[P.n - 1];
+        const ez = P.z[P.n - 1];
+        lefts.push((ex - a.x) * lx + (ez - a.z) * lz);
+      }
+      const w = city.lanes[a.lanes[0]].width;
+      const lo = Math.min(...lefts) - w / 2;
+      const hi = Math.max(...lefts) + w / 2;
+      const mid = (lo + hi) / 2;
+      mk.at(a.x, a.z).rect(a.x + lx * mid - Math.cos(h) * 0.25, a.z + lz * mid - Math.sin(h) * 0.25, h, 0.45, hi - lo, Y.mark, white);
     }
   }
-  const mkMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
-  const mkMesh = new THREE.Mesh(res.add(mk.build()), mkMat);
-  mkMesh.receiveShadow = true;
-  mkMesh.renderOrder = 1;
-  group.add(mkMesh);
+  // garis beri jalan (putus-putus melintang) di ujung lajur yang harus mengalah
+  for (const lane of city.lanes) {
+    if (!lane.next.length || lane.sig) continue;
+    if (!lane.next.every((c) => c.rank === 2)) continue;
+    const P = lane.poly;
+    const ex = P.x[P.n - 1];
+    const ez = P.z[P.n - 1];
+    const h = P.h[P.n - 2];
+    const lx = Math.sin(h);
+    const lz = -Math.cos(h);
+    const w = lane.width;
+    for (let v = -w / 2 + 0.25; v < w / 2 - 0.2; v += 0.9) {
+      mk.at(ex, ez).rect(ex + lx * (v + 0.25) - Math.cos(h) * 0.2, ez + lz * (v + 0.25) - Math.sin(h) * 0.2, h, 0.3, 0.5, Y.mark, white);
+    }
+  }
+  // zebra cross
+  for (const X of data.crossings) {
+    const ux = Math.cos(X.h);
+    const uz = Math.sin(X.h);
+    const nx = -uz;
+    const nz = ux;
+    for (let v = -X.len / 2 + 0.45; v <= X.len / 2 - 0.4; v += 1.0) {
+      mk.at(X.x, X.z).rect(X.x + nx * v, X.z + nz * v, X.h, X.w, 0.5, Y.mark, white);
+    }
+  }
+  // tepi cincin bundaran
+  for (const rb of data.roundabouts) {
+    for (const rr of [rb.r - rb.w / 2 + 0.3, rb.r + rb.w / 2 - 0.3]) {
+      const pts = [];
+      for (let k = 0; k <= 64; k++) pts.push([rb.x + Math.cos((k / 64) * Math.PI * 2) * rr, rb.z + Math.sin((k / 64) * Math.PI * 2) * rr]);
+      mk.at(rb.x, rb.z).ribbon(pts, 0.12, Y.mark, white);
+    }
+  }
+  const mkMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+  addTiles(mk, mkMat);
   out.mats.markings = mkMat;
 
-  // Bangunan
+  // ===== gedung =====
   const tex = windowTextures(res);
-  const walls = new GeoBuf();
-  const roofs = new GeoBuf();
-  const palette = ['#c9d0dc', '#aab5c7', '#8f9bb0', '#d8d1c4', '#b9ab99', '#9ea9b5', '#cbbba8', '#8392a7', '#b7c3cf'];
-  const roofCol = col('#4a5361');
-  const hvac = col('#6b7482');
-  const treeSpots = [];
-  for (const blk of blockTypes) {
-    if (blk.park) {
-      for (let i = 0; i < 22; i++) {
-        treeSpots.push([blk.x0 + 4 + rng() * (blk.x1 - blk.x0 - 8), blk.z0 + 4 + rng() * (blk.z1 - blk.z0 - 8), 0.9 + rng() * 0.5]);
-      }
-      continue;
+  const wallsT = tiled();
+  const roofsT = tiled();
+  const domes = [];
+  for (const bl of data.buildings) {
+    const floors = bl.f;
+    const top = floors * 3.2 + 0.3;
+    let wallCol;
+    let roofCol;
+    if (bl.k === 'campus') {
+      wallCol = col(CAMPUS_WALL).offsetHSL(0, 0, (bl.c % 3) * 0.02 - 0.02);
+      roofCol = col(CAMPUS_ROOF);
+    } else if (bl.k === 'mosque') {
+      wallCol = col('#f6f2e8');
+      roofCol = col('#e9e4d8');
+    } else {
+      wallCol = col(HOUSE_WALL[bl.c % HOUSE_WALL.length]);
+      roofCol = col(bl.r === 'hip' ? HOUSE_ROOF[bl.c % HOUSE_ROOF.length] : '#dcd8cf');
     }
-    const cx = (blk.x0 + blk.x1) / 2;
-    const cz = (blk.z0 + blk.z1) / 2;
-    const central = Math.max(0, 1 - Math.hypot(cx, cz) / 260);
-    const cols = rng() < 0.5 ? 2 : 3;
-    const rows = rng() < 0.5 ? 2 : 3;
-    const cw = (blk.x1 - blk.x0) / cols;
-    const ch = (blk.z1 - blk.z0) / rows;
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const bx0 = blk.x0 + c * cw;
-        const bz0 = blk.z0 + r * ch;
-        if (rng() < 0.1) {
-          treeSpots.push([bx0 + cw / 2, bz0 + ch / 2, 1.1]);
-          continue;
+    const walls = wallsT.at(bl.p[0][0], bl.p[0][1]);
+    const roofs = roofsT.at(bl.p[0][0], bl.p[0][1]);
+    walls.walls(bl.p, 0, top, wallCol, 1 / 12.8, 1 / 12.8, (bl.c * 0.37) % 1);
+    if (bl.r === 'hip' && bl.obb) {
+      const [ox, oz, L, W, h] = bl.obb;
+      const c = Math.cos(h);
+      const s = Math.sin(h);
+      const ov = 0.35;
+      const hl = L / 2 + ov;
+      const hw = W / 2 + ov;
+      const rh = Math.min(2.4, W * 0.38);
+      const ridge = Math.max(0, hl - hw);
+      const P = (u, v, y) => [ox + c * u - s * v, y, oz + s * u + c * v];
+      const a = P(-hl, -hw, top);
+      const b2 = P(hl, -hw, top);
+      const c2 = P(hl, hw, top);
+      const d = P(-hl, hw, top);
+      const r0 = P(-ridge, 0, top + rh);
+      const r1 = P(ridge, 0, top + rh);
+      const nUp = (p, q, r) => {
+        const ux = q[0] - p[0];
+        const uy = q[1] - p[1];
+        const uz = q[2] - p[2];
+        const vx = r[0] - p[0];
+        const vy = r[1] - p[1];
+        const vz = r[2] - p[2];
+        let nx = uy * vz - uz * vy;
+        let ny = uz * vx - ux * vz;
+        let nz = ux * vy - uy * vx;
+        const l = Math.hypot(nx, ny, nz) || 1;
+        nx /= l;
+        ny /= l;
+        nz /= l;
+        if (ny < 0) {
+          nx = -nx;
+          ny = -ny;
+          nz = -nz;
         }
-        const m = 1.8 + rng() * 2.6;
-        const x0 = bx0 + m;
-        const x1 = bx0 + cw - m;
-        const z0 = bz0 + m;
-        const z1 = bz0 + ch - m;
-        const floors = Math.round(3 + rng() * 4 + central * rng() * 11);
-        const h = floors * 3.5;
-        const color = col(palette[Math.floor(rng() * palette.length)]);
-        const u0 = Math.floor(rng() * 8) / 8;
-        const v0 = Math.floor(rng() * 8) / 8;
-        walls.wall(x0, z1, x1, z1, 0.17, h, 0, 1, color, u0, v0);
-        walls.wall(x1, z0, x0, z0, 0.17, h, 0, -1, color, u0 + 0.25, v0);
-        walls.wall(x1, z1, x1, z0, 0.17, h, 1, 0, color, u0 + 0.5, v0);
-        walls.wall(x0, z0, x0, z1, 0.17, h, -1, 0, color, u0 + 0.75, v0);
-        roofs.flat(x0, z0, x1, z1, h, roofCol);
-        // pembatas atap tipis dan mesin AC
-        roofs.box(x0, h, z0, x1, h + 0.5, z0 + 0.3, roofCol);
-        roofs.box(x0, h, z1 - 0.3, x1, h + 0.5, z1, roofCol);
-        if (rng() < 0.7) {
-          const ax = x0 + 3 + rng() * Math.max(1, x1 - x0 - 9);
-          const az = z0 + 3 + rng() * Math.max(1, z1 - z0 - 9);
-          roofs.box(ax, h, az, ax + 3 + rng() * 3, h + 1.2 + rng() * 1.5, az + 2.5 + rng() * 2, hvac);
+        return [nx, ny, nz];
+      };
+      let n = nUp(a, b2, r1);
+      roofs.quad(a, b2, r1, r0, n[0], n[1], n[2], roofCol);
+      n = nUp(c2, d, r0);
+      roofs.quad(c2, d, r0, r1, n[0], n[1], n[2], roofCol);
+      const sh = roofCol.clone().offsetHSL(0, 0, -0.05);
+      n = nUp(b2, c2, r1);
+      roofs.tri(b2, c2, r1, n[0], n[1], n[2], sh);
+      n = nUp(d, a, r0);
+      roofs.tri(d, a, r0, n[0], n[1], n[2], sh);
+      // plafon di bawah atap supaya tidak tembus pandang dari bawah
+      roofs.flatPoly(bl.p, top - 0.02, wallCol);
+    } else {
+      roofs.flatPoly(bl.p, top, roofCol);
+      if (bl.k === 'campus') {
+        // pembatas atap tipis
+        const pts = bl.p;
+        for (let i = 0; i < pts.length; i++) {
+          const p = pts[i];
+          const q = pts[(i + 1) % pts.length];
+          const len = Math.hypot(q[0] - p[0], q[1] - p[1]);
+          if (len < 0.5) continue;
+          const nx = (q[1] - p[1]) / len;
+          const nz = -(q[0] - p[0]) / len;
+          roofs.quad([p[0], top, p[1]], [q[0], top, q[1]], [q[0], top + 0.6, q[1]], [p[0], top + 0.6, p[1]], nx, 0, nz, col(CAMPUS_TRIM));
         }
-        out.buildings.push({ minx: x0, minz: z0, maxx: x1, maxz: z1, h });
       }
+    }
+    if (bl.k === 'mosque') {
+      let sx = 0;
+      let sz = 0;
+      for (const p of bl.p) {
+        sx += p[0];
+        sz += p[1];
+      }
+      domes.push({ x: sx / bl.p.length, z: sz / bl.p.length, y: top, r: Math.min(4.5, Math.max(2, Math.sqrt(Math.abs(areaOf(bl.p))) / 3.2)) });
     }
   }
-  const wallMat = res.add(
-    new THREE.MeshLambertMaterial({ vertexColors: true, map: tex.map, emissive: 0xffffff, emissiveMap: tex.emi, emissiveIntensity: 0 }),
-  );
-  const wallMesh = new THREE.Mesh(res.add(walls.build()), wallMat);
-  wallMesh.castShadow = true;
-  wallMesh.receiveShadow = true;
-  group.add(wallMesh);
-  const roofMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true }));
-  const roofMesh = new THREE.Mesh(res.add(roofs.build()), roofMat);
-  roofMesh.castShadow = true;
-  roofMesh.receiveShadow = true;
-  group.add(roofMesh);
+  const wallMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true, map: tex.map, emissive: 0xffffff, emissiveMap: tex.emi, emissiveIntensity: 0 }));
+  addTiles(wallsT, wallMat, { cast: true });
+  const roofMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  addTiles(roofsT, roofMat, { cast: true });
   out.mats.windows = wallMat;
-
-  // Pohon di trotoar dan lampu jalan
-  const lampSpots = [];
-  for (const r of graph.roads) {
-    const a = r.a;
-    const horiz = r.k === 0;
-    const P = (u, w) => (horiz ? [a.x + u, a.z + w] : [a.x + w, a.z + u]);
-    for (const u of [22, 40, 60, 78]) {
-      for (const side of [-1, 1]) {
-        if (rng() < 0.15) continue;
-        const p = P(u + (rng() - 0.5) * 3, side * 10.1);
-        treeSpots.push([p[0], p[1], 0.85 + rng() * 0.35]);
-      }
-    }
-    for (const [u, side] of [
-      [30, -1],
-      [70, -1],
-      [50, 1],
-    ]) {
-      const base = P(u, side * 7.7);
-      const head = P(u, side * 5.9);
-      lampSpots.push({ bx: base[0], bz: base[1], hx: head[0], hz: head[1], horiz });
+  if (domes.length) {
+    const domeGeo = res.add(new THREE.SphereGeometry(1, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2));
+    const domeMat = res.add(new THREE.MeshLambertMaterial({ color: '#2f9e76' }));
+    const towerGeo = res.add(new THREE.CylinderGeometry(0.45, 0.55, 1, 8));
+    const towerMat = res.add(new THREE.MeshLambertMaterial({ color: '#f6f2e8' }));
+    for (const d of domes) {
+      const dome = new THREE.Mesh(domeGeo, domeMat);
+      dome.position.set(d.x, d.y, d.z);
+      dome.scale.set(d.r, d.r * 0.9, d.r);
+      dome.castShadow = true;
+      group.add(dome);
+      const tw = new THREE.Mesh(towerGeo, towerMat);
+      const th = d.y + 7;
+      tw.scale.set(1, th, 1);
+      tw.position.set(d.x + d.r + 1.2, th / 2, d.z);
+      tw.castShadow = true;
+      group.add(tw);
+      const cap = new THREE.Mesh(domeGeo, domeMat);
+      cap.position.set(d.x + d.r + 1.2, th, d.z);
+      cap.scale.set(0.7, 0.9, 0.7);
+      group.add(cap);
     }
   }
-  // Pohon di luar kota
-  for (let i = 0, n = 0; n < 120 && i < 2000; i++) {
-    const x = (rng() * 2 - 1) * (o1 + 75);
-    const z = (rng() * 2 - 1) * (o1 + 75);
-    if (Math.max(Math.abs(x), Math.abs(z)) < o1 + 7) continue;
-    treeSpots.push([x, z, 0.9 + rng() * 0.6]);
-    n++;
-  }
 
-  const trunkGeo = res.add(new THREE.CylinderGeometry(0.16, 0.24, 2.4, 6));
-  trunkGeo.translate(0, 1.2, 0);
-  const crownGeo = res.add(new THREE.IcosahedronGeometry(1.9, 0));
-  crownGeo.translate(0, 3.9, 0);
-  const trunkMat = res.add(new THREE.MeshLambertMaterial({ color: '#5b4636' }));
+  // ===== pohon =====
+  const trees = data.trees;
+  const trunkGeo = res.add(new THREE.CylinderGeometry(0.14, 0.22, 2.2, 6, 1, true));
+  trunkGeo.translate(0, 1.1, 0);
+  const crownGeo = res.add(new THREE.IcosahedronGeometry(1.8, 0));
+  crownGeo.translate(0, 3.6, 0);
+  const bushGeo = res.add(new THREE.IcosahedronGeometry(1.3, 0));
+  bushGeo.translate(0, 1.6, 0);
+  const trunkMat = res.add(new THREE.MeshLambertMaterial({ color: '#7a5a42' }));
   const crownMat = res.add(new THREE.MeshLambertMaterial({ color: '#ffffff', flatShading: true }));
-  const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, treeSpots.length);
-  const crowns = new THREE.InstancedMesh(crownGeo, crownMat, treeSpots.length);
-  const greens = ['#2f6b3f', '#3b7a47', '#2a5c38', '#4b8a52', '#356f45'].map(col);
+  const big = trees.filter((t) => t[3] === 0);
+  const small = trees.filter((t) => t[3] !== 0);
+  const trunks = new THREE.InstancedMesh(trunkGeo, trunkMat, Math.max(1, trees.length));
+  const crowns = new THREE.InstancedMesh(crownGeo, crownMat, Math.max(1, big.length));
+  const bushes = new THREE.InstancedMesh(bushGeo, crownMat, Math.max(1, small.length));
+  const greens = ['#6fae5c', '#7dbb66', '#5f9f53', '#8cc26f', '#6aa75e', '#94c874'].map(col);
   const m4 = new THREE.Matrix4();
   const q = new THREE.Quaternion();
   const up = new THREE.Vector3(0, 1, 0);
-  treeSpots.forEach(([x, z, s], i) => {
+  const pv = new THREE.Vector3();
+  const sv = new THREE.Vector3();
+  out.trees = [];
+  let ti = 0;
+  big.forEach(([x, z, s], i) => {
     q.setFromAxisAngle(up, rng() * Math.PI * 2);
-    m4.compose(new THREE.Vector3(x, 0.15, z), q, new THREE.Vector3(s, s * (0.9 + rng() * 0.25), s));
-    trunks.setMatrixAt(i, m4);
+    pv.set(x, 0, z);
+    sv.set(s, s * (0.9 + rng() * 0.25), s);
+    m4.compose(pv, q, sv);
+    trunks.setMatrixAt(ti++, m4);
     crowns.setMatrixAt(i, m4);
     crowns.setColorAt(i, greens[Math.floor(rng() * greens.length)]);
-    out.trees.push({ x, z, r: 0.5 * s, h: 6 * s });
+    out.trees.push({ x, z, r: 0.35 * s, h: 5.4 * s });
   });
-  trunks.castShadow = crowns.castShadow = true;
-  group.add(trunks, crowns);
+  small.forEach(([x, z, s], i) => {
+    q.setFromAxisAngle(up, rng() * Math.PI * 2);
+    pv.set(x, 0, z);
+    sv.set(s, s, s);
+    m4.compose(pv, q, sv);
+    const sm = m4.clone().scale(new THREE.Vector3(1, 0.55, 1));
+    trunks.setMatrixAt(ti++, sm);
+    bushes.setMatrixAt(i, m4);
+    bushes.setColorAt(i, greens[Math.floor(rng() * greens.length)].clone().offsetHSL(0, 0, 0.04));
+    out.trees.push({ x, z, r: 0.3 * s, h: 2.8 * s });
+  });
+  trunks.count = ti;
+  crowns.count = big.length;
+  bushes.count = small.length;
+  for (const m of [trunks, crowns, bushes]) {
+    m.castShadow = true;
+    m.computeBoundingSphere();
+    group.add(m);
+  }
 
-  // Tiang lampu jalan (digabung) dan kepala lampu (instanced)
+  // ===== lampu jalan di jalan utama dan sekitar kampus =====
+  const lampSpots = [];
+  for (const r of data.roads) {
+    if (!r.route) continue;
+    const mid = r.p[Math.floor(r.p.length / 2)];
+    const nearCampus = Math.hypot(mid[0], mid[1]) < 260;
+    if (!(r.cls === 'tertiary' || (nearCampus && (r.cls === 'service' || r.cls === 'residential')))) continue;
+    const pts = roadPaths.get(r.id);
+    if (!pts) continue;
+    let acc = 0;
+    let next = 12;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const L = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+      while (next <= acc + L) {
+        const t = (next - acc) / L;
+        const x = pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t;
+        const z = pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t;
+        const h = Math.atan2(pts[i + 1][1] - pts[i][1], pts[i + 1][0] - pts[i][0]);
+        const side = lampSpots.length % 2 ? 1 : -1;
+        const off = r.half + 0.35;
+        lampSpots.push({ x: x + Math.sin(h) * off * side, z: z - Math.cos(h) * off * side, hx: x + Math.sin(h) * (off - 1.3) * side, hz: z - Math.cos(h) * (off - 1.3) * side });
+        next += r.cls === 'tertiary' ? 34 : 42;
+      }
+      acc += L;
+    }
+  }
   const props = new GeoBuf();
-  const poleCol = col('#39414f');
+  const poleCol = col('#8a929c');
   for (const L of lampSpots) {
-    props.box(L.bx - 0.09, 0.15, L.bz - 0.09, L.bx + 0.09, 6.6, L.bz + 0.09, poleCol);
-    const ax0 = Math.min(L.bx, L.hx) - 0.06;
-    const ax1 = Math.max(L.bx, L.hx) + 0.06;
-    const az0 = Math.min(L.bz, L.hz) - 0.06;
-    const az1 = Math.max(L.bz, L.hz) + 0.06;
-    props.box(ax0, 6.5, az0, ax1, 6.62, az1, poleCol);
-    out.poles.push({ x: L.bx, z: L.bz, r: 0.12, h: 6.6 });
+    props.box(L.x - 0.07, 0, L.z - 0.07, L.x + 0.07, 6.2, L.z + 0.07, poleCol);
+    props.box(Math.min(L.x, L.hx) - 0.05, 6.1, Math.min(L.z, L.hz) - 0.05, Math.max(L.x, L.hx) + 0.05, 6.2, Math.max(L.z, L.hz) + 0.05, poleCol);
+    out.poles.push({ x: L.x, z: L.z, r: 0.1, h: 6.2 });
   }
-  const propMat = res.add(new THREE.MeshLambertMaterial({ vertexColors: true }));
-  const propMesh = new THREE.Mesh(res.add(props.build()), propMat);
-  propMesh.castShadow = true;
-  group.add(propMesh);
-
-  const headGeo = res.add(new THREE.BoxGeometry(0.9, 0.14, 0.42));
-  const headMat = res.add(new THREE.MeshBasicMaterial({ color: '#9aa3ae' }));
-  const heads = new THREE.InstancedMesh(headGeo, headMat, lampSpots.length);
-  const poolGeo = res.add(new THREE.CircleGeometry(7.5, 24));
-  poolGeo.rotateX(-Math.PI / 2);
-  // Cahaya paling terang di bawah lampu lalu memudar ke tepi (warna titik: pusat 1, tepi 0).
-  const poolCol = new Float32Array(poolGeo.attributes.position.count * 3);
-  for (let i = 0; i < poolGeo.attributes.position.count; i++) {
-    const r = Math.hypot(poolGeo.attributes.position.getX(i), poolGeo.attributes.position.getZ(i)) / 7.5;
-    const k = Math.max(0, 1 - r) ** 1.4;
-    poolCol[i * 3] = poolCol[i * 3 + 1] = poolCol[i * 3 + 2] = k;
+  if (!props.empty) {
+    const propMesh = new THREE.Mesh(res.add(props.build()), res.add(new THREE.MeshLambertMaterial({ vertexColors: true })));
+    propMesh.castShadow = true;
+    group.add(propMesh);
   }
-  poolGeo.setAttribute('color', new THREE.BufferAttribute(poolCol, 3));
-  const poolMat = res.add(
-    new THREE.MeshBasicMaterial({ color: '#ffc27a', vertexColors: true, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }),
-  );
-  const pools = new THREE.InstancedMesh(poolGeo, poolMat, lampSpots.length);
+  const headGeo = res.add(new THREE.BoxGeometry(0.7, 0.14, 0.34));
+  const headMat = res.add(new THREE.MeshBasicMaterial({ color: '#c9ced4' }));
+  const heads = new THREE.InstancedMesh(headGeo, headMat, Math.max(1, lampSpots.length));
   lampSpots.forEach((L, i) => {
-    q.setFromAxisAngle(up, L.horiz ? Math.PI / 2 : 0);
-    m4.compose(new THREE.Vector3(L.hx, 6.45, L.hz), q, new THREE.Vector3(1, 1, 1));
+    m4.makeTranslation(L.hx, 6.05, L.hz);
     heads.setMatrixAt(i, m4);
-    // sedikit di atas trotoar (0,15 m) supaya lingkaran cahaya tidak terpotong kerb
-    m4.compose(new THREE.Vector3(L.hx, 0.17, L.hz), new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
+  });
+  heads.count = lampSpots.length;
+  group.add(heads);
+  out.mats.lampHead = headMat;
+  // genangan cahaya lampu jalan (hanya malam)
+  const poolGeo = res.add(new THREE.CircleGeometry(7, 24));
+  poolGeo.rotateX(-Math.PI / 2);
+  const pc = new Float32Array(poolGeo.attributes.position.count * 3);
+  for (let i = 0; i < poolGeo.attributes.position.count; i++) {
+    const r = Math.hypot(poolGeo.attributes.position.getX(i), poolGeo.attributes.position.getZ(i)) / 7;
+    const k = Math.max(0, 1 - r) ** 1.5;
+    pc[i * 3] = pc[i * 3 + 1] = pc[i * 3 + 2] = k;
+  }
+  poolGeo.setAttribute('color', new THREE.BufferAttribute(pc, 3));
+  const poolMat = res.add(new THREE.MeshBasicMaterial({ color: '#ffc98a', vertexColors: true, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }));
+  const pools = new THREE.InstancedMesh(poolGeo, poolMat, Math.max(1, lampSpots.length));
+  lampSpots.forEach((L, i) => {
+    m4.makeTranslation(L.hx, Y.mark + 0.01, L.hz);
     pools.setMatrixAt(i, m4);
   });
+  pools.count = lampSpots.length;
   pools.renderOrder = 2;
   pools.visible = false;
-  group.add(heads, pools);
-  out.mats.lampHead = headMat;
+  group.add(pools);
   out.mats.lampPool = poolMat;
   out.pools = pools;
-  out.group = group;
+
+  // ===== label =====
+  for (const lb of data.labels) {
+    if (lb.k === 'campus') {
+      const { tex: t, aspect } = labelTexture(res, lb.t, { font: '700 72px system-ui, sans-serif', h: 120, pad: 48, color: '#9a3412', bg: 'rgba(255,250,242,0.92)' });
+      const sp = new THREE.Sprite(res.add(new THREE.SpriteMaterial({ map: t, depthWrite: false, transparent: true })));
+      const hgt = 7;
+      sp.scale.set(hgt * aspect, hgt, 1);
+      sp.position.set(lb.x, 26, lb.z);
+      sp.renderOrder = 8;
+      group.add(sp);
+      out.labels.push({ obj: sp, kind: 'campus' });
+    } else {
+      const { tex: t, aspect } = labelTexture(res, lb.t, { font: '600 64px system-ui, sans-serif', h: 96, pad: 24, color: '#3f4650', stroke: 'rgba(255,255,255,0.95)', strokeW: 10 });
+      const hgt = 3.2;
+      const geo = res.add(new THREE.PlaneGeometry(hgt * aspect, hgt));
+      geo.rotateX(-Math.PI / 2);
+      const mat = res.add(new THREE.MeshBasicMaterial({ map: t, transparent: true, opacity: 0, depthWrite: false }));
+      const m = new THREE.Mesh(geo, mat);
+      // label di sisi jalan (sedikit di luar trotoar) supaya tidak menutupi marka
+      m.position.set(lb.x, Y.mark + 0.02, lb.z);
+      m.rotation.y = -lb.h;
+      m.renderOrder = 3;
+      group.add(m);
+      out.labels.push({ obj: m, kind: 'street', mat });
+    }
+  }
+
+  // ===== halte =====
+  out.halteGroup = halteModel.createHalteGroup({ res, scene: group }, data.halte);
   return out;
+}
+
+function areaOf(p) {
+  let a = 0;
+  for (let i = 0; i < p.length; i++) {
+    const q = p[(i + 1) % p.length];
+    a += p[i][0] * q[1] - q[0] * p[i][1];
+  }
+  return a / 2;
+}
+
+/** Label jalan hanya terlihat saat kamera cukup tinggi (tampilan peta atau drone jauh). */
+export function updateLabels(world, camY) {
+  const k = Math.max(0, Math.min(1, (camY - 30) / 60));
+  for (const l of world.labels) {
+    if (l.kind === 'street') {
+      l.mat.opacity = 0.85 * k;
+      l.obj.visible = k > 0.01;
+    } else l.obj.visible = camY > 14;
+  }
 }

@@ -8,7 +8,7 @@ diketuk. Yang diperiksa:
   4. Keluar masuk pelajaran 5 kali: loop, kanvas, style, dan listener window/document tidak bocor.
   5. Semua pesan konsol error/warning dan pageerror.
 
-Pemakaian: python3 tests/kontrol_indep_qa.py [--mobile] [--port 8136]
+Pemakaian: python3 tests/kontrol_indep_qa.py [--mobile] [--port 8246]
 """
 import json
 import sys
@@ -18,9 +18,9 @@ from playwright.sync_api import sync_playwright
 
 CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-arm64/"
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
-SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/kontrol-qa/"
+SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/kontrol/indep/"
 MOBILE = "--mobile" in sys.argv
-PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8136"
+PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8246"
 BASE = f"http://127.0.0.1:{PORT}/"
 TAG = "m" if MOBILE else "d"
 LOG = []
@@ -230,7 +230,7 @@ def main():
                 cut["cut"] = st
                 s.stage_shot("02-potong")
 
-        R["lookahead-large"] = s.wait_task("lookahead-large", 45, watch2)
+        R["lookahead-large"] = s.wait_task("lookahead-large", 120, watch2)
         t0 = time.time()
         while time.time() - t0 < 20 and "cut" not in cut:
             watch2()
@@ -241,7 +241,7 @@ def main():
 
         R["t3_preset_ld"] = s.slider_value("Lookahead Ld")
         R["t3_ld"] = s.drag_slider("Lookahead Ld", 7)
-        R["tuned"] = s.wait_task("tuned", 60)
+        R["tuned"] = s.wait_task("tuned", 240)
         R["t3_readouts"] = s.readouts()
         log("t3", R["tuned"], R["t3_ld"], json.dumps(R["t3_readouts"], ensure_ascii=False))
         s.stage_shot("03-pas")

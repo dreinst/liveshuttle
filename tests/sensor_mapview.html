@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <title>Uji sensor: pratinjau peta</title>
+    <link rel="icon" href="../favicon.svg" />
+    <link rel="stylesheet" href="../css/style.css" />
+    <style>body { margin: 0; background: #0b1220; } .c { position: relative; width: 900px; height: 540px; margin: 8px; }</style>
+  </head>
+  <body>
+    <div class="c" id="a"></div>
+    <script type="module">
+      // Alat bantu memilih lokasi adegan: gambar peta Ma Chung di skala pelajaran, dengan nomor ruas.
+      import { View } from '../js/engine/canvas.js';
+      import { loadMap, createMapRenderer } from '../js/engine/osm2d.js';
+      import { drawLabel } from '../js/engine/draw.js';
+      const q = new URLSearchParams(location.search);
+      const cx = +q.get('x') || 0, cy = +q.get('y') || 0, sc = +q.get('s') || 12;
+      const map = await loadMap(q.get('map') || 'machung');
+      const view = new View(document.getElementById('a'), {});
+      view.fit(null);
+      view.camera.x = cx; view.camera.y = cy; view.setScale(sc); view.centerOn(cx, cy);
+      const r = createMapRenderer(map, { layers: { places: true } });
+      function frame() {
+        const g = view.begin('#0b1220');
+        r.draw(g, view);
+        if (q.get('ids')) {
+          const vb = view.visibleBounds();
+          for (const rd of map.roads) {
+            const m = rd.points[Math.floor(rd.points.length / 2)];
+            const mid = rd.points.length === 2 ? { x: (rd.points[0].x + rd.points[1].x) / 2, y: (rd.points[0].y + rd.points[1].y) / 2 } : m;
+            if (mid.x > vb.minX && mid.x < vb.maxX && mid.y > vb.minY && mid.y < vb.maxY) drawLabel(g, view, mid.x, mid.y, String(rd.id), { size: 9 });
+          }
+          for (const n of map.nodes) if (n.x > vb.minX && n.x < vb.maxX && n.y > vb.minY && n.y < vb.maxY && n.degree > 2) drawLabel(g, view, n.x, n.y, 'n' + n.id, { size: 9, color: '#fde68a', dy: 10 });
+        }
+        window.__ready = true;
+      }
+      frame();
+    </script>
+  </body>
+</html>

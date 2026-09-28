@@ -1,4 +1,4 @@
-/* SimOtonom: gaya bersama untuk seluruh situs.
+/* LiveShuttle: gaya bersama untuk seluruh situs.
    Tema gelap bergaya ruang kendali. Variabel di :root dipakai semua halaman dan pelajaran. */
 
 :root {
@@ -612,10 +612,10 @@ kbd {
 }
 
 .hero-title {
-  font-size: clamp(2rem, 4.2vw, 3.3rem);
+  font-size: clamp(1.75rem, 3.3vw, 2.65rem);
   font-weight: 800;
-  line-height: 1.08;
-  letter-spacing: -0.03em;
+  line-height: 1.12;
+  letter-spacing: -0.025em;
   text-wrap: balance;
 }
 
@@ -688,6 +688,13 @@ kbd {
   position: relative;
   aspect-ratio: 16 / 10.5;
   background: #13261f;
+}
+
+.ambient-note {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-align: right;
 }
 
 .about {
@@ -1376,15 +1383,21 @@ kbd {
   color: var(--ok);
 }
 
+/* Lencana Dijeda di pojok kanan atas panggung, supaya tidak menutupi panel hasil di bagian bawah
+   atau atribusi peta di pojok kanan bawah. Tinggi tetap: bila pelajaran lama masih mengatur
+   `bottom`, lencana tetap di atas dan tidak memanjang. Bila chip HUD sampai ke pojok kanan,
+   lesson-page.js mengisi --stage-badge-auto supaya lencana turun di bawah chip itu.
+   Pelajaran boleh menggeser sendiri dengan --stage-badge-top. */
 .stage-badge {
   position: absolute;
+  top: var(--stage-badge-top, var(--stage-badge-auto, 10px));
   right: 10px;
-  bottom: 10px;
   z-index: 3;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 12px;
+  height: 30px;
+  padding: 0 12px;
   border-radius: 999px;
   background: rgba(245, 158, 11, 0.16);
   border: 1px solid rgba(245, 158, 11, 0.45);
@@ -1524,7 +1537,7 @@ kbd {
 
 .step-dots {
   display: flex;
-  gap: 2px;
+  gap: 0;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -1532,8 +1545,8 @@ kbd {
 
 .step-dot {
   position: relative;
-  width: 22px;
-  height: 28px;
+  width: 26px;
+  height: 40px;
   padding: 0;
   border: 0;
   background: none;
@@ -1894,7 +1907,7 @@ kbd {
   margin-top: 10px;
 }
 
-/* ---------- simulator 3D ---------- */
+/* ---------- Shuttle 3D Ma Chung ---------- */
 
 .sim3d-host {
   position: relative;
@@ -1989,7 +2002,7 @@ kbd {
 .ctl-slider input[type='range'] {
   --fill: 50%;
   width: 100%;
-  height: 28px;
+  height: 40px;
   margin: 0;
   background: transparent;
   cursor: pointer;
@@ -2152,7 +2165,7 @@ kbd {
   gap: 6px;
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 34px;
+  min-height: 40px;
   padding: 0 6px;
   border: 0;
   border-radius: 9px;
@@ -2420,8 +2433,8 @@ kbd {
   background: #16223c;
   box-shadow: 0 18px 40px -12px rgba(0, 0, 0, 0.7);
   font-size: 0.92rem;
-  pointer-events: auto;
-  cursor: pointer;
+  /* klik tembus ke kontrol di bawahnya, toast hilang sendiri */
+  pointer-events: none;
   animation: toast-in 0.25s ease;
 }
 
@@ -2505,6 +2518,13 @@ kbd {
   100% {
     transform: scale(1);
     box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
+  }
+}
+
+/* layar sentuh: titik langkah selebar 40 px supaya mudah diketuk */
+@media (pointer: coarse) {
+  .step-dot {
+    width: 40px;
   }
 }
 

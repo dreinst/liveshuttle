@@ -1,7 +1,7 @@
 """QA pelajaran Persepsi lewat UI seperti pelajar: semua tugas, jeda, ulangi, kecepatan, dan uji kebocoran.
 
 Pemakaian: python3 tests/persepsi_qa.py [--mobile]
-Butuh server statis di port 8113.
+Butuh server: python3 tests/serve.py 8243
 """
 import sys
 import time
@@ -141,7 +141,7 @@ with Session(mobile=MOBILE) as s:
     results["summaryStep"] = s.hook()["stepIndex"]
     top(s)
     s.shot(f"qa-{TAG}-6-ringkasan")
-    results["progress"] = s.page.evaluate("() => JSON.parse(localStorage.getItem('simotonom.progress.v1')).lessons.persepsi")
+    results["progress"] = s.page.evaluate("() => JSON.parse(localStorage.getItem('liveshuttle.progress.v1')).lessons.persepsi")
 
     # navigasi berulang: tidak boleh ada loop, kanvas, atau gaya yang tertinggal
     for i in range(8):

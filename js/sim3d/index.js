@@ -1,57 +1,48 @@
-// Simulator Kendaraan Otonom 3D.
-// Kontrak: mount(container, { mode, navigate }) mengembalikan { destroy() }.
-// Simulasi berjalan dengan langkah tetap 1/60 detik dan terpisah dari tampilan.
+// Shuttle 3D Ma Chung: bagian 3D situs LiveShuttle.
+// Kontrak: mount(container, { mode: 'panduan' | 'jelajah', navigate }) mengembalikan { destroy() }.
+// Fisika berjalan dengan langkah tetap 1/60 detik. Percepatan waktu menjalankan lebih banyak
+// langkah, tidak pernah langkah yang lebih besar. Tampilan diinterpolasi di antara langkah fisika.
 import * as THREE from '../vendor/three.bundle.min.js';
-import { Disposer, Res, disposeTree, el, mulberry32, ms, kmh, clamp } from './util.js';
-import { buildGraph } from './roadgraph.js';
-import { buildWorld } from './world.js';
+import { Disposer, Res, disposeTree, el, mulberry32, fmt } from './util.js';
+import { City, loadCityData } from './city.js';
+import { buildWorld, updateLabels } from './world.js';
 import { Signals } from './signals.js';
-import { Traffic, LaneIndex, CAR_LEN, CAR_WID } from './traffic.js';
+import { Junctions } from './junctions.js';
+import { Traffic } from './traffic.js';
 import { Pedestrians } from './pedestrians.js';
-import { Scenarios } from './scenarios.js';
 import { Ego } from './ego.js';
-import { Sensing } from './sensing.js';
-import { Perception } from './perception.js';
-import { Planner } from './planning.js';
-import { Controller } from './control.js';
-import { Weather } from './weather.js';
-import { Cameras, CAMERA_MODES } from './cameras.js';
+import { Passing } from './passing.js';
+import { Obstacles } from './obstacles.js';
+import { Sensors } from './sensors.js';
+import { Weather, WEATHER_LABEL } from './weather.js';
+import { Cameras } from './cameras.js';
 import { Hud } from './hud.js';
-import { Tutorial } from './tutorial.js';
+import { Guide } from './guide.js';
 import { bindKeys } from './input.js';
-import { obbOverlap, obbCircle, obbAabb } from './geom.js';
+import { InvariantMonitor, SHIELD } from './shield.js';
 
 const DT = 1 / 60;
-const SPEED_STEPS = [0.25, 0.5, 1, 2, 4];
-// Hemat benar-benar mengurangi beban: resolusi lebih rendah (juga di layar 1x), tanpa bayangan,
-// tanpa genangan cahaya lampu jalan, hujan lebih sedikit, dan jarak pandang kamera lebih pendek.
-const QUALITY = {
-  hemat: { ratio: 0.8, shadows: false, lite: true, far: 700 },
-  standar: { ratio: 1.25, shadows: false, lite: false, far: 1400 },
-  tinggi: { ratio: 1.5, shadows: true, lite: false, far: 1400 },
-};
+const MAX_STEPS = 24;
+const TIME_SCALES = [1, 2, 4];
 
 let webglChecked = null;
 function webglAvailable() {
   if (webglChecked !== null) return webglChecked;
-  webglChecked = probeWebgl();
-  return webglChecked;
-}
-
-function probeWebgl() {
   try {
     const c = document.createElement('canvas');
     const gl = c.getContext('webgl2');
-    if (!gl) return false;
-    const ext = gl.getExtension('WEBGL_lose_context');
-    if (ext) ext.loseContext();
-    return true;
+    webglChecked = !!gl;
+    if (gl) {
+      const ext = gl.getExtension('WEBGL_lose_context');
+      if (ext) ext.loseContext();
+    }
   } catch (e) {
-    return false;
+    webglChecked = false;
   }
+  return webglChecked;
 }
 
-/** Muat css/sim3d.css. Bila gagal (misalnya koneksi terputus), coba sekali lagi. */
+/** Muat css/sim3d.css (sekali coba ulang bila koneksi terputus). */
 function loadStyles() {
   const href = new URL('../../css/sim3d.css', import.meta.url).href;
   const state = { link: null };
@@ -95,36 +86,40 @@ class App {
     this.res = new Res();
     this.timers = new Set();
     this.destroyed = false;
-    this.rng = mulberry32(12345);
+    // biji acak tetap supaya kota selalu sama; uji boleh mengganti lewat window.__sim3dSeed
+    this.rng = mulberry32(Number(window.__sim3dSeed) || 20260928);
     this.simTime = 0;
     this.paused = false;
     this.timeScale = 1;
     this.acc = 0;
-    this.autopilot = true;
-    this.targetSpeed = ms(50);
-    this.quality = 'standar';
-    this.lateralError = 0;
-    this.waitingNow = 0;
-    this.objects = [];
-    this.counters = { collisions: 0, aebAuto: 0, aebManual: 0, overtakes: 0, placed: 0, jaywalkers: 0, destinations: 0 };
-    this.contacts = new Set();
-    this.closedSegs = new Set();
-    this.debugLog = [];
-    this.fps = 60;
-    this.frames = 0;
     this.stepN = 0;
+    this.fps = 60;
+    this.frameMs = 16;
+    this.slowT = 0;
+    this.fastT = 0;
+    this.droppedSteps = 0;
+    this.focus = { x: 0, z: 0 };
+    this.egoPose = { x: 0, z: 0, h: 0 };
+    this.shieldStats = { shuttle: 0, npc: 0 };
+    this.shieldLogList = [];
+    this.shieldLogId = 0;
+    this.debugLog = [];
+    this.clampLog = [];
   }
 
   async init() {
     const styles = loadStyles();
     this.styleState = styles.state;
-    const effects = await loadWeatherEffects();
+    const effectsP = loadWeatherEffects();
+    const dataP = loadCityData();
     await styles.done;
     if (this.destroyed) return;
     if (!webglAvailable()) {
       this.fail();
       return;
     }
+    const [effects, data] = await Promise.all([effectsP, dataP]);
+    if (this.destroyed) return;
     let renderer;
     try {
       renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
@@ -136,109 +131,73 @@ class App {
     renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.domElement.className = 's3d-canvas';
     renderer.domElement.setAttribute('role', 'img');
-    renderer.domElement.setAttribute('aria-label', 'Tampilan 3D kota dengan mobil otonom berwarna toska. Keadaan mobil dijelaskan di panel samping.');
-
-    // Ponsel memakai Standar (rasio piksel 1,25) supaya marka dan titik LiDAR tetap tajam.
-    this.quality = 'standar';
+    renderer.domElement.setAttribute('aria-label', 'Tampilan 3D jalan di sekitar Universitas Ma Chung dengan shuttle otonom berwarna toska. Keadaan shuttle dijelaskan di panel.');
+    this.maxRatio = Math.min(window.devicePixelRatio || 1, 2);
+    this.ratio = this.maxRatio;
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(55, 1, 0.3, 1400);
-    this.graph = buildGraph();
-    this.world = buildWorld(this.scene, this.res, this.graph);
-    this.laneIdx = new LaneIndex(this.graph.lanes.length);
-    this.connTarget = new Int16Array(this.graph.lanes.length);
-    this.boxOcc = {};
-    for (const n of this.graph.nodes) this.boxOcc[n.id] = new Int8Array(4);
-
-    this.ego = new Ego(this);
-    this.signals = new Signals(this);
+    this.camera = new THREE.PerspectiveCamera(55, 1, 0.5, 2600);
+    this.city = new City(data);
+    this.world = buildWorld(this);
+    this.invariants = new InvariantMonitor(this);
     this.weather = new Weather(this, effects);
+    this.signals = new Signals(this);
+    this.junctions = new Junctions(this);
     this.traffic = new Traffic(this);
     this.peds = new Pedestrians(this);
-    this.scen = new Scenarios(this);
-    this.sensing = new Sensing(this);
-    this.perception = new Perception(this);
-    this.planner = new Planner(this);
-    this.control = new Controller(this);
-
-    // Posisi awal mobil otonom: lajur kiri, menghadap timur, dekat pusat kota.
-    const startSeg = this.graph.segs.find((s) => s.a.i === 1 && s.a.j === 2 && s.k === 0) || this.graph.segs[0];
-    const lane = startSeg.lanes[0];
-    const p = lane.poly.at(14, {});
-    this.ego.x = p.x;
-    this.ego.z = p.z;
-    this.ego.h = p.h;
-    this.ego.v = 6;
-    this.planner.planFrom(lane, 14);
-    for (let i = 0; i < this.traffic.target; i++) this.traffic.spawnRandom(28);
+    this.passing = new Passing(this);
+    this.obstacles = new Obstacles(this);
+    this.ego = new Ego(this);
+    this.ego.start();
+    this.sensors = new Sensors(this);
+    this.egoPose.x = this.ego.x;
+    this.egoPose.z = this.ego.z;
+    this.egoPose.h = this.ego.h;
+    this.focus.x = this.ego.x;
+    this.focus.z = this.ego.z;
     for (let i = 0; i < this.peds.target; i++) this.peds.spawnRandom(0);
+    this.peds.register();
+    for (let i = 0; i < this.traffic.target; i++) this.traffic.spawnRandom(25);
 
     // DOM
     this.hud = new Hud(this);
-    this.help = this.hud.help;
     this.root = this.hud.root;
-    this.hud.stage.prepend(renderer.domElement);
+    this.hud.stage.append(renderer.domElement);
     this.container.append(this.root);
     this.cameras = new Cameras(this, this.camera, renderer.domElement);
-    this.tutorial = new Tutorial(this);
-    this.hud.qualSel.value = this.quality;
-    this.applyQuality();
-
-    // Lembar bawah dengan tab dipakai di ponsel dan tablet tegak (lebar sampai 900 px).
-    const mq = matchMedia('(max-width: 900px)');
+    this.guide = new Guide(this);
+    const mq = matchMedia('(max-width: 760px)');
     const onMq = () => {
       this.hud.applyLayout(mq.matches);
-      this.resize();
+      this.applyQuality();
     };
     this.disposer.on(mq, 'change', onMq);
     this.hud.applyLayout(mq.matches);
-
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(this.hud.stage);
     this.disposer.add(() => this.ro.disconnect());
-    this.resize();
-
-    this.bindPointer();
+    this.applyQuality();
     bindKeys(this);
-    // Tautan ke #/simulator/tutorial atau /bebas saat simulator sudah terbuka: ganti mode tanpa memuat ulang.
     this.disposer.on(window, 'hashchange', () => {
-      const m = /^#\/simulator\/(tutorial|bebas)$/.exec(location.hash);
+      const m = /^#\/shuttle-3d\/(panduan|jelajah)$/.exec(location.hash);
       if (m && m[1] !== this.mode) this.setMode(m[1]);
     });
-    // Tautan lain di halaman (misalnya menu Simulator 3D di kepala halaman) ke mode simulator:
-    // ganti mode di tempat supaya kemajuan tutorial dan penghitung tidak hilang karena dimuat ulang.
-    this.disposer.on(
-      document,
-      'click',
-      (ev) => {
-        if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
-        const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
-        if (!a || (this.root && this.root.contains(a)) || a.target === '_blank') return;
-        const m = /^#\/simulator(?:\/(tutorial|bebas))?$/.exec(a.getAttribute('href') || '');
-        if (!m) return;
-        ev.preventDefault();
-        this.setMode(m[1] || 'tutorial');
-      },
-      true,
-    );
     this.disposer.on(document, 'visibilitychange', () => {
       if (document.hidden) this.stopLoop();
       else this.startLoop();
     });
-
-    this.setCamera(this.mode === 'tutorial' ? 'orbit' : 'kejar', { reset: true });
     this.hud.setMode(this.mode);
-    this.tutorial.go(0);
-    if (this.mode !== 'tutorial') this.hud.highlight([]);
+    this.guide.go(0);
+    this.cameras.snapFocus();
+    this.setCamera('drone', { reset: true, silent: true });
 
-    // Pengait baca saja untuk uji otomatis
     Object.defineProperty(window, '__sim3d', { configurable: true, get: () => this.snapshot() });
     this.disposer.add(() => {
       delete window.__sim3d;
     });
 
-    // Beberapa langkah awal supaya lampu dan mobil sudah bergerak saat pertama tampil
-    for (let i = 0; i < 30; i++) this.step(DT);
+    // beberapa detik awal supaya lalu lintas sudah bergerak saat pertama tampil
+    for (let i = 0; i < 120; i++) this.step(DT);
     this.frame = this.frame.bind(this);
     this.startLoop();
     this.ready = true;
@@ -246,10 +205,10 @@ class App {
 
   fail() {
     if (!this.styleState) this.styleState = loadStyles().state;
-    const link = el('a', { class: 's3d-btn s3d-primary', href: '#/pelajaran/level-otomasi' }, 'Buka pelajaran pertama');
+    const lessons = el('a', { class: 's3d-btn s3d-primary', href: '#/pelajaran/level-otomasi' }, 'Buka pelajaran pertama');
     const home = el('a', { class: 's3d-btn s3d-ghost', href: '#/' }, 'Kembali ke beranda');
     for (const [a, h] of [
-      [link, '#/pelajaran/level-otomasi'],
+      [lessons, '#/pelajaran/level-otomasi'],
       [home, '#/'],
     ]) {
       this.disposer.on(a, 'click', (ev) => {
@@ -263,10 +222,10 @@ class App {
       el(
         'div',
         { class: 's3d-fail' },
-        el('h2', {}, 'Simulator 3D belum bisa berjalan di perangkat ini'),
-        el('p', {}, 'Simulator ini membutuhkan WebGL 2, dan browser kamu belum bisa menjalankannya. Coba aktifkan akselerasi perangkat keras di pengaturan browser, atau buka dengan Chrome, Edge, Firefox, atau Safari versi terbaru.'),
+        el('h2', {}, 'Shuttle 3D belum bisa berjalan di perangkat ini'),
+        el('p', {}, 'Tampilan 3D ini membutuhkan WebGL 2, dan browser kamu belum bisa menjalankannya. Coba aktifkan akselerasi perangkat keras di pengaturan browser, atau buka dengan Chrome, Edge, Firefox, atau Safari versi terbaru.'),
         el('p', {}, 'Sementara itu, kamu tetap bisa belajar lewat pelajaran interaktif yang memakai tampilan 2D.'),
-        el('div', { class: 's3d-fail-actions' }, link, home),
+        el('div', { class: 's3d-fail-actions' }, lessons, home),
       ),
     );
     this.container.append(this.root);
@@ -293,205 +252,132 @@ class App {
     this.lastT = now;
     if (!(dt > 0)) dt = 0;
     dt = Math.min(dt, 0.1);
-    this.fps += (1 / Math.max(dt, 1e-3) - this.fps) * 0.05;
+    if (dt > 0) this.fps += (1 / dt - this.fps) * 0.05;
     if (!this.paused) {
       this.acc += dt * this.timeScale;
       let n = 0;
-      while (this.acc >= DT && n < 8) {
+      while (this.acc >= DT && n < MAX_STEPS) {
         this.step(DT);
         this.acc -= DT;
         n++;
       }
-      if (n >= 8) this.acc = 0;
+      if (this.acc >= DT) {
+        this.droppedSteps += Math.floor(this.acc / DT);
+        this.acc = 0;
+      }
     }
-    this.render(dt);
-    this.frames++;
+    const alpha = this.paused ? 1 : Math.min(1, this.acc / DT);
+    const t0 = performance.now();
+    this.render(dt, alpha);
+    this.adapt(dt, performance.now() - t0);
+  }
+
+  /** Resolusi adaptif: turunkan rasio piksel bila waktu bingkai lama di atas sekitar 20 ms. */
+  adapt(dt, renderMs) {
+    this.frameMs += (dt * 1000 - this.frameMs) * 0.05;
+    void renderMs;
+    if (this.frameMs > 20) {
+      this.slowT += dt;
+      this.fastT = 0;
+    } else if (this.frameMs < 13) {
+      this.fastT += dt;
+      this.slowT = 0;
+    } else {
+      this.slowT = 0;
+      this.fastT = 0;
+    }
+    if (this.slowT > 2 && this.ratio > 0.75) {
+      this.ratio = Math.max(0.75, this.ratio - 0.25);
+      this.slowT = 0;
+      this.applyRatio();
+    } else if (this.fastT > 6 && this.ratio < this.maxRatio) {
+      this.ratio = Math.min(this.maxRatio, this.ratio + 0.25);
+      this.fastT = 0;
+      this.applyRatio();
+    }
+  }
+
+  applyRatio() {
+    this.renderer.setPixelRatio(this.ratio);
+    this.resize();
+  }
+
+  applyQuality() {
+    const mobile = this.hud && this.hud.mobile;
+    this.lite = !!mobile;
+    const shadows = !mobile;
+    if (this.renderer.shadowMap.enabled !== shadows) {
+      this.renderer.shadowMap.enabled = shadows;
+      this.weather.sun.castShadow = shadows;
+      this.scene.traverse((o) => {
+        const m = o.material;
+        if (m) (Array.isArray(m) ? m : [m]).forEach((mm) => (mm.needsUpdate = true));
+      });
+    }
+    this.applyRatio();
   }
 
   // ===== simulasi =====
 
   step(dt) {
     this.simTime += dt;
-    const idx = this.laneIdx;
-    idx.clear();
-    this.scen.register(idx);
-    this.peds.register(idx);
-    this.traffic.register(idx);
-    const e = this.ego;
-    for (const { lane, s } of this.planner.egoLanes()) idx.add(lane.id, s - e.hl, s + e.hl, Math.max(0, e.v), 'ego', e);
-    this.countBoxes();
+    this.stepN++;
+    this.weather.step(dt);
     this.signals.step(dt);
-    this.traffic.step(dt);
+    const T = this.traffic;
+    this.passing.prune();
+    T.savePrev();
+    T.beginTick();
     this.peds.step(dt);
-    if (this.scen.pendingJay) this.scen.trySpawnJay();
-    // Pindaian sensor tepat tiap 6 langkah (0,1 detik waktu simulasi, 10 kali per detik).
-    if (this.stepN++ % 6 === 0) {
-      this.buildObjects();
-      this.sensing.scan();
-      this.perception.update(this.simTime);
+    this.junctions.beginTick();
+    T.requestAll();
+    this.junctions.process();
+    T.stepAll(dt);
+    this.ego.step(dt);
+    this.sensors.step(dt);
+    this.invariants.checkContacts(T.all, this.peds.grid);
+    if (this.stepN % 6 === 0) {
+      T.checkOverlaps();
+      T.checkOffRoad();
     }
-    this.perception.predict(this.simTime);
-    this.planner.step(dt);
-    const cmd = this.control.step();
-    e.integrate(dt, cmd.steer, cmd.acc, cmd.reverse);
-    this.planner.track();
-    this.lateralError = this.planner.trackErr || 0;
-    this.checkCollisions();
-    this.tutorial.check();
     if (this.simTime >= (this.nextBalance || 0)) {
-      this.nextBalance = this.simTime + 0.4;
-      this.updateClosures();
-      this.traffic.balance();
+      this.nextBalance = this.simTime + 0.5;
+      T.balance();
       this.peds.balance();
+      T.watchdog();
     }
-  }
-
-  /** Ruas yang kedua lajurnya tertutup rintangan dianggap ditutup (kendaraan mencari jalan lain). */
-  updateClosures() {
-    const by = new Map();
-    for (const o of this.scen.obstacles) {
-      const seg = o.lane.seg;
-      let e = by.get(seg.id);
-      if (!e) by.set(seg.id, (e = [false, false]));
-      e[o.lane.k] = true;
-    }
-    const closed = new Set();
-    for (const [id, e] of by) if (e[0] && e[1]) closed.add(id);
-    const changed = closed.size !== this.closedSegs.size || [...closed].some((id) => !this.closedSegs.has(id));
-    this.closedSegs = closed;
-    if (changed) this.planner.onClosures();
-  }
-
-  /** Okupansi kotak persimpangan, jumlah kendaraan menuju tiap lajur keluar, dan antrean di lampu. */
-  countBoxes() {
-    for (const k in this.boxOcc) this.boxOcc[k].fill(0);
-    this.connTarget.fill(0);
-    for (const c of this.signals.list) {
-      c.demand.fill(0);
-      c.queueLen.fill(0);
-    }
-    let waiting = 0;
-    const stopped = this.stoppedBuf || (this.stoppedBuf = new Map());
-    for (const arr of stopped.values()) arr.length = 0;
-    const visit = (lane, s, len, v) => {
-      if (lane.type === 'conn') {
-        this.boxOcc[lane.node.id][lane.approach]++;
-        this.connTarget[lane.toLane.id]++;
-        return;
-      }
-      if (!lane.node.signalized) return;
-      const ctl = this.signals.byNode.get(lane.node.id);
-      const dStop = lane.len - (s + len / 2);
-      if (dStop < 45) ctl.demand[lane.dir]++;
-      if (v < 1.5 && dStop < 100) {
-        const key = lane.node.id * 4 + lane.dir;
-        let arr = stopped.get(key);
-        if (!arr) stopped.set(key, (arr = []));
-        arr.push(dStop, dStop + len);
-      }
-    };
-    for (const car of this.traffic.cars) visit(car.lane, car.s, car.len, car.v);
-    const el0 = this.planner.egoLanes()[0];
-    if (el0) visit(el0.lane, el0.s, this.ego.len, this.ego.v);
-    // Antrean = rangkaian kendaraan berhenti yang bersambung dari garis henti ke belakang.
-    for (const [key, arr] of stopped) {
-      if (!arr.length) continue;
-      const pairs = [];
-      for (let i = 0; i < arr.length; i += 2) pairs.push([arr[i], arr[i + 1]]);
-      pairs.sort((a, b) => a[0] - b[0]);
-      let end = 8;
-      let len = 0;
-      for (const [front, back] of pairs) {
-        if (front > end) break;
-        len = Math.max(len, back);
-        end = back + 9;
-        waiting++;
-      }
-      const ctl = this.signals.byNode.get(Math.floor(key / 4));
-      ctl.queueLen[key % 4] = len;
-    }
-    this.waitingNow = waiting;
-  }
-
-  buildObjects() {
-    const out = [];
-    for (const c of this.traffic.cars) {
-      out.push({ id: `car:${c.id}`, cls: 'mobil', kind: 'obb', x: c.x, z: c.z, h: c.h, hl: CAR_LEN / 2, hw: CAR_WID / 2, height: 1.5, vx: c.vx, vz: c.vz, ref: c });
-    }
-    for (const p of this.peds.peds) {
-      out.push({ id: `ped:${p.id}`, cls: 'pejalan', kind: 'circle', x: p.x, z: p.z, h: p.h, hl: 0.3, hw: 0.3, r: 0.3, height: 1.7, vx: p.vx, vz: p.vz, onRoad: p.onRoad, ref: p });
-    }
-    for (const o of this.scen.obstacles) out.push(o);
-    this.objects = out;
-  }
-
-  checkCollisions() {
-    const e = this.ego;
-    const fp = e.footprint();
-    const now = new Set();
-    const near = (x, z, r) => {
-      const dx = x - e.x;
-      const dz = z - e.z;
-      return dx * dx + dz * dz < (r + 3.5) * (r + 3.5);
-    };
-    for (const c of this.traffic.cars) {
-      if (!near(c.x, c.z, 2.3)) continue;
-      if (obbOverlap(fp, { x: c.x, z: c.z, h: c.h, hl: CAR_LEN / 2, hw: CAR_WID / 2 })) now.add(`car:${c.id}`);
-    }
-    for (const o of this.scen.obstacles) {
-      if (!near(o.x, o.z, o.hl + 0.5)) continue;
-      const hit = o.kind === 'circle' ? obbCircle(fp, o.x, o.z, o.r) : obbOverlap(fp, o);
-      if (hit) now.add(o.id);
-    }
-    for (const p of this.peds.peds) {
-      if (!near(p.x, p.z, 0.3)) continue;
-      if (obbCircle(fp, p.x, p.z, 0.28)) now.add(`ped:${p.id}`);
-    }
-    for (const b of this.world.buildings) {
-      if (e.x < b.minx - 4 || e.x > b.maxx + 4 || e.z < b.minz - 4 || e.z > b.maxz + 4) continue;
-      if (obbAabb(fp, b.minx, b.minz, b.maxx, b.maxz)) now.add(`bld:${b.minx}:${b.minz}`);
-    }
-    for (const t of this.world.trees) {
-      if (!near(t.x, t.z, t.r)) continue;
-      if (obbCircle(fp, t.x, t.z, t.r * 0.6)) now.add(`tree:${t.x}:${t.z}`);
-    }
-    for (const p of this.world.poles) {
-      if (!near(p.x, p.z, p.r)) continue;
-      if (obbCircle(fp, p.x, p.z, p.r)) now.add(`pole:${p.x}:${p.z}`);
-    }
-    for (const id of now) {
-      if (!this.contacts.has(id)) {
-        this.counters.collisions++;
-        this.logDebug({ t: Math.round(this.simTime * 10) / 10, type: 'tabrakan', id, v: Math.round(kmh(e.v)), beh: this.planner.behavior, auto: this.autopilot, x: Math.round(e.x), z: Math.round(e.z) });
-        e.v = 0;
-        e.a = 0;
-        const what = id.startsWith('ped') ? 'pejalan kaki' : id.startsWith('car') ? 'mobil lain' : id.startsWith('obs') ? 'rintangan' : 'benda di pinggir jalan';
-        this.toast(`Tabrakan dengan ${what}.`, 'danger');
-      }
-    }
-    this.contacts = now;
   }
 
   // ===== tampilan =====
 
-  render(dt) {
-    const simDt = this.paused ? 0 : dt * this.timeScale;
-    this.traffic.sync();
-    this.peds.sync();
-    this.ego.sync(simDt);
-    this.scen.sync(dt);
+  render(dtReal, alpha) {
+    const simDt = this.paused ? 0 : dtReal * this.timeScale;
+    const v = this.ego.veh;
+    let dh = v.h - v.ph;
+    if (dh > Math.PI) dh -= Math.PI * 2;
+    if (dh < -Math.PI) dh += Math.PI * 2;
+    this.egoPose.x = v.px + (v.x - v.px) * alpha;
+    this.egoPose.z = v.pz + (v.z - v.pz) * alpha;
+    this.egoPose.h = v.ph + dh * alpha;
+    this.focus.x = this.egoPose.x;
+    this.focus.z = this.egoPose.z;
+    const lights = this.weather.lightsOn;
+    this.renderAlpha = alpha;
+    this.traffic.sync(alpha, lights, this.simTime);
+    this.peds.sync(alpha);
+    this.ego.sync(this.egoPose, dtReal, simDt, lights);
+    this.obstacles.sync(lights, this.simTime);
+    this.sensors.sync(dtReal);
     this.signals.sync();
-    this.sensing.sync();
-    this.planner.sync();
-    this.cameras.update(dt);
-    this.weather.fitFog(this.camera.position, this.ego.x, this.ego.z);
-    this.weather.update(simDt, this.camera.position);
-    this.weather.follow(this.ego.x, this.ego.z);
-    this.weather.sky.position.copy(this.camera.position);
-    this.perception.sync(this.camera, this.hud.labels, this.width, this.height);
+    this.cameras.update(dtReal);
+    this.hud.map.draw(dtReal);
+    updateLabels(this.world, this.camera.position.y);
+    this.weather.fitFog(this.camera.position, this.focus.x, this.focus.z);
+    this.weather.update(dtReal, simDt, this.camera.position);
+    this.weather.follow(this.focus.x, this.focus.z);
     this.renderer.render(this.scene, this.camera);
-    this.hudT = (this.hudT || 0) + dt;
-    if (this.hudT > 0.12 || !this.hudOnce) {
+    this.hudT = (this.hudT || 0) + dtReal;
+    if (this.hudT > 0.15 || !this.hudOnce) {
       this.hudT = 0;
       this.hudOnce = true;
       this.hud.update();
@@ -499,7 +385,7 @@ class App {
   }
 
   resize() {
-    if (!this.renderer) return;
+    if (!this.renderer || !this.hud) return;
     const st = this.hud.stage;
     const w = Math.max(1, st.clientWidth);
     const h = Math.max(1, st.clientHeight);
@@ -510,219 +396,130 @@ class App {
     this.camera.updateProjectionMatrix();
   }
 
-  applyQuality() {
-    const q = QUALITY[this.quality] || QUALITY.standar;
-    const dpr = window.devicePixelRatio || 1;
-    this.renderer.setPixelRatio(Math.min(dpr, q.ratio));
-    this.lite = q.lite;
-    this.camera.far = q.far;
-    this.camera.updateProjectionMatrix();
-    if (this.weather) this.weather.setLite(q.lite);
-    if (this.sensing) this.sensing.setPixelRatio(this.renderer.getPixelRatio());
-    if (this.renderer.shadowMap.enabled !== q.shadows) {
-      this.renderer.shadowMap.enabled = q.shadows;
-      this.scene.traverse((o) => {
-        const m = o.material;
-        if (m) (Array.isArray(m) ? m : [m]).forEach((mm) => (mm.needsUpdate = true));
-      });
-    }
-    this.resize();
+  setCabinView(on) {
+    this.ego.model.setCabin(on);
   }
 
-  bindPointer() {
-    const cv = this.renderer.domElement;
-    let down = null;
-    this.disposer.on(cv, 'pointerdown', (ev) => {
-      down = { x: ev.clientX, y: ev.clientY, t: performance.now() };
-    });
-    this.disposer.on(cv, 'pointerup', (ev) => {
-      if (!down) return;
-      const moved = Math.hypot(ev.clientX - down.x, ev.clientY - down.y);
-      const quick = performance.now() - down.t < 450;
-      down = null;
-      if (moved > 6 || !quick || !this.scen.clickArmed || this.mode !== 'bebas') return;
-      const rect = cv.getBoundingClientRect();
-      const ndc = new THREE.Vector2(((ev.clientX - rect.left) / rect.width) * 2 - 1, -((ev.clientY - rect.top) / rect.height) * 2 + 1);
-      const ray = new THREE.Raycaster();
-      ray.setFromCamera(ndc, this.camera);
-      const hit = new THREE.Vector3();
-      if (ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), hit)) this.scen.placeAt(hit.x, hit.z);
-    });
-  }
-
-  // ===== aksi (dipakai tombol dan papan ketik) =====
+  // ===== aksi =====
 
   toast(text, kind) {
     if (this.hud) this.hud.toast(text, kind);
   }
 
   setMode(mode) {
-    if (mode !== 'tutorial' && mode !== 'bebas') return;
+    if (mode !== 'panduan' && mode !== 'jelajah') return;
     if (mode === this.mode) return;
     this.mode = mode;
     this.hud.setMode(mode);
     try {
-      history.replaceState(history.state, '', `#/simulator/${mode}`);
+      history.replaceState(history.state, '', `#/shuttle-3d/${mode}`);
     } catch (e) {
       /* abaikan */
     }
-    // Mode menaruh dengan klik hanya ada di Mode Bebas, jadi selalu dimatikan saat pindah mode.
-    this.armClick(false);
-    if (mode === 'tutorial') {
-      // Tugas tutorial (misalnya menyalip) butuh autopilot, jadi nyalakan lagi bila tadi dimatikan.
-      if (!this.autopilot) this.toggleAutopilot();
-      this.tutorial.go(this.tutorial.i);
-    } else {
-      this.hud.highlight([]);
-      this.toast(this.hud.mobile ? 'Mode Bebas: semua alat tersedia. Coba taruh rintangan dengan mengetuk jalan.' : 'Mode Bebas: semua alat tersedia. Coba taruh rintangan dengan klik di jalan.');
-    }
+    if (mode === 'panduan') this.guide.render();
     this.resize();
   }
 
   setCamera(mode, opts = {}) {
     this.cameras.set(mode, opts);
-    if (!opts.fromTutorial && this.tutorial) this.tutorial.event('camera', mode);
+    this.hud.setCamera(mode);
+    if (!opts.silent) this.guide.event('camera', mode);
   }
 
-  cycleCamera() {
-    const i = CAMERA_MODES.indexOf(this.cameras.mode);
-    this.setCamera(CAMERA_MODES[(i + 1) % CAMERA_MODES.length]);
+  toggleManual() {
+    const r = this.ego.setManual(this.ego.mode !== 'manual');
+    if (!r.ok) this.toast(r.reason, 'warn');
+    this.hud.update();
   }
 
   togglePause() {
     this.paused = !this.paused;
     this.acc = 0;
+    this.hud.update();
   }
 
-  changeSpeed(dir) {
-    let i = SPEED_STEPS.indexOf(this.timeScale);
-    if (i < 0) i = 2;
-    i = clamp(i + dir, 0, SPEED_STEPS.length - 1);
-    this.timeScale = SPEED_STEPS[i];
+  setTimeScale(s) {
+    if (!TIME_SCALES.includes(s)) return;
+    this.timeScale = s;
+    this.hud.update();
   }
 
   toggleHelp(force) {
-    const open = force === undefined ? this.help.hidden : force;
+    const open = force === undefined ? this.hud.help.hidden : force;
     this.hud.showHelp(open);
   }
 
-  setWeather(name) {
-    if (name === this.weather.name) return;
-    this.weather.set(name);
-    this.tutorial.event('weather', name);
-    const cap = this.weather.capReason();
-    if (cap) this.toast(cap);
+  guideEvent(type, value) {
+    if (this.guide) this.guide.event(type, value);
   }
 
-  setQuality(q) {
-    if (!QUALITY[q]) return;
-    this.quality = q;
-    this.applyQuality();
+  /** Jalan ditutup atau dibuka, penghalang dipasang atau diangkat. */
+  onRoadChange(kind, info) {
+    this.traffic.onRoadChange();
+    this.ego.onRoadChange(kind, info);
   }
 
-  setLayer(name, on) {
-    if (name === 'lidar') this.sensing.showLidar = on;
-    if (name === 'boxes') this.perception.showBoxes = on;
-    if (name === 'fov') this.sensing.showFov = on;
-    if (name === 'path') this.planner.showPath = on;
-    if (name === 'queues') this.signals.showQueues = on;
+  onWeatherChange(name) {
+    if (this.hud) this.toast(`Cuaca berganti: ${WEATHER_LABEL[name]}. ${this.ego.weatherNote()}`);
   }
 
-  toggleLidar() {
-    this.sensing.showLidar = !this.sensing.showLidar;
-    this.tutorial.event('lidar', this.sensing.showLidar);
-  }
-
-  toggleBoxes() {
-    this.perception.showBoxes = !this.perception.showBoxes;
-  }
-
-  toggleFov() {
-    this.sensing.showFov = !this.sensing.showFov;
-  }
-
-  togglePath() {
-    this.planner.showPath = !this.planner.showPath;
-  }
-
-  toggleQueues() {
-    this.signals.showQueues = !this.signals.showQueues;
-  }
-
-  setTargetSpeed(kmhValue) {
-    const v = clamp(Math.round(kmhValue / 5) * 5, 10, 70);
-    if (Math.round(kmh(this.targetSpeed)) === v) return;
-    this.targetSpeed = ms(v);
-    this.tutorial.event('speed', v);
-  }
-
-  toggleAutopilot() {
-    this.autopilot = !this.autopilot;
-    for (const k of Object.keys(this.control.keys)) this.control.keys[k] = false;
-    if (this.autopilot) {
-      // kembali ke jalan: cari lajur terdekat dan hitung ulang rute
-      const ok = this.planner.relocate();
-      if (!ok || this.planner.deviation > 6) {
-        this.toast('Mobil terlalu jauh dari jalan. Kemudikan kembali ke lajur dulu.', 'warn');
-        this.autopilot = false;
-        return;
-      }
-      this.toast('Autopilot menyala. Mobil mengemudi sendiri lagi.');
-    } else this.toast(this.hud.mobile ? 'Autopilot mati. Kemudikan dengan tombol Kiri, Gas, Rem, dan Kanan di layar.' : 'Autopilot mati. Kemudikan dengan panah atau W, A, S, D.');
-  }
-
-  emergencyBrake() {
-    this.planner.manualBrakeT = 2.5;
-    this.counters.aebManual++;
-    this.toast('Rem darurat ditekan.', 'danger');
-  }
-
-  placeObstacle(type) {
-    this.scen.placeAhead(type || this.scen.selected);
-  }
-
-  armClick(force) {
-    if (this.mode !== 'bebas') {
-      this.scen.clickArmed = false;
-      this.renderer.domElement.classList.remove('is-armed');
-      if (force !== false) this.toast('Menaruh dengan klik tersedia di Mode Bebas.');
+  /** Catatan intervensi perisai. Untuk shuttle ditulis dalam kalimat sederhana. */
+  shieldLog(veh, cons) {
+    if (!veh.ego) {
+      this.shieldStats.npc++;
       return;
     }
-    this.scen.clickArmed = force === undefined ? !this.scen.clickArmed : force;
-    this.renderer.domElement.classList.toggle('is-armed', this.scen.clickArmed);
+    this.shieldStats.shuttle++;
+    let text;
+    const at = cons.name ? ` di ${cons.name}` : '';
+    const d = Math.max(0, cons.d);
+    if (cons.kind === 'merah') text = `Berhenti, lampu merah${at}`;
+    else if (cons.kind === 'kuning') text = `Berhenti, lampu kuning${at}`;
+    else if (cons.kind === 'zebra') text = `Mengerem, zebra cross sedang dipakai${at}`;
+    else if (cons.kind === 'pejalan-arah') text = `Menahan gas, pejalan kaki akan menyeberang ${fmt(d, 0)} m di depan`;
+    else text = `Menahan gas, pejalan kaki ${fmt(d, 0)} m di depan`;
+    this.shieldLogList.push({ id: ++this.shieldLogId, t: this.simTime, text });
+    if (this.shieldLogList.length > 20) this.shieldLogList.shift();
   }
 
-  clearObstacles() {
-    const n = this.scen.obstacles.length;
-    this.scen.clear();
-    this.toast(n ? 'Semua rintangan dihapus.' : 'Tidak ada rintangan untuk dihapus.');
+  noteClamp(veh, cons) {
+    const e = { t: Math.round(this.simTime * 10) / 10, v: `${veh.type}#${veh.id}`, kind: cons.kind, d: Math.round(cons.d * 100) / 100, link: veh.link.id, x: Math.round(veh.x * 10) / 10, z: Math.round(veh.z * 10) / 10, vv: Math.round(veh.v * 100) / 100 };
+    if (cons.ped) {
+      Object.assign(e, { ped: cons.ped.id, pstate: cons.ped.state, pedge: cons.ped.edge.id, px: Math.round(cons.ped.x * 10) / 10, pz: Math.round(cons.ped.z * 10) / 10 });
+      const L = cons.link;
+      if (L) {
+        e.clink = L.id;
+        e.ckind = L.kind;
+        for (let i = 0; i < L.pedN; i++) {
+          const pe = L.peds[i];
+          if (pe.ped === cons.ped) {
+            e.pes = Math.round(pe.s * 100) / 100;
+            e.pelat = Math.round(pe.lat * 100) / 100;
+            e.pred = pe.pred;
+            e.sw = L.sweepArr ? Math.round(L.sweepArr[Math.max(0, Math.min(L.sweepArr.length - 1, Math.round(pe.s / L.sweepStep)))] * 100) / 100 : 0;
+            break;
+          }
+        }
+      }
+    }
+    this.clampLog.push(e);
+    if (this.clampLog.length > 30) this.clampLog.shift();
   }
 
-  jaywalker() {
-    this.scen.jaywalker();
+  logDebug(entry) {
+    entry.t = Math.round(this.simTime * 10) / 10;
+    this.debugLog.push(entry);
+    if (this.debugLog.length > 60) this.debugLog.shift();
   }
 
-  setSignalMode(mode) {
-    if (mode === this.signals.mode) return;
-    this.signals.setMode(mode);
-    this.tutorial.event('signal', mode);
-    this.toast(mode === 'adaptif' ? 'Lampu adaptif: hijau hanya untuk arah yang ada antreannya.' : 'Lampu waktu tetap: setiap arah mendapat giliran yang sama.');
-  }
-
-  setTrafficDensity(n) {
-    this.traffic.target = clamp(Math.round(n), 0, this.traffic.max);
-  }
-
-  setPedDensity(n) {
-    this.peds.target = clamp(Math.round(n), 0, this.peds.max);
-  }
-
-  // ===== pengait uji =====
+  // ===== pengait uji (baca saja, plus fungsi uji tersembunyi) =====
 
   snapshot() {
+    const T = this.traffic;
     const e = this.ego;
-    const pl = this.planner;
-    const per = this.perception;
+    const byType = {};
+    for (const c of T.cars) byType[c.type] = (byType[c.type] || 0) + 1;
+    const r = this.renderer;
     return Object.freeze({
       ready: !!this.ready,
       mode: this.mode,
@@ -730,84 +527,216 @@ class App {
       timeScale: this.timeScale,
       simTime: this.simTime,
       camera: this.cameras ? this.cameras.mode : null,
-      weather: this.weather ? this.weather.name : null,
-      quality: this.quality,
-      signalMode: this.signals ? this.signals.mode : null,
-      helpOpen: this.help ? !this.help.hidden : false,
-      layers: { lidar: this.sensing.showLidar, boxes: per.showBoxes, fov: this.sensing.showFov, path: pl.showPath, queues: this.signals.showQueues },
-      ego: {
-        x: e.x,
-        z: e.z,
-        heading: e.h,
-        speedKmh: kmh(e.v),
-        targetKmh: kmh(this.targetSpeed),
-        lane: pl.kNow === 0 ? 'kiri' : 'kanan',
-        autopilot: this.autopilot,
-        behavior: pl.behavior,
-        reason: pl.reason,
-        limiter: pl.limiter,
-        ttc: Number.isFinite(pl.ttc) ? pl.ttc : null,
-        deviation: this.lateralError,
-        aeb: pl.aeb,
-        routeItems: pl.route ? pl.route.items.length : 0,
-        destLeft: pl.destLeft,
-        replans: pl.replans || 0,
-        plan: pl.route
-          ? {
-              ri: pl.route.ri,
-              s: Math.round(pl.route.s * 10) / 10,
-              lat: Math.round(pl.route.lat * 100) / 100,
-              active: pl.active ? `${pl.active.kind}:${Math.round(pl.active.start)}+${Math.round(pl.active.len)}` : null,
-              held: pl.held ? `${pl.held.kind}:${pl.held.why}` : null,
-              backup: !!pl.backup,
-              overtake: pl.overtake ? `${pl.overtake.uid}:${Math.round(pl.overtake.sEnd)}:${Math.round(pl.overtake.sOut)}` : null,
-              events: pl.evs.map((e) => `${e.kind}:${Number.isFinite(e.start) ? Math.round(e.start) : 'tahan'}`).join(','),
-            }
-          : null,
-      },
-      counters: { ...this.counters, emergencyBrakes: this.counters.aebAuto + this.counters.aebManual },
-      perception: { count: per.list.length, byClass: per.counts(), pedSeen: per.pedSeen, nextLight: per.light ? { ...per.light } : null },
-      sensing: { lidarRange: this.sensing.ranges().lidar, cameraRange: this.sensing.ranges().kamera, points: this.sensing.pointCount, scans: this.sensing.scanCount },
+      guide: this.guide ? this.guide.summary() : null,
+      weather: { name: this.weather.name, label: WEATHER_LABEL[this.weather.name], next: this.weather.nextName, countdown: this.weather.countdown, mu: this.weather.mu, changes: this.weather.changes },
+      shuttle: e.snapshot(),
+      nav: e.nav.summary(),
+      sensors: this.sensors.summary(),
+      invariants: { redLight: this.invariants.redLight, pedContact: this.invariants.pedContact, events: this.invariants.events.slice(-10) },
+      shield: { shuttle: this.shieldStats.shuttle, npc: this.shieldStats.npc, clamps: T.stats.clamps, log: this.shieldLogList.slice(-5).map((l) => l.text), clampLog: this.clampLog.slice(-10) },
+      collisions: { npcOverlaps: T.stats.overlaps, other: e.stats.collisions },
       traffic: {
-        cars: this.traffic.cars.length,
+        vehicles: T.cars.length,
+        byType,
+        outside: T.outside.length,
         peds: this.peds.peds.length,
-        obstacles: this.scen.obstacles.length,
-        npcOverlaps: this.traffic.countOverlaps(),
-        respawns: this.traffic.respawns,
-        waiting: this.waitingNow,
-        avgWait: { adaptif: this.signals.avgWait('adaptif'), tetap: this.signals.avgWait('tetap') },
-        clickArmed: this.scen.clickArmed,
-        queues: this.signals.list.reduce((m, c) => Math.max(m, ...c.queueLen), 0),
-        queueBars: this.signals.approaches.filter((ap) => ap.ctl.queueLen[ap.k] >= 1).length,
+        stuckNow: T.stuckNow || 0,
+        stuckMax: T.stats.stuckMax,
+        recovered: T.stats.recovered,
+        offRoad: T.stats.offRoad,
+        followClamps: T.stats.followClamps,
+        lineClamps: T.stats.lineClamps,
+        exits: T.stats.exits,
+        entries: T.stats.entries,
+        grants: this.junctions.grants,
+        dilemma: T.stats.dilemma,
+        crossings: this.peds.stats.crossings,
+        gaveUp: this.peds.stats.gaveUp,
+        blockedSteps: this.peds.stats.blockedSteps,
       },
-      tutorial: this.tutorial ? this.tutorial.summary() : null,
-      debug: this.debugLog.slice(-20),
-      probe: this.probe(),
-      screenOf: (x, z) => this.screenOf(x, z),
-      render: { fps: this.fps, calls: this.renderer ? this.renderer.info.render.calls : 0, triangles: this.renderer ? this.renderer.info.render.triangles : 0, width: this.width, height: this.height, pixelRatio: this.renderer ? this.renderer.getPixelRatio() : 0 },
+      signals: this.signals.list.map((c) => ({ id: c.id, stage: c.stage.type, arm: c.stage.arm, yellow: c.plan.yellow })),
+      map: { lanes: this.city.lanes.length, connectors: this.city.conns.length, laneZones: this.city.laneZoneCount || 0, junctions: this.city.junctions.length, signals: this.signals.list.length, crossings: this.city.crossings.length, halte: this.city.halte.map((h) => h.name), buildings: this.city.data.buildings.length },
+      render: { cam: this.camera ? [this.camera.position.x, this.camera.position.y, this.camera.position.z] : null, fps: this.fps, frameMs: this.frameMs, calls: r ? r.info.render.calls : 0, triangles: r ? r.info.render.triangles : 0, width: this.width, height: this.height, pixelRatio: r ? r.getPixelRatio() : 0, droppedSteps: this.droppedSteps },
+      debugLog: this.debugLog.slice(-20),
+      debug: this.debugApi(),
     });
   }
 
-  /** Catatan kejadian penting untuk uji otomatis (dibatasi 40 terakhir). */
-  logDebug(entry) {
-    this.debugLog.push(entry);
-    if (this.debugLog.length > 40) this.debugLog.shift();
-  }
-
-  /** Titik di jalur rencana sekitar 28 m di depan (untuk uji klik di jalan). */
-  probe() {
-    const pl = this.planner;
-    const i = Math.min(pl.pathN - 1, Math.round(28 / 1.5));
-    if (i < 0 || !pl.path[i]) return null;
-    return { x: pl.path[i].x, z: pl.path[i].z };
-  }
-
-  /** Posisi layar (piksel, relatif halaman) untuk titik dunia di tanah. Tidak mengubah apa pun. */
-  screenOf(x, z) {
-    if (!this.camera || !this.renderer) return null;
-    const v = new THREE.Vector3(x, 0, z).project(this.camera);
-    const r = this.renderer.domElement.getBoundingClientRect();
-    return { x: r.left + ((v.x + 1) / 2) * r.width, y: r.top + ((1 - v.y) / 2) * r.height, visible: v.z < 1 };
+  debugApi() {
+    if (this._debug) return this._debug;
+    this._debug = Object.freeze({
+      setWeather: (name) => {
+        this.weather.change(name, true);
+        return this.weather.name;
+      },
+      skipWeather: () => {
+        this.weather.skip();
+        return this.weather.name;
+      },
+      spawnCrossing: () => this.ego.trySpawnCrossing(),
+      requestCrossing: () => this.ego.requestCrossing(),
+      setManual: (on) => this.ego.setManual(on),
+      // khusus uji: masukan kemudi manual 0 sampai 1 (up, down, left, right)
+      drive: (inp) => Object.assign(this.ego.input, inp),
+      // khusus uji: letakkan shuttle manual di pose tertentu (seluruh badan di jalan, tidak menimpa pejalan kaki)
+      placeShuttle: (x, z, h) => {
+        const e = this.ego;
+        const c = Math.cos(h);
+        const s = Math.sin(h);
+        const onPed = this.peds.peds.some((p) => Math.abs((p.x - x) * c + (p.z - z) * s) < 4 && Math.abs((p.z - z) * c - (p.x - x) * s) < 2);
+        if (e.mode !== 'manual' || e.offMask(x, z, h) || onPed) return false;
+        Object.assign(e.veh, { x, z, h, px: x, pz: z, ph: h, v: 0, kappa: 0 });
+        e.vs = 0;
+        e.aSigned = 0;
+        e.snapToLink();
+        return true;
+      },
+      speedLimit: (kmh) => this.ego.setSpeedLimit(kmh),
+      obstacle: (kind) => {
+        const r = this.obstacles.placeAhead(kind);
+        return { ok: r.ok, reason: r.reason, dist: r.dist };
+      },
+      clearObstacles: () => this.obstacles.clear(),
+      toggleRoad: (x, z) => {
+        const id = this.obstacles.roadAt(x, z);
+        return id === null ? { ok: false, reason: 'bukan-jalan' } : this.obstacles.toggleRoad(id);
+      },
+      // khusus uji: tutup jalan pertama di rute shuttle yang lebih dari minDist meter di depan
+      closeAhead: (minDist = 80) => {
+        const v = this.ego.veh;
+        let d = -v.s;
+        for (const l of [v.link].concat(v.path, v.route || [])) {
+          if (d > minDist && l.kind === 'lane' && l.roadId >= 0) {
+            const r = this.obstacles.closeRoad(l.roadId);
+            if (r.ok) return { ...r, roadId: l.roadId, dist: d };
+          }
+          d += l.len;
+        }
+        return { ok: false };
+      },
+      openRoad: (id) => this.obstacles.openRoad(id),
+      // khusus uji: pose di tengah lajur lurus yang panjang (untuk uji mengemudi manual)
+      lanePoses: () =>
+        this.city.lanes
+          .filter((l) => l.core && !l.closed && l.ring === null && l.len > 70)
+          .map((l) => {
+            const s = l.len > 130 ? 8 : l.len / 2 - 20;
+            const o = l.poly.atSmooth(s, {});
+            return { id: l.id, x: o.x, z: o.z, h: o.h, len: l.len - s, name: l.name || '', routable: this.city.halte.some((hh) => this.ego.routeTo(l, s, hh)) };
+          }),
+      callPassengers: (i, n) => this.ego.pax.call(i, n),
+      sensorView: (v) => this.sensors.setView(v),
+      lidarRays: (on) => this.sensors.setRays(on),
+      signalArms: () => this.signals.list.flatMap((c) => c.arms.map((a, i) => ({ ctl: c.id, arm: i, x: a.x, z: a.z, h: a.h, half: a.half, name: a.name, color: c.color(i) }))),
+      egoRoute: () => [this.ego.veh.link].concat(this.ego.veh.path, this.ego.veh.route || []).map((l) => l.id),
+      // khusus uji: jalankan n langkah fisika 1/60 detik tanpa menggambar
+      runSteps: (n) => {
+        const t0 = performance.now();
+        for (let i = 0; i < n; i++) this.step(DT);
+        return performance.now() - t0;
+      },
+      screenOf: (x, z) => {
+        const v = new THREE.Vector3(x, 0, z).project(this.camera);
+        const rc = this.renderer.domElement.getBoundingClientRect();
+        return { x: rc.left + ((v.x + 1) / 2) * rc.width, y: rc.top + ((1 - v.y) / 2) * rc.height, visible: v.z < 1 };
+      },
+      lookAt: (x, z, height) => {
+        this.cameras.set('peta', { instant: true });
+        this.hud.setCamera('peta');
+        this.cameras.mapHeight = height || 230;
+        this.viewOverride = { x, z, h: 0 };
+        this.cameras.fx.reset(x);
+        this.cameras.fz.reset(z);
+      },
+      // khusus uji: titik rute shuttle d meter di depan, dan posisinya di layar peta rute
+      routeAhead: (d) => {
+        const n = this.ego.nav;
+        const cum = n.routeCum;
+        for (let i = 0; i < cum.length; i++) if (cum[i] >= n.progress + d) return { x: n.route[i * 2], z: n.route[i * 2 + 1] };
+        return null;
+      },
+      mapScreenOf: (x, z) => {
+        const p = this.hud.map.toScreen(x, z);
+        const rc = this.hud.map.canvas.getBoundingClientRect();
+        return { x: rc.left + p.x, y: rc.top + p.y };
+      },
+      clearView: () => {
+        this.viewOverride = null;
+      },
+      shield: SHIELD,
+      offRoadEvents: () => (this.traffic.offRoadEvents || []).slice(-400),
+      linkInfo: (id) => { const l = this.city.links[id]; return l ? { kind: l.kind, len: l.len, stopLen: l.stopLen, name: l.name, cls: l.cls, j: l.junction ? l.junction.id : null, move: l.move, from: l.from ? l.from.id : null, to: l.to ? l.to.id : null } : null; },
+      sceneStats: () => {
+        const out = [];
+        this.scene.traverse((o) => {
+          if (!o.isMesh || !o.geometry) return;
+          const g = o.geometry;
+          const tri = (g.index ? g.index.count : g.attributes.position.count) / 3;
+          const n = o.isInstancedMesh ? o.count : 1;
+          out.push({ name: o.name || o.type, tris: Math.round(tri * n), inst: n, shadow: o.castShadow });
+        });
+        return out.sort((a, b) => b.tris - a.tris).slice(0, 25);
+      },
+      probe: (id, x, z) => {
+        const l = this.city.links[id];
+        const pr = l.poly.project(x, z, {});
+        const a = l.sweepArr;
+        return { s: pr.s, lat: pr.lat, len: l.len, sweep: a ? a[Math.max(0, Math.min(a.length - 1, Math.round(pr.s / l.sweepStep)))] : 0, maxSweep: l.sweep };
+      },
+      probeNear: (x, z) =>
+        this.city.linksNear(x, z).map((l) => {
+          const pr = l.poly.project(x, z, {});
+          const a = l.sweepArr;
+          return { id: l.id, kind: l.kind, s: Math.round(pr.s * 100) / 100, lat: Math.round(pr.lat * 100) / 100, len: Math.round(l.len * 100) / 100, sweep: a ? Math.round(a[Math.max(0, Math.min(a.length - 1, Math.round(pr.s / l.sweepStep)))] * 100) / 100 : 0 };
+        }).filter((q) => Math.abs(q.lat) < 4 && q.s > -1 && q.s < q.len + 1),
+      egoCons: () => {
+        const v = this.ego.veh;
+        const c = v.cons;
+        const o = { d: c.d, kind: c.kind, link: c.link ? c.link.id : null, v: v.v, s: v.s, vlink: v.link.id, path: v.path.slice(0, 3).map((l) => l.id) };
+        if (c.ped && c.link) {
+          const L = c.link;
+          for (let i = 0; i < L.pedN; i++) if (L.peds[i].ped === c.ped) Object.assign(o, { pes: L.peds[i].s, pelat: L.peds[i].lat, pred: L.peds[i].pred, px: c.ped.x, pz: c.ped.z, pstate: c.ped.state });
+        }
+        return o;
+      },
+      stopBacks: () => this.city.lanes.filter((l) => l.stopLen < l.len - 0.01).map((l) => Math.round((l.len - l.stopLen) * 10) / 10),
+      // khusus uji: keadaan kendaraan yang diam paling lama (untuk mencari kebuntuan)
+      vehicles: (minStuck = 0) =>
+        this.traffic.all
+          .filter((v) => v.stuckT >= minStuck)
+          .map((v) => ({ id: v.id, type: v.type, link: v.link.id, lk: v.link.kind, s: Math.round(v.s * 10) / 10, len: Math.round(v.link.len * 10) / 10, v: Math.round(v.v * 100) / 100, stuck: Math.round(v.stuckT), reason: v.planReason, grants: v.grants.map((g) => g.c.id), req: v.reqConn ? v.reqConn.id : null, path: v.path.slice(0, 12).map((l) => `${l.kind === 'conn' ? 'c' : l.ring !== null ? 'r' : 'l'}${l.id}:${Math.round(l.len * 10) / 10}${l.portal ? l.portal : ''}${l.occN ? '*' + l.occN : ''}`), x: Math.round(v.x * 10) / 10, z: Math.round(v.z * 10) / 10, cons: v.cons.kind, consD: Math.round(v.cons.d * 10) / 10, rbExit: v.rbExit ? v.rbExit.id : null, why: v.waitWhy || 0 })),
+      zoneInfo: (id) => {
+        const c = this.city.links[id];
+        if (!c) return null;
+        return {
+          laneZones: (c.laneZones || []).map((z) => ({ lane: z.lane.id, kind: z.kind, s0: z.s0, s1: z.s1, cs1: z.cs1, laneLen: z.lane.len, stopLen: z.lane.stopLen, occ: Array.from({ length: z.lane.occN }, (_, i) => ({ v: z.lane.occ[i].veh.id, s: z.lane.occ[i].s })) })),
+          conflicts: (c.conflicts || []).map((k) => ({ o: k.o.id, my: k.my, ot: k.ot, zone: !!k.zone, holders: k.o.holders.map((w) => w.id) })),
+          rank: c.rank,
+          approach: (c.approach || []).map((a) => ({ v: a.veh.id, d: a.d })),
+        };
+      },
+      // khusus uji: ubah jumlah kendaraan NPC yang dijaga (dipakai juga oleh pengatur kepadatan nanti)
+      setTraffic: (n) => {
+        this.traffic.target = Math.max(0, Math.min(this.traffic.max, Math.round(n)));
+        return this.traffic.target;
+      },
+      pedList: () => this.peds.peds.map((p) => ({ id: p.id, state: p.state, edge: p.edge.id, t: Math.round(p.t * 10) / 10, fwd: p.fwd, x: Math.round(p.x), z: Math.round(p.z), wait: Math.round(p.waitT) })),
+      // khusus uji: posisi tepat untuk pemantau geometri independen
+      geo: () => ({
+        v: this.traffic.all.map((v) => [v.x, v.z, v.h, v.len / 2, v.hw, v.v, v.id, v.ego ? 1 : 0]),
+        p: this.peds.peds.map((p) => [p.x, p.z, p.id]).concat(this.ego.pax.walkers.map((w) => [w.x, w.z, -1])),
+        a: this.signals.list.flatMap((c) => c.arms.map((a, i) => [a.x, a.z, a.h, a.half, c.color(i)])),
+      }),
+      pedStates: () => {
+        const o = { walk: 0, wait: 0, cross: 0, test: 0 };
+        for (const p of this.peds.peds) {
+          o[p.state] = (o[p.state] || 0) + 1;
+          if (p.test) o.test++;
+        }
+        return o;
+      },
+    });
+    return this._debug;
   }
 
   destroy() {
@@ -833,20 +762,20 @@ class App {
     if (this.styleState && this.styleState.link) this.styleState.link.remove();
     this.scene = null;
     this.world = null;
-    this.graph = null;
+    this.city = null;
   }
 }
 
-export async function mount(container, { mode = 'tutorial', navigate } = {}) {
-  const app = new App(container, mode === 'bebas' ? 'bebas' : 'tutorial', navigate);
+export async function mount(container, { mode = 'panduan', navigate } = {}) {
+  const m = mode === 'jelajah' || mode === 'bebas' ? 'jelajah' : 'panduan';
+  const app = new App(container, m, navigate);
   try {
     await app.init();
   } catch (err) {
-    // Jika gagal di tengah jalan, bersihkan dan tampilkan pesan ramah.
-    console.warn('Simulator 3D gagal dimuat:', err);
+    console.warn('Shuttle 3D gagal dimuat:', err);
     const nav = app.navigate;
     app.destroy();
-    const again = new App(container, app.mode, nav);
+    const again = new App(container, m, nav);
     again.fail();
     return { destroy: () => again.destroy() };
   }

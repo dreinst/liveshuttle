@@ -6,7 +6,7 @@
   2. Label "Ld" dan "titik tujuan" tidak boleh tertutup chip HUD atau keluar kanvas (Ld 17 m).
   3. Tampilan seluruh lintasan: penunjuk setir tidak menutupi lintasan.
 
-Pemakaian: python3 tests/kontrol_indep_edge.py [--mobile] [--port 8136]
+Pemakaian: python3 tests/kontrol_indep_edge.py [--mobile] [--port 8246]
 """
 import json
 import sys
@@ -58,7 +58,7 @@ with q.S() as s:
     s.page.wait_for_timeout(2500)
     s.shot("e5-seluruh-panggung", selector=".stage")
     # pengambilalihan saat seluruh lintasan tampil: chip HUD bertambah, lintasan tidak boleh tertutup
-    R["ld15_small"] = s.drag_slider("Lookahead Ld", 1.5)
+    R["ld2_small"] = s.drag_slider("Lookahead Ld", 2)
     for _ in range(80):
         if "[tersembunyi]" not in s.hud().get("Pengemudi cadangan", "[tersembunyi]"):
             break

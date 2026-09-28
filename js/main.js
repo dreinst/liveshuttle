@@ -1,13 +1,18 @@
-// SimOtonom: boot aplikasi, router hash, dan kait uji (window.__simotonom).
+// LiveShuttle: boot aplikasi, router hash, dan kait uji (window.__simotonom, nama lama dipertahankan).
 //
 // Rute:
-//   #/                     beranda
-//   #/pelajaran            beranda, digulir ke daftar pelajaran
-//   #/pelajaran/<id>       halaman pelajaran
-//   #/simulator            dialihkan ke #/simulator/tutorial
-//   #/simulator/tutorial   simulator kota 3D, mode tutorial
-//   #/simulator/bebas      simulator kota 3D, mode bebas
-//   lainnya                kembali ke beranda
+//   #/                       beranda
+//   #/pelajaran              beranda, digulir ke daftar pelajaran
+//   #/pelajaran/<id>         halaman pelajaran
+//   #/shuttle-3d             dialihkan ke #/shuttle-3d/panduan
+//   #/shuttle-3d/panduan     Shuttle 3D Ma Chung, mode panduan
+//   #/shuttle-3d/jelajah     Shuttle 3D Ma Chung, mode jelajah
+//   #/simulator[/tutorial]   rute lama, dialihkan ke #/shuttle-3d/panduan
+//   #/simulator/bebas        rute lama, dialihkan ke #/shuttle-3d/jelajah
+//   lainnya                  kembali ke beranda
+//
+// Kedua mode 3D memakai kunci rute yang sama ('sim'), jadi pindah panduan <-> jelajah tidak
+// memasang ulang simulator bila modulnya bisa berganti mode di tempat (lihat simulator-page.js).
 
 import { findLesson } from './lessons/index.js';
 import { createHeader } from './shell/header.js';
@@ -56,12 +61,21 @@ function parse(hash) {
     if (findLesson(parts[1]) && parts.length === 2) return { name: 'lesson', id: parts[1], key: `lesson:${parts[1]}` };
     return { redirect: '#/' };
   }
+  if (parts[0] === 'shuttle-3d') {
+    if ((parts[1] === 'panduan' || parts[1] === 'jelajah') && parts.length === 2) return { name: 'sim', mode: parts[1], key: 'sim' };
+    return { redirect: '#/shuttle-3d/panduan' };
+  }
   if (parts[0] === 'simulator') {
-    if (parts.length === 1) return { redirect: '#/simulator/tutorial' };
-    if ((parts[1] === 'tutorial' || parts[1] === 'bebas') && parts.length === 2) return { name: 'sim', mode: parts[1], key: `sim:${parts[1]}` };
-    return { redirect: '#/simulator/tutorial' };
+    return { redirect: parts[1] === 'bebas' ? '#/shuttle-3d/jelajah' : '#/shuttle-3d/panduan' };
   }
   return { redirect: '#/' };
+}
+
+const SITE = 'LiveShuttle';
+function pageTitle(route) {
+  if (route.name === 'lesson') return `${findLesson(route.id)?.title || 'Pelajaran'} · ${SITE}`;
+  if (route.name === 'sim') return `Shuttle 3D Ma Chung, ${route.mode === 'jelajah' ? 'Jelajah' : 'Panduan'} · ${SITE}`;
+  return `${SITE} · Belajar transportasi tanpa pengemudi`;
 }
 
 let current = null;
@@ -76,6 +90,8 @@ function render() {
   }
   if (route.key === currentKey) {
     if (route.scrollTo === 'lessons') document.getElementById('daftar-pelajaran')?.scrollIntoView({ block: 'start' });
+    // pindah mode 3D (panduan <-> jelajah) tanpa memasang ulang bila memungkinkan
+    if (route.name === 'sim' && typeof current?.setMode === 'function') current.setMode(route.mode);
     setState({ route: location.hash || '#/' });
     return;
   }
@@ -103,11 +119,21 @@ function render() {
     simMode: null,
   });
   header.update(route);
+  document.title = pageTitle(route);
   if (!route.scrollTo) window.scrollTo(0, 0);
 
   const hooks = { setState, reducedMotion };
   if (route.name === 'lesson') current = renderLesson(main, route.id, hooks);
-  else if (route.name === 'sim') current = renderSimulator(main, route.mode, hooks);
+  else if (route.name === 'sim') {
+    // dipanggil simulator-page.js setiap kali mode 3D berganti (dari rute atau dari dalam modul)
+    hooks.onModeChange = (mode) => {
+      const r = { ...route, mode };
+      header.update(r);
+      document.title = pageTitle(r);
+      setState({ simMode: mode, route: location.hash || '#/' });
+    };
+    current = renderSimulator(main, route.mode, hooks);
+  }
   else current = renderHome(main, { reducedMotion, scrollTo: route.scrollTo });
 
   // pindahkan fokus ke judul halaman agar pembaca layar tahu halaman berganti

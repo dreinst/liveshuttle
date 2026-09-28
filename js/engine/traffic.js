@@ -94,11 +94,18 @@ export function speedToStop(distance, decel = 3) {
 /**
  * Kecepatan target sederhana untuk kendaraan latar yang mengikuti kendaraan di depan.
  * gap = jarak bersih bemper ke bemper (m).
- * Hasil tidak melebihi cruise, menjaga jarak minimum dan jarak waktu (time gap).
+ * Hasil tidak melebihi cruise dan tetap bisa berhenti bila pemimpin mengerem (bySafeStop).
+ * Catatan jujur: dengan bawaan (strict = false), jarak mantap saat mengikuti pada kecepatan v adalah
+ * minGap + 0,5 * v * timeGap, jadi hanya setengah jarak waktu. Berikan strict: true agar jarak
+ * mantapnya minGap + v * timeGap (sesuai definisi jarak waktu). Bawaan dibiarkan demi pelajaran lama.
  */
-export function followingSpeed(gap, leaderSpeed, { cruise = 10, minGap = 2.5, timeGap = 1.2, decel = 3 } = {}) {
+export function followingSpeed(gap, leaderSpeed, { cruise = 10, minGap = 2.5, timeGap = 1.2, decel = 3, strict = false } = {}) {
   const free = gap - minGap;
   if (free <= 0) return 0;
+  if (strict) {
+    const bySafeStop = Math.sqrt(Math.max(0, leaderSpeed * leaderSpeed + 2 * decel * free));
+    return clamp(Math.min(free / timeGap, bySafeStop), 0, cruise);
+  }
   const byTimeGap = free / timeGap;
   const bySafeStop = Math.sqrt(Math.max(0, leaderSpeed * leaderSpeed + 2 * decel * free));
   return clamp(Math.min(byTimeGap + leaderSpeed * 0.5, bySafeStop), 0, cruise);
@@ -116,9 +123,9 @@ export function shouldStopForYellow(distance, speed, comfortDecel = 3) {
  * Kecepatan target kendaraan latar di sebuah jalur yang punya garis henti berlampu.
  * @param {object} agent PathAgent (butuh s, speed, cruise, dan length atau radius)
  * @param {Array<{s:number, light:TrafficLight}>} stops posisi garis henti sepanjang jalur
- * @param {object} [opts] { leaderGap, leaderSpeed, decel, margin }
+ * @param {object} [opts] { leaderGap, leaderSpeed, decel, margin, timeGap, strict (lihat followingSpeed) }
  */
-export function laneTargetSpeed(agent, stops = [], { leaderGap = Infinity, leaderSpeed = 0, decel = 3, margin = 0.8 } = {}) {
+export function laneTargetSpeed(agent, stops = [], { leaderGap = Infinity, leaderSpeed = 0, decel = 3, margin = 0.8, timeGap = 1.2, strict = false } = {}) {
   const half = agent.length != null ? agent.length / 2 : agent.radius ?? 0;
   let v = agent.cruise;
   for (const stop of stops) {
@@ -129,6 +136,6 @@ export function laneTargetSpeed(agent, stops = [], { leaderGap = Infinity, leade
       v = Math.min(v, d <= 0.05 ? 0 : speedToStop(d, decel));
     }
   }
-  if (leaderGap < Infinity) v = Math.min(v, followingSpeed(leaderGap, leaderSpeed, { cruise: agent.cruise, decel }));
+  if (leaderGap < Infinity) v = Math.min(v, followingSpeed(leaderGap, leaderSpeed, { cruise: agent.cruise, decel, timeGap, strict }));
   return v;
 }

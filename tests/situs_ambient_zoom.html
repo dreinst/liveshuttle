@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <title>Uji situs: kanvas beranda diperbesar</title>
+    <link rel="stylesheet" href="../css/style.css" />
+    <style>body { margin: 0; background: #0b1220; } #amb { position: relative; width: 2400px; height: 1530px; }</style>
+  </head>
+  <body>
+    <div id="amb"></div>
+    <script type="module">
+      import { mountAmbient } from '../js/shell/ambient.js';
+      window.__amb = mountAmbient(document.getElementById('amb'), { reducedMotion: false });
+    </script>
+  </body>
+</html>

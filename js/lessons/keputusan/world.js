@@ -1,85 +1,56 @@
-// Dunia simulasi pelajaran Pengambilan Keputusan.
+// Dunia simulasi pelajaran Pengambilan Keputusan di Jalan Kawi, Malang.
 //
-// Jalan lurus dua arah membentang timur-barat di y = 0 dengan lalu lintas kiri. Mobil otonom
-// melaju ke timur di lajur kiri (y = -1,75). Lajur kanan (y = +1,75) dipakai kendaraan dari
-// arah berlawanan, dan boleh dipakai untuk menyalip saat kosong.
+// Tata letak berasal dari data OpenStreetMap (lihat scene.js): Jalan Kawi dua arah dengan satu
+// lajur per arah (lebar perkiraan), simpang berlampu dengan Jalan Kelud dan Jalan Arjuno, dua
+// penyeberangan di kaki simpang, dan satu zebra cross tanpa lampu di timur simpang.
 //
-// Dunia berulang setiap L meter: persimpangan berlampu, zebra cross, dan tempat mobil mogok
-// muncul lagi di setiap putaran, jadi kejadian yang sama bisa diamati berkali-kali.
-// Mobil otonom, mobil dari arah berlawanan, dan pejalan kaki memakai koordinat mutlak. Saat
-// mobil otonom sudah lewat satu putaran, semuanya digeser mundur L meter. Pergeseran ini tidak
-// terlihat karena pemandangannya sama persis.
+// Mobil otonom melaju ke timur di lajur kiri (lalu lintas kiri). Lajur kanan dipakai kendaraan dari
+// arah berlawanan (mobil, angkot, sepeda motor) dan boleh dipakai untuk menyalip saat kosong.
+// Kendaraan di Jalan Kelud dan Jalan Arjuno melintas lurus saat lampu mereka hijau.
+// Ruas yang disimulasikan sekitar 340 m. Setelah sampai di ujung, mobil otonom mulai lagi dari
+// awal ruas (pelajaran memberi tahu hal ini lewat log).
 //
-// File ini berisi model dunia (lampu, lalu lintas lain, pejalan kaki, mobil mogok) dan cara
-// menggambarnya. Logika keputusan mobil otonom ada di ./planner.js.
+// Koordinat Jalan Kawi memakai kerangka jalan dari scene.js: x = s (m sepanjang jalan),
+// y = geseran ke samping (positif = kanan arah timur). Kendaraan di jalan simpang memakai
+// koordinat peta langsung.
+//
+// Setiap langkah fisika, SETIAP kendaraan melewati perisai keselamatan (shield.js) sebelum
+// percepatannya dipakai. Pemeriksa invarian terpisah menghitung terobos lampu merah dan kontak
+// dengan pejalan kaki, yang harus selalu 0.
 
-import { Vehicle, PathAgent } from '../../engine/vehicle.js';
-import { Path, boxesOverlap, distanceToBox } from '../../engine/geometry.js';
-import { speedToStop, followingSpeed, shouldStopForYellow, laneTargetSpeed } from '../../engine/traffic.js';
-import { stopLine, crosswalk } from '../../engine/road.js';
-import { Rng, mulberry32, approach, kmhToMs } from '../../engine/math.js';
-import { COLORS, withAlpha } from '../../engine/theme.js';
-import {
-  rectBox,
-  drawBuilding,
-  drawTree,
-  drawCar,
-  drawPedestrian,
-  drawTrafficLight,
-  drawCrosswalk,
-  drawStopLine,
-  drawLine,
-  drawRing,
-} from '../../engine/draw.js';
+import { Vehicle } from '../../engine/vehicle.js';
+import { boxesOverlap, distanceToBox } from '../../engine/geometry.js';
+import { speedToStop, followingSpeed } from '../../engine/traffic.js';
+import { Rng, clamp, kmhToMs } from '../../engine/math.js';
+import { COLORS } from '../../engine/theme.js';
+import { SAFETY, brakeLimit, yellowMustStop, canStopForPed, limitAccel, createCounters } from './shield.js';
+import { ROAD_HALF, EGO_LAT, ONC_LAT, CW_HALF } from './scene.js';
 
-// ---------- tata letak satu putaran (koordinat lokal 0 sampai L) ----------
-
-export const L = 280; // panjang satu putaran dunia (m)
-export const EGO_Y = -1.75; // tengah lajur kiri (arah timur)
-export const ONC_Y = 1.75; // tengah lajur kanan (arah barat)
-export const ROAD_HALF = 3.5;
-export const WALK = 2.5; // lebar trotoar
-export const INT_X = 70; // tengah jalan simpang
-export const SIDE_HALF = 3.5;
-export const STOP_E = 64; // garis henti arah timur (lajur mobil otonom)
-export const STOP_W = 76; // garis henti arah barat
-export const ZEBRA_X = 150;
-export const ZEBRA_HALF = 2; // setengah lebar pita zebra searah jalan
-export const YIELD_GAP = 1.5; // jarak garis berhenti ke tepi zebra
-export const STALL_X = 225; // tempat mobil mogok (titik tengah)
-export const STALL_Y = -2.0; // sedikit menepi ke kiri
-export const PASS_A = 185; // ruas garis tengah putus-putus (boleh menyalip)
-export const PASS_B = 268;
-export const ONC_CRUISE = kmhToMs(40);
 export const RANGE = 80; // jangkauan persepsi dekat (kamera dan LiDAR), m
-export const RANGE_FAR = 250; // jangkauan radar jarak jauh untuk mobil lawan, m
+export const RANGE_FAR = 250; // jangkauan radar jarak jauh untuk kendaraan dari arah berlawanan, m
 export const PED_Y = ROAD_HALF + 1.1; // posisi menunggu pejalan kaki di trotoar
 export const PED_SPEED = 1.35; // m/s
+export const YIELD_GAP = 1.5; // jarak garis beri jalan ke tepi zebra cross
+export const ANGKOT_LAT = EGO_LAT - 0.55; // angkot ngetem menepi ke kiri, dekat kerb
+export const EGO_BRAKE = brakeLimit(8);
 
-const GEN_AHEAD = 380; // mobil lawan dibuat sampai sejauh ini di depan mobil otonom
-const GEN_BEHIND = 120;
-const EAST_LIGHT = { x: 65.2, y: -5.0, heading: Math.PI };
-const WEST_LIGHT = { x: 74.8, y: 5.0, heading: 0 };
-const SOUTH_LIGHT = { x: 74.8, y: -5.0, heading: -Math.PI / 2 };
-const NORTH_LIGHT = { x: 65.2, y: 5.0, heading: Math.PI / 2 };
-
-// jeda antarmobil dari arah berlawanan (m). Setiap `every` mobil ada satu celah panjang supaya
-// mobil otonom tidak menunggu selamanya.
+// jarak antarkendaraan dari arah berlawanan (m). Setiap `every` kendaraan ada satu celah panjang
+// supaya mobil otonom tidak menunggu selamanya untuk menyalip.
 export const DENSITY = {
   kosong: null,
-  sepi: { min: 130, max: 230, every: 2, gapMin: 240, gapMax: 320 },
-  sedang: { min: 45, max: 100, every: 3, gapMin: 210, gapMax: 260 },
-  padat: { min: 26, max: 48, every: 5, gapMin: 200, gapMax: 230 },
+  sepi: { min: 110, max: 210, every: 2, gapMin: 240, gapMax: 320 },
+  sedang: { min: 40, max: 90, every: 3, gapMin: 210, gapMax: 260 },
+  padat: { min: 22, max: 42, every: 5, gapMin: 200, gapMax: 230 },
 };
 
 // ---------- lampu lalu lintas ----------
 
-const DUR = { MAIN_GREEN: 14, MAIN_YELLOW: 3, ALL_RED_1: 2, SIDE_GREEN: 10, SIDE_YELLOW: 3, ALL_RED_2: 2 };
-export const YELLOW_TIME = DUR.MAIN_YELLOW;
+export const DUR = Object.freeze({ MAIN_GREEN: 14, MAIN_YELLOW: SAFETY.yellow, ALL_RED_1: 2, SIDE_GREEN: 10, SIDE_YELLOW: SAFETY.yellow, ALL_RED_2: 2 });
 
 /**
- * Pengatur lampu persimpangan. Arah utama = jalan lurus (timur-barat), arah simpang = utara-selatan.
- * mode: 'otomatis' (bergiliran), 'merah' (arah utama dipaksa merah), 'hijau' (arah utama dipaksa hijau).
+ * Pengatur lampu simpang. Arah utama = Jalan Kawi, arah simpang = Jalan Kelud dan Jalan Arjuno.
+ * Titik lampunya ada di data OSM. Durasi fase buatan simulasi.
+ * mode: 'otomatis' (bergiliran), 'merah' (Jalan Kawi dipaksa merah), 'hijau' (Jalan Kawi dipaksa hijau).
  * Hijau selalu berganti ke kuning dulu, lalu semua merah sebentar, baru arah lain hijau.
  */
 export class Signal {
@@ -87,12 +58,13 @@ export class Signal {
     this.mode = 'otomatis';
     this.phase = 'MAIN_GREEN';
     this.t = 0;
-    this.yellowId = 0; // bertambah setiap arah utama mulai kuning
+    this.yellowId = 0; // bertambah setiap Jalan Kawi mulai kuning
+    this.sideYellowId = 0;
   }
 
-  reset(phase = 'MAIN_GREEN', t = 0) {
-    this.phase = phase;
-    this.t = t;
+  reset() {
+    this.phase = 'MAIN_GREEN';
+    this.t = 0;
   }
 
   get main() {
@@ -107,6 +79,7 @@ export class Signal {
     this.phase = phase;
     this.t = 0;
     if (phase === 'MAIN_YELLOW') this.yellowId += 1;
+    if (phase === 'SIDE_YELLOW') this.sideYellowId += 1;
   }
 
   update(dt) {
@@ -136,12 +109,19 @@ export class Signal {
     }
   }
 
-  /** Sisa waktu kuning arah utama (detik), 0 bila tidak kuning. */
+  /** Sisa waktu kuning Jalan Kawi (detik), 0 bila tidak kuning. */
   yellowLeft() {
     return this.phase === 'MAIN_YELLOW' ? Math.max(0, DUR.MAIN_YELLOW - this.t) : 0;
   }
 
-  /** Detik sampai warna lampu arah utama berganti, atau null bila warnanya ditahan. */
+  /** Pejalan kaki boleh mulai menyeberangi Jalan Kawi di kaki simpang (Jalan Kawi merah cukup lama). */
+  pedPhaseOk() {
+    if (this.phase !== 'SIDE_GREEN') return false;
+    if (this.mode === 'merah') return true;
+    return this.mode === 'otomatis' && DUR.SIDE_GREEN - this.t >= 3;
+  }
+
+  /** Detik sampai warna lampu Jalan Kawi berganti, atau null bila warnanya ditahan. */
   mainTimeLeft() {
     const { mode: m, t } = this;
     switch (this.phase) {
@@ -165,162 +145,284 @@ export class Signal {
   }
 }
 
-// ---------- pemandangan tetap ----------
+// ---------- jenis kendaraan lain ----------
 
-function buildStatic() {
-  const rnd = mulberry32(7);
-  const r = (a, b) => a + (b - a) * rnd();
-  const buildings = [];
-  const spans = [
-    [3, 59],
-    [81, 277],
-  ];
-  for (const side of [-1, 1]) {
-    for (const [a, b] of spans) {
-      let x = a + r(0, 3);
-      while (x < b - 8) {
-        const w = Math.min(r(12, 22), b - x);
-        if (w < 8) break;
-        const setback = 8.2 + r(0, 1.6);
-        const depth = r(9, 15);
-        const y0 = side < 0 ? -(setback + depth) : setback;
-        const y1 = side < 0 ? -setback : setback + depth;
-        buildings.push(rectBox(x, y0, x + w, y1));
-        x += w + r(3, 6);
-      }
-    }
-  }
-  const trees = [];
-  for (const side of [-1, 1]) {
-    for (let x = 6 + (side > 0 ? 7 : 0); x < L - 4; x += 15 + r(0, 3)) {
-      if (x > 55 && x < 85) continue; // persimpangan
-      if (x > 143 && x < 157) continue; // zebra cross
-      trees.push({ x, y: side * 7.0, r: 1.3 + r(0, 0.45) });
-    }
-  }
-  const lamps = [];
-  for (let x = 20; x < L; x += 40) {
-    if (x > 55 && x < 85) continue;
-    lamps.push({ x, y: -6.3 }, { x: x + 20, y: 6.3 });
-  }
-  const zebra = crosswalk({ x: ZEBRA_X, y: 0, heading: Math.PI / 2, length: 2 * ROAD_HALF, width: 2 * ZEBRA_HALF });
-  const lines = [
-    stopLine({ x: STOP_E, y: EGO_Y, heading: 0 }),
-    stopLine({ x: STOP_W, y: ONC_Y, heading: Math.PI }),
-    stopLine({ x: INT_X + 1.75, y: -6.3, heading: Math.PI / 2 }),
-    stopLine({ x: INT_X - 1.75, y: 6.3, heading: -Math.PI / 2 }),
-  ];
-  const yieldLines = [
-    stopLine({ x: ZEBRA_X - ZEBRA_HALF - YIELD_GAP, y: EGO_Y, heading: 0, width: 0.25 }),
-    stopLine({ x: ZEBRA_X + ZEBRA_HALF + YIELD_GAP, y: ONC_Y, heading: Math.PI, width: 0.25 }),
-  ];
-  return { buildings, trees, lamps, zebra, lines, yieldLines };
+const KIND_SPEC = {
+  motor: { length: 1.9, width: 0.72, maxBrake: 6, aMax: 2.6 },
+  city: { length: 3.7, width: 1.65, maxBrake: 7, aMax: 2 },
+  mpv: { length: 4.4, width: 1.73, maxBrake: 7, aMax: 1.8 },
+  car: { length: 4.5, width: 1.8, maxBrake: 7, aMax: 2 },
+  angkot: { length: 4.1, width: 1.62, maxBrake: 6.5, aMax: 1.6 },
+};
+
+/** Jarak minimal (m) dari zebra cross supaya pejalan kaki uji boleh muncul: jarak henti nyaman ditambah cadangan. */
+export function pedSpawnNeed(v) {
+  return (v * v) / (2 * 2) + 8;
 }
 
-// ---------- lalu lintas jalan simpang (koordinat lokal terhadap tengah persimpangan) ----------
-
-function createCross() {
-  const pathS = new Path([
-    { x: 1.75, y: -85 },
-    { x: 1.75, y: 85 },
-  ]);
-  const pathN = new Path([
-    { x: -1.75, y: 85 },
-    { x: -1.75, y: -85 },
-  ]);
-  const STOP_S = 85 - 6.5; // posisi s tepi garis henti jalan simpang
-  const mk = (path, color) => new PathAgent({ path, cruise: 9, accel: 2, decel: 4, loop: true, color });
-  const lanes = [
-    { path: pathS, agents: [mk(pathS, COLORS.vehicles[0]), mk(pathS, COLORS.vehicles[3])], start: [30, 112] },
-    { path: pathN, agents: [mk(pathN, COLORS.vehicles[4]), mk(pathN, COLORS.vehicles[1])], start: [18, 98] },
-  ];
-
-  function reset() {
-    for (const lane of lanes) {
-      lane.agents.forEach((a, i) => {
-        a.setS(lane.start[i]);
-        a.speed = 0;
-      });
-    }
-  }
-
-  function update(dt, sideState) {
-    const light = { state: sideState };
-    for (const lane of lanes) {
-      const len = lane.path.length;
-      for (const a of lane.agents) {
-        let leaderGap = Infinity;
-        let leaderSpeed = 0;
-        for (const b of lane.agents) {
-          if (b === a) continue;
-          const gap = ((b.s - a.s + len) % len) - (a.length + b.length) / 2;
-          if (gap < leaderGap) {
-            leaderGap = gap;
-            leaderSpeed = b.speed;
-          }
-        }
-        const stopS = a.s + a.length / 2 > STOP_S + 0.5 ? STOP_S + len : STOP_S;
-        a.step(dt, laneTargetSpeed(a, [{ s: stopS, light }], { leaderGap, leaderSpeed, decel: 3 }));
-      }
-    }
-  }
-
-  function draw(g) {
-    for (const lane of lanes) for (const a of lane.agents) drawCar(g, a);
-  }
-
-  const agents = () => lanes.flatMap((l) => l.agents);
-  reset();
-  return { reset, update, draw, agents };
+/** Jarak minimal (m) dari angkot ngetem supaya angkot boleh ditaruh di depan mobil otonom. */
+export function angkotSpawnNeed(v) {
+  return (v * v) / (2 * 1.5) + 8 + 14;
 }
 
 // ---------- dunia ----------
 
-export function createWorld() {
+export function createWorld(scene) {
+  const S = scene.S;
+  const frame = scene.frame;
   const signal = new Signal();
-  const statics = buildStatic();
-  const cross = createCross();
   const rng = new Rng(11);
+  const counters = createCounters();
   const ego = new Vehicle({
     id: 'ego',
     label: 'Mobil otonom',
     ego: true,
-    x: 0,
-    y: EGO_Y,
+    x: S.start,
+    y: EGO_LAT,
     heading: 0,
     maxAccel: 2,
-    maxBrake: 8,
-    maxSpeed: 20,
+    maxBrake: EGO_BRAKE,
+    maxSpeed: SAFETY.vMaxEgo,
     steerRate: 1.4,
   });
-  const oncoming = []; // terurut x naik: indeks 0 paling barat (paling depan)
+  ego.dir = 1;
+  const cws = {
+    west: { key: 'west', s: S.cwWest, half: CW_HALF, kind: 'lampu', exitFor: -1 },
+    east: { key: 'east', s: S.cwEast, half: CW_HALF, kind: 'lampu', exitFor: 1 },
+    zebra: { key: 'zebra', s: S.zebra, half: CW_HALF, kind: 'zebra', exitFor: 0 },
+  };
+  const cwList = [cws.west, cws.east, cws.zebra];
+  const oncoming = []; // arah barat, terurut x naik: indeks 0 paling barat (paling depan)
+  const cross = { utara: [], selatan: [] };
   const peds = [];
-  const stalled = { active: false, fromK: 0 };
+  const angkot = { active: false, id: 'angkot-ngetem', x: S.angkot, y: ANGKOT_LAT, length: KIND_SPEC.angkot.length, width: KIND_SPEC.angkot.width, since: 0 };
+  const pending = { ped: 0, angkot: false };
   const events = [];
   const W = {
+    S,
     ego,
     signal,
     oncoming,
-    peds,
-    stalled,
     cross,
+    peds,
+    cws,
+    angkot,
+    pending,
+    counters,
     time: 0,
     density: 'sepi',
-    viewMaxX: 60, // batas kanan area yang terlihat, diisi dari render
-    collisions: 0,
+    viewMaxS: S.start + 70, // batas kanan area terlihat (s), diisi dari render
+    wraps: 0,
+    lastWrapAt: -10,
+    shieldNote: null,
+    // Khusus uji otomatis: kendaraan lain mengabaikan lampu dan penyeberangan di perencanaannya
+    // sendiri, sehingga hanya perisai yang menjaga aturan. Pelajaran tidak pernah menyalakannya.
+    chaos: { npcIgnoreRules: false },
   };
   let nextId = 1;
   let sinceGap = 0;
-  let pending = null;
+  let pendingSpacing = null;
   let pedSide = 'utara';
   let colorIdx = 0;
-  let lastHit = -10;
+  let ambientTimer = 6;
+  let contactPairs = new Set(); // pasangan yang bersinggungan di langkah sebelumnya
+  let hitPairs = new Set();
 
-  // ---------- mobil dari arah berlawanan ----------
+  // ---------- pembantu ----------
 
-  function makeCar(x) {
-    const color = COLORS.vehicles[(colorIdx++ * 2 + 1) % COLORS.vehicles.length];
-    return { id: `lawan-${nextId++}`, kind: 'car', x, y: ONC_Y, heading: Math.PI, length: 4.5, width: 1.8, speed: ONC_CRUISE, cruise: ONC_CRUISE, color, braking: false, yieldTo: null };
+  const egoFront = () => ego.x + ego.length / 2;
+  const kawiVehicles = () => [ego, ...oncoming];
+  const crossList = () => [...cross.utara, ...cross.selatan];
+  const egoInOncomingLane = () => ego.y > -0.6;
+
+  function worldBox(v) {
+    const p = frame.toWorld(v.x, v.y);
+    return { x: p.x, y: p.y, heading: p.heading + (v.dir < 0 ? Math.PI : 0) + (v === ego ? ego.heading : 0), length: v.length, width: v.width };
+  }
+
+  // ---------- batasan untuk kendaraan di Jalan Kawi ----------
+
+  /**
+   * Batasan keras terdekat di depan kendaraan di Jalan Kawi (dir 1 = timur, -1 = barat).
+   * Hasil { pos (s), d, what, rule, go }. go = keputusan terus saat kuning (perisai menahan kecepatan).
+   */
+  function kawiConstraint(v, dir) {
+    const front = v.x + (dir * v.length) / 2;
+    const qf = dir * front;
+    let best = { pos: null, d: Infinity, what: null, rule: false, go: false };
+    const take = (pos, what, rule) => {
+      const d = dir * pos - qf;
+      if (d < best.d) best = { ...best, pos, d, what, rule };
+    };
+    // garis henti lampu
+    const lineS = dir > 0 ? S.stopEB : S.stopWB;
+    const beforeLine = dir * lineS - qf >= -0.01;
+    if (beforeLine) {
+      const st = signal.main;
+      if (st === 'red') take(lineS, 'lampu merah', true);
+      else if (st === 'yellow') {
+        if (!v.yc || v.yc.id !== signal.yellowId) v.yc = { id: signal.yellowId, stop: yellowMustStop(Math.max(0, dir * lineS - qf), v.speed) };
+        if (v.yc.stop) take(lineS, 'lampu kuning', true);
+        else best.go = true;
+      }
+    }
+    // penyeberangan yang dipakai pejalan kaki
+    for (const cw of cwList) {
+      const edge = cw.s - dir * cw.half;
+      if (dir * edge - qf < -0.01 || dir * edge - qf > 160) continue;
+      if (!peds.some((p) => p.cw === cw && p.state === 'menyeberang')) continue;
+      // penyeberangan di sisi keluar simpang: jangan masuk simpang bila jalan keluarnya belum kosong
+      if (cw.exitFor === dir && beforeLine) take(lineS, 'penyeberangan dipakai', true);
+      else take(edge, 'penyeberangan dipakai', true);
+    }
+    // pejalan kaki di koridor atau diperkirakan masuk koridor
+    const half = v.width / 2 + SAFETY.latMargin;
+    for (const p of peds) {
+      if (p.state === 'selesai' || Math.abs(p.y) > ROAD_HALF + 1.5) continue;
+      const ahead = dir * p.x - qf;
+      if (ahead < -p.radius || ahead > 160) continue;
+      const off = Math.abs(p.y - v.y) - half - p.radius;
+      let hit = off <= 0;
+      if (!hit && Math.abs(p.vy) > 0.05 && Math.sign(v.y - p.y) === Math.sign(p.vy)) hit = off / Math.abs(p.vy) <= SAFETY.tPredict;
+      if (hit) take(p.x - dir * (p.radius + SAFETY.gapPed), 'pejalan kaki', true);
+    }
+    // area simpang yang masih dipakai kendaraan dari Jalan Kelud atau Jalan Arjuno (bukan aturan pengguna, tetap dijaga)
+    const boxNear = dir > 0 ? S.boxA : S.boxB;
+    if (dir * boxNear - qf >= -0.01 && crossOnKawi()) take(boxNear, 'simpang belum kosong', false);
+    // benda diam atau kendaraan lain di koridor
+    if (dir > 0 && angkot.active && Math.abs(angkot.y - v.y) < (angkot.width + v.width) / 2 + 0.2) {
+      const rear = angkot.x - angkot.length / 2;
+      if (rear - qf > -0.5) take(rear - 0.5, 'angkot ngetem', false);
+    }
+    if (dir < 0 && v !== ego && egoInOncomingLane() && ego.x < v.x) take(ego.x + ego.length / 2 + 1, 'mobil otonom di lajur ini', false);
+    // kendaraan di depan di lajur yang sama: tetap bisa berhenti walau ia mengerem sekuat-kuatnya
+    if (dir < 0 && v !== ego) {
+      let lead = null;
+      for (const o of oncoming) if (o !== v && o.x < v.x && (!lead || o.x > lead.x)) lead = o;
+      if (lead) take(lead.x + lead.length / 2 - (lead.speed * lead.speed) / (2 * lead.maxBrake) + 1, 'kendaraan di depan', false);
+    }
+    return best;
+  }
+
+  function crossOnKawi() {
+    for (const k of ['utara', 'selatan']) {
+      const sd = scene.side[k];
+      for (const a of cross[k]) if (a.s + a.length / 2 > sd.sIn && a.s - a.length / 2 < sd.sOut) return true;
+    }
+    return false;
+  }
+
+  function kawiInBox() {
+    for (const v of kawiVehicles()) if (v.x + v.length / 2 > S.boxA && v.x - v.length / 2 < S.boxB) return true;
+    return false;
+  }
+
+  /** Terapkan perisai ke percepatan yang diminta. Mencatat campur tangan per episode. */
+  function shieldApply(v, aDesire, aLead, dir, cons, dt, maxBrake, who) {
+    let a = cons.go ? Math.max(aDesire, 0) : aDesire;
+    const held = cons.go && aDesire < -0.3;
+    a = Math.min(a, aLead);
+    const lim = limitAccel(v.speed, a, cons.d, maxBrake, dt);
+    const active = lim.limited || held;
+    if (active && !v._shield) {
+      counters.interventions += 1;
+      if (who === 'ego') {
+        counters.egoInterventions += 1;
+        W.shieldNote = { time: W.time, what: held ? 'tahan-kuning' : cons.what };
+      }
+    }
+    v._shield = active;
+    return lim.accel;
+  }
+
+  // ---------- mobil otonom ----------
+
+  function stepEgo(cmd, dt) {
+    const f0 = egoFront();
+    ego._f0 = f0;
+    const cons = kawiConstraint(ego, 1);
+    const a = shieldApply(ego, cmd.aDesire, cmd.aSafety ?? Infinity, 1, cons, dt, EGO_BRAKE, 'ego');
+    ego.step(dt, { accel: a, steer: cmd.steer });
+    // jepit: tidak pernah maju melewati batasan keras
+    if (cons.pos != null && f0 <= cons.pos + 1e-6 && egoFront() > cons.pos - SAFETY.clampGap) {
+      ego.x = cons.pos - SAFETY.clampGap - ego.length / 2;
+      ego.speed = 0;
+      counters.clamps += 1;
+      counters.note('jepit', { who: 'ego', what: cons.what, t: W.time });
+    }
+  }
+
+  // ---------- kendaraan dari arah berlawanan (arah barat) ----------
+
+  function pickKind() {
+    const r = rng.next();
+    if (r < 0.42) return 'motor';
+    if (r < 0.62) return 'city';
+    if (r < 0.74) return 'mpv';
+    if (r < 0.84) return 'car';
+    return 'angkot';
+  }
+
+  function makeVehicle(kind, extra = {}) {
+    const spec = KIND_SPEC[kind];
+    const id = `${kind}-${nextId++}`;
+    const v = {
+      id,
+      kind,
+      length: spec.length,
+      width: spec.width,
+      maxBrake: brakeLimit(spec.maxBrake),
+      aMax: spec.aMax,
+      speed: 0,
+      braking: false,
+      yc: null,
+      ...extra,
+    };
+    if (kind === 'motor') {
+      v.cruise = kmhToMs(rng.range(34, 40));
+      v.color = ['#64748b', '#1f2937', '#b91c1c', '#1d4ed8', '#e2e8f0'][rng.int(0, 4)];
+      v.helmet = COLORS.helmets[rng.int(0, COLORS.helmets.length - 1)];
+      v.jacket = ['#334155', '#7c2d12', '#1e3a8a', '#365314', '#6b21a8'][rng.int(0, 4)];
+      v.passenger = rng.chance(0.3);
+      v.passengerHelmet = COLORS.helmets[rng.int(0, COLORS.helmets.length - 1)];
+    } else if (kind === 'angkot') {
+      v.cruise = kmhToMs(rng.range(30, 34));
+      v.color = COLORS.angkot;
+    } else {
+      v.cruise = kmhToMs(rng.range(34, 40));
+      v.color = COLORS.vehicles[(colorIdx++ * 2 + 1) % COLORS.vehicles.length];
+    }
+    return v;
+  }
+
+  function makeOncoming(x) {
+    const kind = pickKind();
+    const c = makeVehicle(kind, { x, y: ONC_LAT + (kind === 'motor' ? 0.55 : 0), heading: Math.PI, dir: -1 });
+    c.speed = c.cruise;
+    c.laneY = c.y;
+    // sebagian angkot berhenti sebentar menurunkan penumpang di mulut Jalan Kawi Gang 9A
+    if (kind === 'angkot' && rng.chance(0.55)) c.pickup = { s: S.cwWest - 62 + rng.range(-6, 6), dwell: rng.range(3, 5.5), t: 0, done: false };
+    return c;
+  }
+
+  /**
+   * Kendaraan baru yang muncul di tengah ruas (setelah kepadatan diganti) tidak boleh muncul di atas
+   * penyeberangan atau di dalam simpang, dan kecepatan awalnya harus masih bisa berhenti dengan nyaman
+   * sebelum batasan di depannya (garis henti merah, penyeberangan yang dipakai, kendaraan di depan).
+   */
+  function placeOncoming(x) {
+    const zones = [...cwList.map((cw) => [cw.s - cw.half - 3, cw.s + cw.half + 3]), [S.stopEB - 3, S.stopWB + 3]];
+    for (let k = 0; k < 4; k++) for (const [a, b] of zones) if (x + 3 > a && x - 3 < b) x = b + 3.1;
+    const c = makeOncoming(x);
+    c.speed = 0;
+    const cons = kawiConstraint(c, -1);
+    let v = c.cruise;
+    if (cons.d < Infinity) v = Math.min(v, Math.sqrt(2 * 2.5 * Math.max(0, cons.d - 3)));
+    let lead = null;
+    for (const o of oncoming) if (o.x < c.x && (!lead || o.x > lead.x)) lead = o;
+    if (lead) v = Math.min(v, followingSpeed(c.x - c.length / 2 - (lead.x + lead.length / 2), lead.speed, { cruise: c.cruise, minGap: 2.5, timeGap: 1.2, decel: 2.5, strict: true }));
+    c.speed = Math.max(0, v);
+    return c;
   }
 
   function nextSpacing(cfg) {
@@ -332,162 +434,348 @@ export function createWorld() {
     return rng.range(cfg.min, cfg.max);
   }
 
-  /**
-   * Tambah mobil lawan di ujung depan antrean. floorX = batas terdekat untuk mobil baru, supaya
-   * mobil tidak pernah muncul tiba-tiba di area yang terlihat (atau di zona salip).
-   */
-  function fillOncoming(floorX = W.viewMaxX + 15) {
+  /** Tambah kendaraan dari arah berlawanan di titik muncul (jauh di luar layar) bila jaraknya cukup. */
+  function fillOncoming() {
     const cfg = DENSITY[W.density];
     if (!cfg) return;
-    for (let guard = 0; guard < 60; guard++) {
-      const last = oncoming[oncoming.length - 1];
-      if (!last) {
-        oncoming.push(makeCar(Math.max(ego.x + GEN_AHEAD, floorX)));
-        continue;
-      }
-      if (pending == null) pending = nextSpacing(cfg);
-      if (last.x + pending > ego.x + GEN_AHEAD) break;
-      oncoming.push(makeCar(Math.max(last.x + pending, floorX)));
-      pending = null;
+    const last = oncoming[oncoming.length - 1];
+    if (pendingSpacing == null) pendingSpacing = nextSpacing(cfg);
+    if (!last || S.spawn - last.x >= pendingSpacing) {
+      oncoming.push(makeOncoming(S.spawn));
+      pendingSpacing = null;
     }
   }
 
-  /** Isi ulang mobil lawan dari belakang mobil otonom sampai jauh di depan (dipakai saat reset). */
   function seedOncoming() {
     oncoming.length = 0;
-    pending = null;
+    pendingSpacing = null;
     sinceGap = 0;
     const cfg = DENSITY[W.density];
     if (!cfg) return;
-    let x = ego.x - 70 + rng.range(0, cfg.min);
-    while (x < ego.x + GEN_AHEAD) {
-      oncoming.push(makeCar(x));
+    let x = S.despawn + 20 + rng.range(0, cfg.min);
+    while (x <= S.spawn) {
+      oncoming.push(makeOncoming(x));
       x += nextSpacing(cfg);
     }
   }
 
   /**
-   * Ganti kepadatan. Mobil yang belum terlihat dibuang lalu dibuat ulang dengan kepadatan baru,
-   * selalu di luar layar. clearUntil (x mutlak) dipakai saat mobil otonom sedang menyalip: mobil
-   * baru baru boleh muncul setelah titik itu, jadi celah yang sudah dihitung tetap aman.
+   * Ganti kepadatan. Kendaraan yang belum terlihat dibuang lalu dibuat ulang dengan kepadatan baru,
+   * selalu di luar layar. clearUntil (s) dipakai saat mobil otonom sedang menyalip: kendaraan baru
+   * baru boleh muncul setelah titik itu, jadi celah yang sudah dihitung tetap aman.
    */
   function setDensity(d, clearUntil = -Infinity) {
     W.density = d;
-    pending = null;
+    pendingSpacing = null;
     sinceGap = 0;
-    for (let i = oncoming.length - 1; i >= 0; i--) {
-      if (oncoming[i].x - oncoming[i].length / 2 > W.viewMaxX + 12) oncoming.splice(i, 1);
+    const floor = Math.max(W.viewMaxS + 12, clearUntil);
+    for (let i = oncoming.length - 1; i >= 0; i--) if (oncoming[i].x - oncoming[i].length / 2 > floor) oncoming.splice(i, 1);
+    const cfg = DENSITY[d];
+    if (!cfg) return;
+    let x = Math.max(floor + 5, (oncoming[oncoming.length - 1]?.x ?? -Infinity) + cfg.min);
+    while (x <= S.spawn) {
+      const c = placeOncoming(x);
+      oncoming.push(c);
+      x = c.x + nextSpacing(cfg);
     }
-    fillOncoming(Math.max(W.viewMaxX + 15, clearUntil));
+  }
+
+  /** Ruang kosong (m) setelah zona sampai bemper belakang kendaraan di depan (arah barat). */
+  function keepClear(c, lead, zoneNear, zoneFar) {
+    const F = c.x - c.length / 2;
+    if (F < zoneNear - 0.01) return Infinity; // sudah masuk zona: jangan berhenti di dalamnya
+    if (F - zoneNear > 45) return Infinity;
+    if (!lead) return Infinity;
+    const room = zoneFar - (lead.x + lead.length / 2);
+    if (lead.speed > 2 || room >= c.length + 2) return Infinity;
+    return F - zoneNear; // berhenti sebelum zona
   }
 
   function updateOncoming(dt) {
-    const s = signal;
     for (let i = 0; i < oncoming.length; i++) {
       const c = oncoming[i];
-      const F = c.x - c.length / 2; // bemper depan (arah barat)
-      let v = c.cruise;
-      // lampu: garis henti arah barat berikutnya di depan
-      const k = Math.floor((F + 0.2 - STOP_W) / L);
-      const lineX = STOP_W + k * L;
-      const d = F - (lineX + 0.2) - 0.8;
-      if (d > -1) {
-        const st = s.main;
-        if (st === 'red' || (st === 'yellow' && shouldStopForYellow(Math.max(0, d), c.speed, 3))) v = Math.min(v, d <= 0.05 ? 0 : speedToStop(d, 3));
+      const lead = oncoming[i - 1] || null;
+      const F = c.x - c.length / 2;
+      c._f0 = F;
+      let vDes = c.cruise;
+      const stopAt = (d) => {
+        vDes = Math.min(vDes, d <= 0.05 ? 0 : speedToStop(d, 3));
+      };
+      const obey = !W.chaos.npcIgnoreRules;
+      if (!obey) vDes = SAFETY.vMaxNpc;
+      // lampu (keputusan kuning sama dengan perisai)
+      const dLine = F - S.stopWB;
+      if (dLine > -0.01 && obey) {
+        const st = signal.main;
+        if (st === 'yellow' && (!c.yc || c.yc.id !== signal.yellowId)) c.yc = { id: signal.yellowId, stop: yellowMustStop(Math.max(0, dLine), c.speed) };
+        if (st === 'red' || (st === 'yellow' && c.yc.stop)) stopAt(dLine - 0.8);
       }
-      // pejalan kaki yang sedang menyeberang di depan
-      for (const p of peds) {
-        if (p.state !== 'menyeberang') continue;
-        const line = p.zx + ZEBRA_HALF + YIELD_GAP;
-        const dp = F - (line + 0.3);
-        if (dp < -0.8) continue;
-        if (c.yieldTo !== p.id && (c.speed * c.speed) / (2 * Math.max(0.1, dp)) > 6) continue; // terlalu dekat, tidak sempat
-        c.yieldTo = p.id;
-        v = Math.min(v, dp <= 0.05 ? 0 : speedToStop(dp, 3));
+      // penyeberangan yang dipakai (sisi keluar simpang: tunggu di garis henti)
+      for (const cw of cwList) {
+        const edge = cw.s + cw.half;
+        const d = F - edge;
+        if (!obey || d < -0.01 || d > 90) continue;
+        if (!peds.some((p) => p.cw === cw && p.state === 'menyeberang')) continue;
+        if (cw.exitFor === -1 && dLine > -0.01) stopAt(dLine - 0.8);
+        else stopAt(d - 1.2);
       }
-      if (c.yieldTo && !peds.some((p) => p.id === c.yieldTo && p.state !== 'selesai')) c.yieldTo = null;
-      // mobil di depannya
-      const lead = oncoming[i - 1];
-      if (lead) v = Math.min(v, followingSpeed(F - (lead.x + lead.length / 2), lead.speed, { cruise: c.cruise, minGap: 2.5, timeGap: 1.2, decel: 3 }));
-      // mobil otonom yang sedang berada di lajur ini (saat menyalip)
-      if (ego.y > -0.6 && ego.x < c.x) {
+      // jangan berhenti di atas penyeberangan atau di tengah simpang
+      for (const [near, far] of [
+        [S.zebra + CW_HALF, S.zebra - CW_HALF],
+        [S.stopWB, S.cwWest - CW_HALF],
+      ]) {
+        const d = keepClear(c, lead, near, far);
+        if (d < Infinity) stopAt(d - 0.8);
+      }
+      // angkot berhenti sebentar menurunkan penumpang
+      if (c.pickup && !c.pickup.done) {
+        const d = F - (c.pickup.s - c.length / 2);
+        if (d < 40) {
+          c.y = c.laneY + 0.3 * clamp(1 - d / 25, 0, 1);
+          if (d <= 0.3 && c.speed < 0.2) {
+            c.pickup.t += dt;
+            c.doorOpen = c.pickup.t > 0.6 && c.pickup.t < c.pickup.dwell - 0.4;
+            if (c.pickup.t >= c.pickup.dwell) {
+              c.pickup.done = true;
+              c.doorOpen = false;
+            }
+            vDes = 0;
+          } else stopAt(d);
+        }
+      } else if (c.pickup?.done && c.y > c.laneY) c.y = Math.max(c.laneY, c.y - 0.25 * dt);
+      c.hazard = !!(c.pickup && !c.pickup.done && F - (c.pickup.s - c.length / 2) < 12);
+      let aDes = clamp((vDes - c.speed) / dt, -4.5, c.aMax);
+      // kendaraan di depan (dan mobil otonom yang sedang menyalip di lajur ini)
+      let aLead = Infinity;
+      const follow = (gap, lv) => {
+        const vf = followingSpeed(gap, lv, { cruise: c.cruise, minGap: 2.5, timeGap: 1.2, decel: 3, strict: true });
+        if (vf < c.speed) aLead = Math.min(aLead, clamp((vf - c.speed) / dt, -c.maxBrake, c.aMax));
+      };
+      if (lead) follow(F - (lead.x + lead.length / 2), lead.speed);
+      if (egoInOncomingLane() && ego.x < c.x) {
         const gap = F - (ego.x + ego.length / 2);
-        if (gap < 90) v = Math.min(v, followingSpeed(gap, 0, { cruise: c.cruise, minGap: 3, timeGap: 1.2, decel: 3 }));
+        if (gap < 90) follow(gap - 0.5, 0);
       }
-      const target = Math.max(0, v);
-      c.braking = target < c.speed - 0.2;
-      c.speed = approach(c.speed, target, (target > c.speed ? 2 : 4.5) * dt);
+      const cons = kawiConstraint(c, -1);
+      const a = shieldApply(c, aDes, aLead, -1, cons, dt, c.maxBrake, 'npc');
+      const v0 = c.speed;
+      c.speed = clamp(c.speed + a * dt, 0, SAFETY.vMaxNpc);
+      c.accel = (c.speed - v0) / dt;
+      c.braking = c.accel < -0.5 && c.speed > 0.1;
       c.x -= c.speed * dt;
+      if (cons.pos != null && F >= cons.pos - 1e-6 && c.x - c.length / 2 < cons.pos + SAFETY.clampGap) {
+        c.x = cons.pos + SAFETY.clampGap + c.length / 2;
+        c.speed = 0;
+        counters.clamps += 1;
+        counters.note('jepit', { who: c.id, what: cons.what, t: W.time });
+      }
     }
-    while (oncoming.length && oncoming[0].x < ego.x - GEN_BEHIND) oncoming.shift();
+    while (oncoming.length && oncoming[0].x < S.despawn) oncoming.shift();
     fillOncoming();
+  }
+
+  // ---------- kendaraan di Jalan Kelud dan Jalan Arjuno ----------
+
+  function resetCross() {
+    for (const k of ['utara', 'selatan']) {
+      cross[k].length = 0;
+      const sd = scene.side[k];
+      const kinds = k === 'utara' ? ['motor', 'city', 'motor'] : ['motor', 'angkot', 'motor'];
+      const starts = k === 'utara' ? [40, 95, 250] : [30, 110, 240];
+      kinds.forEach((kind, i) => {
+        const a = makeVehicle(kind, { s: starts[i], side: k });
+        a.cruise = kmhToMs(kind === 'motor' ? rng.range(22, 26) : rng.range(18, 22));
+        syncCross(a, sd);
+        cross[k].push(a);
+      });
+      cross[k].sort((p, q) => q.s - p.s);
+    }
+  }
+
+  function syncCross(a, sd) {
+    const p = sd.path.sample(a.s);
+    a.x = p.x;
+    a.y = p.y;
+    a.heading = p.heading;
+  }
+
+  function updateCross(dt) {
+    const kawiBusy = kawiInBox();
+    for (const k of ['utara', 'selatan']) {
+      const sd = scene.side[k];
+      const list = cross[k];
+      list.sort((p, q) => q.s - p.s);
+      for (let i = 0; i < list.length; i++) {
+        const a = list[i];
+        const lead = list[i - 1] || null;
+        const F = a.s + a.length / 2;
+        a._f0 = F;
+        let vDes = a.cruise;
+        const stopAt = (d) => {
+          vDes = Math.min(vDes, d <= 0.05 ? 0 : speedToStop(d, 3));
+        };
+        let cons = { pos: null, d: Infinity, what: null, go: false };
+        const take = (pos, what) => {
+          if (pos - F < cons.d) cons = { ...cons, pos, d: pos - F, what };
+        };
+        const dLine = sd.stopS - F;
+        const obey = !W.chaos.npcIgnoreRules;
+        if (!obey) vDes = SAFETY.vMaxNpc;
+        if (dLine > -0.01) {
+          // aturan lampu di perisai (selalu), keinginan berhenti di perencana (kecuali mode uji)
+          const st = signal.side;
+          if (st === 'yellow' && (!a.yc || a.yc.id !== signal.sideYellowId)) a.yc = { id: signal.sideYellowId, stop: yellowMustStop(Math.max(0, dLine), a.speed) };
+          if (st === 'red' || (st === 'yellow' && a.yc.stop)) {
+            if (obey) stopAt(dLine - 0.8);
+            take(sd.stopS, st === 'red' ? 'lampu merah' : 'lampu kuning');
+          } else if (st === 'yellow') cons.go = true;
+        }
+        // kendaraan di depan: tetap bisa berhenti walau ia mengerem sekuat-kuatnya
+        if (lead) take(lead.s - lead.length / 2 + (lead.speed * lead.speed) / (2 * lead.maxBrake) - 1, 'kendaraan di depan');
+        // jangan masuk badan Jalan Kawi bila masih ada kendaraan Jalan Kawi di area simpang
+        const dBox = sd.sIn - F;
+        if (dBox > -0.01 && kawiBusy) {
+          stopAt(dBox - 0.8);
+          take(sd.sIn, 'simpang belum kosong');
+        }
+        let aDes = clamp((vDes - a.speed) / dt, -4.5, a.aMax);
+        let aLead = Infinity;
+        if (lead) {
+          const vf = followingSpeed(lead.s - lead.length / 2 - F, lead.speed, { cruise: a.cruise, minGap: 2.5, timeGap: 1.2, decel: 3, strict: true });
+          if (vf < a.speed) aLead = clamp((vf - a.speed) / dt, -a.maxBrake, a.aMax);
+        }
+        const acc = shieldApply(a, aDes, aLead, 1, cons, dt, a.maxBrake, 'npc');
+        const v0 = a.speed;
+        a.speed = clamp(a.speed + acc * dt, 0, SAFETY.vMaxNpc);
+        a.accel = (a.speed - v0) / dt;
+        a.braking = a.accel < -0.5 && a.speed > 0.1;
+        a.s += a.speed * dt;
+        if (cons.pos != null && F <= cons.pos + 1e-6 && a.s + a.length / 2 > cons.pos - SAFETY.clampGap) {
+          a.s = cons.pos - SAFETY.clampGap - a.length / 2;
+          a.speed = 0;
+          counters.clamps += 1;
+          counters.note('jepit', { who: a.id, what: cons.what, t: W.time });
+        }
+        // ujung jalur (jauh di luar layar): kembali ke awal bila awal jalur kosong
+        if (a.s > sd.path.length - 3) {
+          const free = !list.some((b) => b !== a && b.s < 14);
+          if (free) {
+            a.s = 2;
+            a.yc = null;
+          } else {
+            a.s = sd.path.length - 3;
+            a.speed = 0;
+          }
+        }
+        syncCross(a, sd);
+      }
+    }
   }
 
   // ---------- pejalan kaki ----------
 
-  /**
-   * Munculkan pejalan kaki di zebra cross berikutnya yang masih sempat didekati mobil otonom
-   * dengan pengereman nyaman. Hasil: { ok, reason, ped, nextLap, distance }.
-   */
-  function spawnPed() {
-    const active = peds.filter((p) => p.state !== 'selesai');
-    if (active.length >= 2) return { ok: false, reason: 'penuh' };
-    const front = ego.x + ego.length / 2;
-    const yieldOff = ZEBRA_HALF + YIELD_GAP + 0.3;
-    const need = (ego.speed * ego.speed) / (2 * 2) + 10;
-    const k0 = Math.ceil((front + 0.5 - (ZEBRA_X - yieldOff)) / L);
-    const k = Math.max(k0, Math.ceil((front + need - (ZEBRA_X - yieldOff)) / L));
-    const zx = ZEBRA_X + k * L;
-    let side = pedSide;
-    if (active.some((p) => p.zx === zx && p.side === side && p.state === 'menunggu')) side = side === 'utara' ? 'selatan' : 'utara';
-    pedSide = side === 'utara' ? 'selatan' : 'utara';
+  function makePed(cw, side, { test = false } = {}) {
     const north = side === 'utara';
+    const variants = ['default', 'hijab', 'backpack', 'default', 'hijab'];
     const p = {
       id: `pejalan-${nextId++}`,
-      kind: 'pedestrian',
-      label: 'Pejalan kaki',
-      zx,
+      cw,
       side,
-      x: zx + (north ? -0.8 : 0.8),
+      x: cw.s + (north ? -0.8 : 0.8),
       y: north ? -PED_Y : PED_Y,
       heading: north ? Math.PI / 2 : -Math.PI / 2,
       radius: 0.3,
       speed: 0,
-      vx: 0,
       vy: 0,
       state: 'menunggu',
       wait: 0,
       t: 0,
       phase: 0,
       alpha: 1,
+      held: false,
+      test,
+      variant: variants[rng.int(0, variants.length - 1)],
+      accent: COLORS.hijab[rng.int(0, COLORS.hijab.length - 1)],
+      color: ['#fb7185', '#f59e0b', '#60a5fa', '#34d399', '#e879f9'][rng.int(0, 4)],
     };
     peds.push(p);
-    return { ok: true, ped: p, nextLap: k > k0, distance: zx - ZEBRA_HALF - front };
+    return p;
   }
 
-  function pedCanStart(p, yieldTo) {
-    const zA = p.zx - ZEBRA_HALF;
-    const zB = p.zx + ZEBRA_HALF;
-    const eFront = ego.x + ego.length / 2;
-    const eRear = ego.x - ego.length / 2;
-    const egoPassed = eRear > zB + 0.5;
-    const egoYielding = yieldTo === p.id && ego.speed < 1.5 && eFront < zA - 0.5;
-    // Pejalan kaki selalu menunggu mobil otonom berhenti (sesuai catatan di langkah 2), sejauh
-    // apa pun mobilnya. Kalau ia boleh menyeberang sendiri saat mobil masih jauh, tugas memberi
-    // jalan tidak akan pernah terjadi bila tombol ditekan agak terlambat.
-    if (!(egoPassed || egoYielding)) return false;
-    for (const c of oncoming) {
-      const F = c.x - c.length / 2;
-      const R = c.x + c.length / 2;
-      if (R < zA - 0.5) continue; // sudah lewat
-      if (F <= zB + 0.8) return false; // sedang di atas zebra
-      const d = F - (zB + YIELD_GAP + 0.3);
-      if (d < 90 && c.yieldTo !== p.id && d < (c.speed * c.speed) / (2 * 3) + 6) return false;
+  const pedDist = () => S.zebra - CW_HALF - egoFront(); // bemper depan mobil otonom ke tepi zebra cross
+
+  function spawnTestPed() {
+    const active = peds.filter((p) => p.test && p.state !== 'selesai' && p.cw === cws.zebra);
+    let side = pedSide;
+    if (active.some((p) => p.side === side && p.state === 'menunggu')) side = side === 'utara' ? 'selatan' : 'utara';
+    pedSide = side === 'utara' ? 'selatan' : 'utara';
+    const p = makePed(cws.zebra, side, { test: true });
+    events.push({ type: 'pejalan-muncul', ped: p, distance: pedDist() });
+    return p;
+  }
+
+  /**
+   * Tombol "Munculkan pejalan kaki": pejalan kaki muncul di zebra cross hanya bila mobil otonom masih
+   * bisa berhenti dengan nyaman sebelum zebra cross. Bila tidak, permintaan ditunda sampai mobil
+   * otonom datang lagi dari awal ruas. Hasil: { ok, queued, reason, distance, need }.
+   */
+  function requestPed() {
+    const active = peds.filter((p) => p.test && p.state !== 'selesai');
+    if (active.length + pending.ped >= 2) return { ok: false, reason: 'penuh' };
+    const dist = pedDist();
+    const need = pedSpawnNeed(ego.speed);
+    if (dist >= need) return { ok: true, ped: spawnTestPed(), distance: dist, need };
+    pending.ped += 1;
+    return { ok: false, queued: true, reason: dist < -1 ? 'lewat' : 'dekat', distance: dist, need };
+  }
+
+  function updatePendingPed() {
+    if (pending.ped && pedDist() >= pedSpawnNeed(ego.speed)) {
+      pending.ped -= 1;
+      spawnTestPed();
+    }
+  }
+
+  /** Penerimaan celah: semua kendaraan Jalan Kawi yang datang masih bisa berhenti sebelum penyeberangan. */
+  function gapOk(cw) {
+    for (const v of kawiVehicles()) {
+      const dir = v === ego ? 1 : -1;
+      const front = v.x + (dir * v.length) / 2;
+      const rear = v.x - (dir * v.length) / 2;
+      const qNear = dir * (cw.s - dir * cw.half);
+      const qFar = dir * (cw.s + dir * cw.half);
+      if (dir * rear > qFar + 0.5) continue; // sudah lewat seluruhnya
+      if (dir * front > qNear - 0.3) return false; // sedang di atas atau tepat di tepi penyeberangan
+      const d = qNear - dir * front;
+      if (v.speed < 0.1 ? d < 0.4 : !canStopForPed(d, v.speed)) return false;
     }
     return true;
   }
 
-  function updatePeds(dt, yieldTo) {
+  function pedCanStart(p, planner) {
+    const cw = p.cw;
+    if (cw.kind === 'lampu' && !signal.pedPhaseOk()) return false;
+    if (p.test) {
+      // Pejalan kaki uji menunggu mobil otonom berhenti untuknya atau lewat lebih dulu.
+      const egoPassed = ego.x - ego.length / 2 > cw.s + cw.half + 0.5;
+      const egoYielding = planner?.P.yieldTest === p.id && ego.speed < 1.5 && egoFront() < cw.s - cw.half - 0.5;
+      if (!(egoPassed || egoYielding)) return false;
+    }
+    return gapOk(cw);
+  }
+
+  function pedBlocked(p, nx, ny) {
+    const w = frame.toWorld(nx, ny);
+    const boxes = [...kawiVehicles().map(worldBox), ...crossList()];
+    if (angkot.active) boxes.push(worldBox(angkot));
+    for (const b of boxes) {
+      if (Math.hypot(b.x - w.x, b.y - w.y) > 8) continue;
+      if (distanceToBox(w.x, w.y, b) < p.radius + 0.25) return true;
+    }
+    return false;
+  }
+
+  function updatePeds(dt, planner) {
     for (let i = peds.length - 1; i >= 0; i--) {
       const p = peds[i];
       const north = p.side === 'utara';
@@ -495,271 +783,267 @@ export function createWorld() {
         p.wait += dt;
         p.speed = 0;
         p.vy = 0;
-        if (pedCanStart(p, yieldTo)) {
+        if (pedCanStart(p, planner)) {
           p.state = 'menyeberang';
           events.push({ type: 'pejalan-mulai', ped: p });
+        } else if (!p.test && p.wait > 45) {
+          // pejalan kaki latar yang terlalu lama menunggu berjalan pergi
+          p.state = 'selesai';
+          p.t = 0;
+          p.heading = north ? Math.PI : 0;
         }
       } else if (p.state === 'menyeberang') {
         const dir = north ? 1 : -1;
-        p.speed = PED_SPEED;
-        p.vy = dir * PED_SPEED;
-        p.y += p.vy * dt;
-        p.phase += dt * 7;
+        const ny = p.y + dir * PED_SPEED * dt;
+        if (pedBlocked(p, p.x, ny)) {
+          p.held = true;
+          p.speed = 0;
+          p.vy = 0;
+        } else {
+          p.held = false;
+          p.speed = PED_SPEED;
+          p.vy = dir * PED_SPEED;
+          p.y = ny;
+          p.phase += dt * 7;
+        }
         if ((dir > 0 && p.y >= PED_Y) || (dir < 0 && p.y <= -PED_Y)) {
           p.y = dir * PED_Y;
+          p.vy = 0;
           p.state = 'selesai';
           p.t = 0;
           p.heading = north ? 0 : Math.PI; // berjalan menjauh di trotoar
-          events.push({ type: 'pejalan-selesai', ped: p });
         }
       } else {
         p.t += dt;
         p.speed = 1.2;
         p.x += Math.cos(p.heading) * p.speed * dt;
-        p.vx = Math.cos(p.heading) * p.speed;
         p.vy = 0;
         p.phase += dt * 6;
         p.alpha = Math.max(0, 1 - p.t / 3);
         if (p.t > 3) peds.splice(i, 1);
-        continue;
       }
-      if (p.zx < ego.x - 160) peds.splice(i, 1);
+    }
+    // pejalan kaki latar di penyeberangan kaki simpang
+    ambientTimer -= dt;
+    if (ambientTimer <= 0) {
+      ambientTimer = rng.range(8, 16);
+      const amb = peds.filter((p) => !p.test && p.state !== 'selesai');
+      if (amb.length < 2) {
+        const cw = rng.chance(0.5) ? cws.west : cws.east;
+        const side = rng.chance(0.5) ? 'utara' : 'selatan';
+        if (!peds.some((p) => p.cw === cw && p.side === side && p.state === 'menunggu')) makePed(cw, side);
+      }
     }
   }
 
-  // ---------- mobil mogok ----------
+  // ---------- angkot ngetem ----------
 
-  /** Taruh mobil mogok di tempat berikutnya yang masih bisa didekati dengan nyaman. */
-  function placeStalled() {
-    const front = ego.x + ego.length / 2;
-    const rearOff = STALL_X - 2.25;
-    const need = (ego.speed * ego.speed) / (2 * 1.5) + 8 + 14;
-    const k0 = Math.ceil((front + 0.5 - rearOff) / L);
-    const k = Math.max(k0, Math.ceil((front + need - rearOff) / L));
-    stalled.active = true;
-    stalled.fromK = k;
-    return { nextLap: k > k0, distance: rearOff + k * L - front };
-  }
+  /**
+   * Tombol "Taruh angkot ngetem": angkot berhenti lama di lajur kiri menunggu penumpang. Hanya
+   * ditaruh bila mobil otonom masih bisa berhenti dengan nyaman di belakangnya, atau sudah lewat.
+   */
+  const angkotGap = () => angkot.x - angkot.length / 2 - egoFront(); // bemper depan mobil otonom ke belakang angkot
+  const angkotFits = () => ego.x - ego.length / 2 > angkot.x + angkot.length / 2 + 1 || angkotGap() >= angkotSpawnNeed(ego.speed);
 
-  function removeStalled() {
-    stalled.active = false;
-  }
-
-  function stallBox(k) {
-    return { id: `mogok-${k}`, kind: 'car', x: STALL_X + k * L, y: STALL_Y, heading: 0, length: 4.5, width: 1.8 };
-  }
-
-  // ---------- tabrakan (jaring pengaman, seharusnya tidak pernah terjadi) ----------
-
-  function checkCollisions() {
-    if (W.time - lastHit < 2) return;
-    let what = null;
-    for (const c of oncoming) if (Math.abs(c.x - ego.x) < 6 && boxesOverlap(ego, c)) what = 'mobil dari arah berlawanan';
-    if (stalled.active) {
-      const k = Math.round((ego.x - STALL_X) / L);
-      if (k >= stalled.fromK && boxesOverlap(ego, stallBox(k))) what = 'mobil mogok';
+  function requestAngkot() {
+    if (angkot.active || pending.angkot) {
+      angkot.active = false;
+      pending.angkot = false;
+      return { removed: true };
     }
-    for (const p of peds) if (p.state !== 'selesai' && distanceToBox(p.x, p.y, ego) < p.radius) what = 'pejalan kaki';
-    for (const c of oncoming) for (const p of peds) if (p.state === 'menyeberang' && distanceToBox(p.x, p.y, c) < p.radius) what = 'pejalan kaki dan mobil lawan';
-    if (what) {
-      lastHit = W.time;
-      W.collisions += 1;
-      events.push({ type: 'tabrakan', what });
+    const dist = angkotGap();
+    if (angkotFits()) {
+      placeAngkot();
+      return { ok: true, distance: dist };
     }
+    pending.angkot = true;
+    return { ok: false, queued: true, distance: dist, need: angkotSpawnNeed(ego.speed) };
+  }
+
+  function placeAngkot() {
+    angkot.active = true;
+    angkot.since = W.time;
+    pending.angkot = false;
+    events.push({ type: 'angkot-ditaruh', distance: angkotGap() });
+  }
+
+  function updatePendingAngkot() {
+    if (pending.angkot && angkotFits()) placeAngkot();
+  }
+
+  // ---------- pemeriksa invarian (terpisah dari perisai) ----------
+
+  function monitor() {
+    const red = signal.main === 'red';
+    const sideRed = signal.side === 'red';
+    // terobos lampu merah: bemper depan melewati tepi dekat garis henti saat lampunya merah
+    if (ego._f0 != null && ego._f0 < S.stopEB && egoFront() >= S.stopEB && red) {
+      counters.redRuns += 1;
+      counters.note('merah', { who: 'ego', t: W.time, v: ego.speed });
+    }
+    for (const c of oncoming) {
+      const F = c.x - c.length / 2;
+      if (c._f0 != null && c._f0 > S.stopWB && F <= S.stopWB && red) {
+        counters.redRuns += 1;
+        counters.note('merah', { who: c.id, t: W.time, v: c.speed });
+      }
+    }
+    for (const k of ['utara', 'selatan']) {
+      const sd = scene.side[k];
+      for (const a of cross[k]) {
+        const F = a.s + a.length / 2;
+        if (a._f0 != null && a._f0 < sd.stopS && F >= sd.stopS && F - a._f0 < 5 && sideRed) {
+          counters.redRuns += 1;
+          counters.note('merah', { who: a.id, t: W.time, v: a.speed });
+        }
+      }
+    }
+    // kontak pejalan kaki: kotak kendaraan bersinggungan dengan lingkaran pejalan kaki
+    const boxes = [];
+    boxes.push({ id: 'ego', b: worldBox(ego) });
+    for (const c of oncoming) if (c.x > S.despawn + 5 && c.x < S.end + 30) boxes.push({ id: c.id, b: worldBox(c) });
+    for (const a of crossList()) boxes.push({ id: a.id, b: a });
+    if (angkot.active) boxes.push({ id: angkot.id, b: worldBox(angkot) });
+    const nowContacts = new Set();
+    for (const p of peds) {
+      const w = frame.toWorld(p.x, p.y);
+      for (const { id, b } of boxes) {
+        if (Math.abs(b.x - w.x) > 8 || Math.abs(b.y - w.y) > 8) continue;
+        if (distanceToBox(w.x, w.y, b) < p.radius) {
+          const key = `${p.id}|${id}`;
+          nowContacts.add(key);
+          if (!contactPairs.has(key)) {
+            counters.pedContacts += 1;
+            counters.note('kontak', { ped: p.id, veh: id, t: W.time, state: p.state });
+          }
+        }
+      }
+    }
+    contactPairs = nowContacts;
+    // tabrakan lain (kendaraan dengan kendaraan atau angkot ngetem)
+    const nowHits = new Set();
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const A = boxes[i].b;
+        const B = boxes[j].b;
+        if (Math.abs(A.x - B.x) > 7 || Math.abs(A.y - B.y) > 7) continue;
+        if (boxesOverlap(A, B)) {
+          const key = `${boxes[i].id}|${boxes[j].id}`;
+          nowHits.add(key);
+          if (!hitPairs.has(key)) {
+            counters.otherCollisions += 1;
+            counters.note('tabrakan', { a: boxes[i].id, b: boxes[j].id, t: W.time });
+            if (boxes[i].id === 'ego' || boxes[j].id === 'ego') events.push({ type: 'tabrakan', what: boxes[i].id === 'ego' ? boxes[j].id : boxes[i].id });
+          }
+        }
+      }
+    }
+    hitPairs = nowHits;
   }
 
   // ---------- langkah simulasi ----------
 
-  /** planner: { update(dt), yieldTo, shift(dx) } dari planner.js */
+  /** planner: { update(dt) -> { aDesire, aSafety, steer }, P, onWrap() } dari planner.js */
   function update(dt, planner) {
     W.time += dt;
     signal.update(dt);
-    planner.update(dt);
+    const cmd = planner.update(dt);
+    stepEgo(cmd, dt);
     updateOncoming(dt);
-    cross.update(dt, signal.side);
-    updatePeds(dt, planner.yieldTo);
-    checkCollisions();
-    // geser dunia mundur satu putaran bila mobil otonom sudah terlalu jauh
-    if (ego.x > L + 20) shift(-L, planner);
-  }
-
-  function shift(dx, planner) {
-    ego.x += dx;
-    for (const c of oncoming) c.x += dx;
-    for (const p of peds) {
-      p.x += dx;
-      p.zx += dx;
+    updateCross(dt);
+    updatePeds(dt, planner);
+    updatePendingPed();
+    updatePendingAngkot();
+    monitor();
+    // ujung ruas: mobil otonom mulai lagi dari awal Jalan Kawi
+    if (ego.x >= S.wrap && planner.P.state === 'melaju' && !planner.P.man) {
+      const over = ego.x - S.wrap;
+      ego.x = S.start + over;
+      ego._f0 = null;
+      ego.yc = null;
+      W.wraps += 1;
+      W.lastWrapAt = W.time;
+      planner.onWrap();
+      events.push({ type: 'putaran' });
     }
-    stalled.fromK += Math.round(dx / L);
-    W.viewMaxX += dx;
-    planner?.shift(dx);
   }
 
-  /** Mulai ulang dunia dengan mobil otonom di x tertentu dan melaju pada kecepatan v. */
-  function reset(egoX, v) {
+  /** Mulai ulang dunia dengan mobil otonom di s tertentu dan melaju pada kecepatan v. */
+  function reset(egoS, v) {
     W.time = 0;
     rng.reseed(11);
     nextId = 1;
     colorIdx = 0;
-    lastHit = -10;
-    W.collisions = 0;
+    counters.reset();
+    contactPairs.clear();
+    hitPairs.clear();
     pedSide = 'utara';
-    ego.setPose(egoX, EGO_Y, 0);
-    ego.speed = v;
-    W.viewMaxX = egoX + 60; // diperbarui lagi oleh render berikutnya
+    ambientTimer = 5;
+    ego.setPose(egoS, EGO_LAT, 0);
+    ego.speed = Math.min(v, SAFETY.vMaxEgo);
+    ego._f0 = null;
+    ego.yc = null;
+    ego._shield = false;
+    W.viewMaxS = egoS + 70;
+    W.wraps = 0;
+    W.lastWrapAt = -10;
+    W.shieldNote = null;
     peds.length = 0;
     events.length = 0;
-    signal.reset('MAIN_GREEN');
-    cross.reset();
+    pending.ped = 0;
+    pending.angkot = false;
+    angkot.since = 0;
+    signal.reset();
+    resetCross();
     seedOncoming();
-    if (stalled.active) {
-      stalled.fromK = 0;
-      // jangan sampai mobil mogok muncul tepat di depan mobil otonom
-      const front = ego.x + ego.length / 2;
-      while (STALL_X + stalled.fromK * L - 2.25 - front < 40) stalled.fromK += 1;
-      while (STALL_X + (stalled.fromK - 1) * L - 2.25 - front >= 40) stalled.fromK -= 1;
-    }
   }
 
   function drainEvents() {
     return events.splice(0);
   }
 
-  // ---------- menggambar ----------
-
-  /**
-   * Gambar pemandangan dan semua pelaku kecuali mobil otonom.
-   * vis: area dunia yang terlihat { minX, minY, maxX, maxY }.
-   */
-  function draw(g, view, vis, { reducedMotion = false } = {}) {
-    const kMin = Math.floor((vis.minX - 30) / L);
-    const kMax = Math.floor((vis.maxX + 30) / L);
-    const w = vis.maxX - vis.minX;
-    const h = vis.maxY - vis.minY;
-
-    g.fillStyle = COLORS.ground;
-    g.fillRect(vis.minX, vis.minY, w, h);
-    // trotoar
-    g.fillStyle = COLORS.sidewalk;
-    g.fillRect(vis.minX, -ROAD_HALF - WALK, w, 2 * (ROAD_HALF + WALK));
-    for (let k = kMin; k <= kMax; k++) g.fillRect(k * L + INT_X - SIDE_HALF - WALK, vis.minY, 2 * (SIDE_HALF + WALK), h);
-    // aspal
-    g.fillStyle = COLORS.asphalt;
-    g.fillRect(vis.minX, -ROAD_HALF, w, 2 * ROAD_HALF);
-    for (let k = kMin; k <= kMax; k++) g.fillRect(k * L + INT_X - SIDE_HALF, vis.minY, 2 * SIDE_HALF, h);
-
-    for (let k = kMin; k <= kMax; k++) {
-      g.save();
-      g.translate(k * L, 0);
-      drawMarkings(g, vis);
-      g.restore();
-    }
-    for (let k = kMin; k <= kMax; k++) {
-      g.save();
-      g.translate(k * L, 0);
-      for (const b of statics.buildings) drawBuilding(g, b);
-      for (const l of statics.lamps) {
-        g.fillStyle = '#64748b';
-        g.beginPath();
-        g.arc(l.x, l.y, 0.22, 0, Math.PI * 2);
-        g.fill();
-      }
-      g.translate(INT_X, 0);
-      cross.draw(g);
-      g.restore();
-    }
-
-    // mobil mogok (berulang di setiap putaran mulai fromK)
-    if (stalled.active) {
-      const blinkOn = reducedMotion || Math.floor(W.time * 3) % 2 === 0;
-      for (let k = Math.max(kMin, stalled.fromK); k <= kMax; k++) drawStalled(g, stallBox(k), blinkOn);
-    }
-    for (const c of oncoming) if (c.x > vis.minX - 5 && c.x < vis.maxX + 5) drawCar(g, c);
-    for (const p of peds) {
-      if (p.x < vis.minX - 3 || p.x > vis.maxX + 3) continue;
-      if (p.state === 'menunggu') {
-        const pulse = reducedMotion ? 0 : (Math.sin(W.time * 4) + 1) * 2;
-        drawRing(g, p.x, p.y, view.px(12 + pulse), { color: COLORS.target, width: 1.5, view, alpha: 0.85 });
-      }
-      drawPedestrian(g, p, { view, phase: p.phase, minPx: 15, alpha: p.alpha });
-    }
-    for (let k = kMin; k <= kMax; k++) {
-      g.save();
-      g.translate(k * L, 0);
-      for (const t of statics.trees) drawTree(g, t.x, t.y, t.r);
-      drawTrafficLight(g, { ...WEST_LIGHT, state: signal.main }, { view, minPx: 18, alpha: 0.85 });
-      drawTrafficLight(g, { ...SOUTH_LIGHT, state: signal.side }, { view, minPx: 18, alpha: 0.85 });
-      drawTrafficLight(g, { ...NORTH_LIGHT, state: signal.side }, { view, minPx: 18, alpha: 0.85 });
-      drawTrafficLight(g, { ...EAST_LIGHT, state: signal.main }, { view, minPx: 30 });
-      g.restore();
-    }
-  }
-
-  function drawMarkings(g, vis) {
-    const yellow = { color: COLORS.centerLine, width: 0.15, cap: 'butt' };
-    const edge = { color: 'rgba(229, 231, 235, 0.5)', width: 0.12, cap: 'butt' };
-    const seg = (x0, x1, y) => [
-      { x: x0, y },
-      { x: x1, y },
-    ];
-    drawLine(g, seg(0, STOP_E + 0.2, 0), yellow);
-    drawLine(g, seg(STOP_W - 0.2, PASS_A, 0), yellow);
-    drawLine(g, seg(PASS_A, PASS_B, 0), { ...yellow, dash: [3, 3] });
-    drawLine(g, seg(PASS_B, L, 0), yellow);
-    for (const y of [-ROAD_HALF + 0.25, ROAD_HALF - 0.25]) {
-      drawLine(g, seg(0, INT_X - SIDE_HALF - 0.3, y), edge);
-      drawLine(g, seg(INT_X + SIDE_HALF + 0.3, L, y), edge);
-    }
-    // kerb
-    g.fillStyle = COLORS.curb;
-    for (const y of [-ROAD_HALF - 0.1, ROAD_HALF - 0.1]) {
-      g.fillRect(0, y, INT_X - SIDE_HALF, 0.2);
-      g.fillRect(INT_X + SIDE_HALF, y, L - INT_X - SIDE_HALF, 0.2);
-    }
-    // garis tengah jalan simpang
-    drawLine(g, seg(vis.minY - 5, -6.6, 0).map((p) => ({ x: INT_X, y: p.x })), yellow);
-    drawLine(g, seg(6.6, vis.maxY + 5, 0).map((p) => ({ x: INT_X, y: p.x })), yellow);
-    drawCrosswalk(g, statics.zebra);
-    for (const s of statics.lines) drawStopLine(g, s);
-    for (const s of statics.yieldLines) drawStopLine(g, s, { color: '#cbd5e1' });
-  }
-
-  function drawStalled(g, box, blinkOn) {
-    drawCar(g, box, { color: '#7a8497' });
-    const hl = box.length / 2 - 0.12;
-    const hw = box.width / 2 - 0.14;
-    for (const [sx, sy] of [
-      [hl, -hw],
-      [hl, hw],
-      [-hl, -hw],
-      [-hl, hw],
-    ]) {
-      const x = box.x + sx;
-      const y = box.y + sy;
-      if (blinkOn) {
-        g.fillStyle = withAlpha('#fbbf24', 0.35);
-        g.beginPath();
-        g.arc(x, y, 0.5, 0, Math.PI * 2);
-        g.fill();
-      }
-      g.fillStyle = blinkOn ? '#fbbf24' : '#7c5a12';
-      g.beginPath();
-      g.arc(x, y, 0.2, 0, Math.PI * 2);
-      g.fill();
-    }
+  /** Ringkasan untuk uji otomatis (window.__keputusan). */
+  function snapshot() {
+    return {
+      time: W.time,
+      egoS: ego.x,
+      egoLat: ego.y,
+      egoSpeed: ego.speed,
+      egoFront: egoFront(),
+      light: signal.main,
+      sideLight: signal.side,
+      phase: signal.phase,
+      mode: signal.mode,
+      density: W.density,
+      oncoming: oncoming.length,
+      cross: crossList().length,
+      peds: peds.map((p) => ({ id: p.id, cw: p.cw.key, state: p.state, test: p.test, s: p.x, lat: p.y })),
+      pendingPed: pending.ped,
+      pendingAngkot: pending.angkot,
+      angkot: angkot.active,
+      wraps: W.wraps,
+      S: { ...S },
+      counters: {
+        redRuns: counters.redRuns,
+        pedContacts: counters.pedContacts,
+        otherCollisions: counters.otherCollisions,
+        clamps: counters.clamps,
+        interventions: counters.interventions,
+        egoInterventions: counters.egoInterventions,
+      },
+      events: counters.events.slice(0, 12),
+    };
   }
 
   Object.assign(W, {
     update,
     reset,
-    shift,
-    draw,
     setDensity,
-    spawnPed,
-    placeStalled,
-    removeStalled,
-    stallBox,
+    requestPed,
+    requestAngkot,
     drainEvents,
+    snapshot,
+    worldBox,
   });
   return W;
 }

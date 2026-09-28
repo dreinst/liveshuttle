@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <title>Uji situs: contoh ENGINE.md bagian 8</title>
+    <link rel="icon" href="../favicon.svg" />
+    <link rel="stylesheet" href="../css/style.css" />
+    <style>body { margin: 0; background: #0b1220; } .c { position: relative; width: 900px; height: 540px; margin: 8px; }</style>
+  </head>
+  <body>
+    <div class="c" id="a"></div>
+    <div class="c" id="b"></div>
+    <script type="module">
+      // Menjalankan contoh kode ENGINE.md 8.2 dan 8.4 dengan ctx tiruan, supaya contoh untuk agen pelajaran terbukti jalan.
+      import { View } from '../js/engine/canvas.js';
+      import { Loop } from '../js/engine/loop.js';
+      import { COLORS } from '../js/engine/theme.js';
+      import { loadMap, createMapRenderer, drawSearch } from '../js/engine/osm2d.js';
+      import { Vehicle } from '../js/engine/vehicle.js';
+      import { Sensor, SensorRig } from '../js/engine/sensors.js';
+      import { createLidarTrail, drawLidarRange, drawLidarSweep, lidarSweepAngle, drawVehicle } from '../js/engine/draw.js';
+      import { purePursuit } from '../js/engine/control.js';
+      const out = (window.__ex = { done: false, errors: [] });
+      const abort = new AbortController();
+      const fakeCtx = (el) => ({
+        signal: abort.signal,
+        reducedMotion: false,
+        loadMap: (id) => loadMap(id, { signal: abort.signal }),
+        createView: (opts) => new View(el, opts),
+        createLoop: (opts) => new Loop(opts).start(),
+      });
+      try {
+        // 8.2
+        {
+          const ctx = fakeCtx(document.getElementById('a'));
+          const map = await ctx.loadMap('machung');
+          const view = ctx.createView({
+            bounds: (v) => (v.aspect < 1.2 ? map.boundsAround(40, 150, 170, 210) : map.boundsAround(40, 150, 260, 150)),
+          });
+          const renderer = createMapRenderer(map, { layers: { places: true } });
+          const graph = map.graph({ cost: 'time' });
+          const a = graph.nearestNode(-130, 109).id;
+          const b = graph.nearestNode(223, 254).id;
+          const search = graph.search(a, b, { algorithm: 'astar' });
+          view.onPointer({ tap: (e) => { const hit = graph.nearestEdge(e.x, e.y, { maxDist: 25 }); if (hit) graph.closeRoad(hit.road); } });
+          const loop = ctx.createLoop({
+            update: () => { for (let i = 0; i < 3 && !search.done; i++) search.step(); },
+            render: () => {
+              const g = view.begin();
+              renderer.draw(g, view, { attribution: false });
+              drawSearch(g, view, graph, search);
+              renderer.drawAttribution(g, view);
+            },
+          });
+          out.search = () => ({ done: search.done, found: search.found, expanded: search.expanded });
+        }
+        // 8.4: shuttle mengikuti rute dengan LiDAR tenang
+        {
+          const ctx = fakeCtx(document.getElementById('b'));
+          const map = await ctx.loadMap('machung');
+          const graph = map.graph();
+          const r = graph.findRoute(graph.nearestNode(-130, 109).id, graph.nearestNode(223, 254).id);
+          const path = graph.routePath(r.path, { keepLeft: true, smooth: 5 });
+          const ego = new Vehicle({ kind: 'shuttle', x: path.points[0].x, y: path.points[0].y, heading: path.sample(0).heading, length: 5, width: 2.1, wheelbase: 3, maxSpeed: 8, ego: true });
+          const view = ctx.createView({ bounds: map.boundsAround(ego.x, ego.y, 60, 36) });
+          view.fit(null);
+          view.setScale(8);
+          const renderer = createMapRenderer(map);
+          const lidarSensor = new Sensor('lidar', { range: 40, rays: 360, rate: 10 });
+          const rig = new SensorRig(ego, [lidarSensor], { seed: 2 });
+          const trail = createLidarTrail({ fade: 1.5 });
+          let hintS = 0;
+          const loop = ctx.createLoop({
+            update: (dt, lp) => {
+              const pp = purePursuit(ego, path, { lookahead: 6, hintS });
+              hintS = pp.s;
+              ego.step(dt, { accel: ego.accelToward(6), steer: pp.steer });
+              rig.update(dt, map.buildingsNear(ego.x, ego.y, 60), 'cerah');
+              trail.addReading(rig.reading('lidar'), lp.time);
+            },
+            render: (alpha, lp) => {
+              view.centerOn(ego.x, ego.y);
+              const g = view.begin();
+              renderer.draw(g, view, { attribution: false });
+              const pose = lidarSensor.pose(ego);
+              drawLidarRange(g, pose, lidarSensor.range, COLORS.lidar, { view });
+              drawLidarSweep(g, pose, lidarSweepAngle(lp.time, { period: 8 }), lidarSensor.range);
+              trail.draw(g, lp.time, COLORS.lidar, { view, size: 2.2 });
+              drawVehicle(g, ego, { view, ego: true });
+              renderer.drawAttribution(g, view);
+            },
+          });
+          out.trail = () => ({ points: trail.count, s: Math.round(hintS), speed: +ego.speed.toFixed(2) });
+        }
+        out.done = true;
+      } catch (err) {
+        out.errors.push(String((err && err.stack) || err));
+        out.done = true;
+      }
+    </script>
+  </body>
+</html>

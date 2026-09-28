@@ -1,7 +1,7 @@
 """QA pelajaran Kendali lewat UI seperti pelajar: kelima tugas, jeda, kecepatan, ulangi, kamera,
 dan uji kebocoran navigasi. Semua pesan konsol error/warning dan pageerror dikumpulkan.
 
-Pemakaian: python3 tests/kontrol_qa.py [--mobile] [--port 8116]
+Pemakaian: python3 tests/kontrol_qa.py [--mobile] [--port 8246]
 Butuh server statis yang sudah berjalan di port tersebut.
 """
 import json
@@ -14,7 +14,7 @@ CHROME = ("/Users/mcdonny/Library/Caches/ms-playwright/chromium-1243/chrome-mac-
           "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing")
 SHOTS = "/Users/mcdonny/Downloads/ndur/driverless-sim/tests/shots/kontrol/"
 MOBILE = "--mobile" in sys.argv
-PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8116"
+PORT = sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else "8246"
 BASE = f"http://127.0.0.1:{PORT}/"
 TAG = "m" if MOBILE else "d"
 
@@ -146,7 +146,7 @@ with Session() as s:
 
     # ---------- langkah 2: lookahead besar ----------
     results["ld_large_value"] = slide_to(s, "Lookahead Ld", 16)
-    results["lookahead-large"] = wait_task(s, "lookahead-large", 60)
+    results["lookahead-large"] = wait_task(s, "lookahead-large", 120)
     top(s)
     s.shot(f"qa-{TAG}-2-potong")
     results["cut_status"] = status(s)
@@ -155,8 +155,9 @@ with Session() as s:
     # ---------- langkah 3: cari Ld yang pas, satu putaran penuh ----------
     results["preset_ld_step3"] = float(slider(s, "Lookahead Ld").input_value())
     results["ld_tuned_value"] = slide_to(s, "Lookahead Ld", 7)
-    results["tuned"] = wait_task(s, "tuned", 90)
+    results["tuned"] = wait_task(s, "tuned", 240)
     results["lap_readouts"] = {k: readout(s, k) for k in ("RMS putaran terakhir", "Galat maks putaran", "Rata-rata kecepatan")}
+    results["attribution_hint"] = s.page.locator(".grp-view .ctl-hint").first.inner_text()
     top(s)
     s.page.locator(".seg-btn", has_text="Seluruh lintasan").dispatch_event("click")
     s.page.wait_for_timeout(600)
@@ -206,7 +207,7 @@ with Session() as s:
     top(s)
     s.shot(f"qa-{TAG}-6-ringkasan")
     results["completed"] = s.hook()["completedTasks"]
-    results["progress"] = s.page.evaluate("() => JSON.parse(localStorage.getItem('simotonom.progress.v1')).lessons.kontrol")
+    results["progress"] = s.page.evaluate("() => JSON.parse(localStorage.getItem('liveshuttle.progress.v1')).lessons.kontrol")
 
     # ---------- navigasi berulang: tidak boleh ada loop, kanvas, atau style yang tertinggal ----------
     for i in range(8):

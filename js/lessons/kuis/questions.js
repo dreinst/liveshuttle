@@ -20,7 +20,7 @@ export const TOPICS = {
   keputusan: lessonTopic('keputusan', 'brain'),
   'jarak-aman': lessonTopic('jarak-aman', 'gauge'),
   shuttle: lessonTopic('shuttle', 'car'),
-  simulator: { id: 'simulator', title: 'Simulator 3D', icon: 'cube', href: '#/simulator/tutorial', linkText: 'Buka lagi' },
+  'shuttle-3d': { id: 'shuttle-3d', title: 'Shuttle 3D Ma Chung', icon: 'cube', href: '#/shuttle-3d/panduan', linkText: 'Buka lagi' },
 };
 
 export const QUESTIONS = [
@@ -206,40 +206,110 @@ export const QUESTIONS = [
       'Ruas yang ditutup dihapus dari graf jalan, lalu shuttle menghitung ulang rute dengan A* mulai dari ruas yang sedang dilaluinya. Proses ini disebut <strong>perencanaan ulang</strong> (replanning). Kembali ke halte awal hanya membuang waktu penumpang.',
   },
   {
-    id: 'urutan-alur',
-    topic: 'simulator',
-    q: 'Di Simulator 3D, mobil otonom bekerja dalam empat tahap yang terus berulang. Mana urutan yang benar?',
-    options: [
-      'Sensor → Persepsi → Perencanaan → Kontrol',
-      'Persepsi → Sensor → Kontrol → Perencanaan',
-      'Sensor → Perencanaan → Persepsi → Kontrol',
-      'Perencanaan → Sensor → Persepsi → Kontrol',
-    ],
-    answer: 0,
-    explain:
-      'Sensor mengumpulkan data, misalnya titik LiDAR dan gambar kamera. Persepsi mengubahnya menjadi objek berkotak dan berlabel. Perencanaan memilih tindakan dan jalur. Kontrol menggerakkan setir, gas, dan rem. Siklus ini berulang berkali-kali setiap detik.',
-  },
-  {
     id: 'ttc',
-    topic: 'simulator',
-    q: 'Mobil otonom melaju 20 m/s, 30 m di belakang mobil lain yang melaju searah 14 m/s. Bila tidak ada yang berubah, berapa TTC-nya?',
+    topic: 'jarak-aman',
+    q: 'Mobil melaju 20 m/s, 30 m di belakang mobil lain yang melaju searah 14 m/s. Bila tidak ada yang berubah, berapa TTC-nya?',
     options: ['5 detik', '1,5 detik', '2,1 detik', '0,2 detik'],
     answer: 0,
     explain:
-      'TTC (time to collision) adalah jarak dibagi kecepatan relatif. Kecepatan relatifnya 20 − 14 = 6 m/s, jadi TTC = 30 / 6 = 5 detik. Bila TTC terlalu kecil, rem darurat otomatis (AEB) mengerem penuh.',
+      'TTC (time to collision) adalah jarak dibagi kecepatan mendekat. Kecepatan mendekatnya 20 − 14 = 6 m/s, jadi TTC = 30 / 6 = 5 detik. Di pelajaran Jarak Aman, AEB baru memberi peringatan saat TTC di bawah 2,5 detik.',
   },
   {
-    id: 'lampu-adaptif',
-    topic: 'simulator',
-    q: 'Di Simulator 3D, lampu lalu lintas bisa diatur ke mode Adaptif. Bagaimana mode ini memberi lampu hijau?',
+    id: 'lapisan-otonomi',
+    topic: 'shuttle-3d',
+    q: 'Di bagian bawah layar Shuttle 3D Ma Chung ada empat lapisan otonomi yang bekerja berulang-ulang. Mana urutan yang benar?',
     options: [
-      'Hijau hanya untuk arah yang ada antreannya, dengan batas hijau minimum dan maksimum.',
-      'Setiap arah mendapat hijau sama panjang secara bergiliran, walaupun jalannya kosong.',
-      'Hijau selalu diberikan lebih dulu kepada arah tempat mobil otonom datang.',
-      'Warna lampu berganti secara acak supaya panjang antrean di semua arah merata.',
+      'Indra → Pahami → Rencana → Gerak',
+      'Pahami → Indra → Gerak → Rencana',
+      'Indra → Rencana → Pahami → Gerak',
+      'Rencana → Indra → Pahami → Gerak',
     ],
     answer: 0,
     explain:
-      'Lampu adaptif membaca detektor antrean. Arah yang kosong dilewati. Hijau berakhir bila tidak ada lagi kendaraan yang datang, atau bila batas hijau maksimum tercapai sementara arah lain menunggu. Mode Waktu tetap memberi setiap arah giliran sama panjang walaupun jalannya kosong. Bandingkan rata-rata waktu tunggu keduanya di panel Kota pintar.',
+      'Indra (sensor) mengumpulkan titik LiDAR, gambar kamera, dan pantulan radar. Pahami (persepsi) mengubahnya menjadi daftar benda dengan jarak dan kecepatan. Rencana memilih rute dan tindakan. Gerak (kendali) mengatur setir, gas, dan rem. Urutan ini sama dengan Sensor → Persepsi → Perencanaan → Kontrol di pelajaran.',
+  },
+  {
+    id: 'peta-hd',
+    topic: 'shuttle-3d',
+    q: 'Jalan di Shuttle 3D Ma Chung berasal dari OpenStreetMap. Mengapa kendaraan tanpa pengemudi sungguhan tetap butuh peta HD?',
+    options: [
+      'Peta HD mencatat setiap lajur, garis henti, dan rambu sampai hitungan sentimeter, sedangkan jumlah dan lebar lajur di OSM sering hanya perkiraan.',
+      'OpenStreetMap tidak memuat nama jalan, jadi rute ke halte tidak bisa dicari.',
+      'Dengan peta HD, kendaraan tidak lagi butuh LiDAR, kamera, dan radar.',
+      'OpenStreetMap hanya tersedia untuk kota di luar Indonesia.',
+    ],
+    answer: 0,
+    explain:
+      'OSM adalah peta komunitas. Nama jalan, bundaran, dan gedungnya asli, tetapi jumlah lajur, lebar lajur, dan bentuk persimpangan di simulator ini kami perkirakan (lihat panel Tentang peta). Peta HD merekam lajur dengan ketelitian sentimeter, dan LiDAR mencocokkan diri dengannya untuk lokalisasi. Sensor tetap wajib, karena peta tidak tahu siapa yang sedang ada di jalan.',
+  },
+  {
+    id: 'perisai',
+    topic: 'shuttle-3d',
+    q: 'Kamu mengambil kemudi shuttle dan menekan gas penuh ke arah lampu merah. Apa yang dilakukan perisai keselamatan?',
+    options: [
+      'Mengerem sendiri begitu jarak ke garis henti hampir sama dengan jarak henti, sehingga shuttle berhenti sebelum garis.',
+      'Tidak berbuat apa-apa, karena saat kemudi manual perisai dimatikan.',
+      'Hanya membunyikan peringatan, lalu kamu yang harus mengerem.',
+      'Mengubah lampu menjadi hijau supaya shuttle boleh lewat.',
+    ],
+    answer: 0,
+    explain:
+      'Perisai berjalan setiap langkah fisika (1/60 detik) untuk semua kendaraan, sesudah perintah autopilot atau perintahmu dan sebelum roda bergerak. Ia mencari batasan terdekat di depan (garis henti lampu merah, zebra cross yang dipakai, pejalan kaki di jalur) dan mengerem bila sisa jaraknya sudah hampir sama dengan jarak henti.',
+  },
+  {
+    id: 'pejalan-uji',
+    topic: 'shuttle-3d',
+    q: 'Tombol Pejalan kaki menyeberang memunculkan orang di depan shuttle. Kapan orang itu boleh muncul?',
+    options: [
+      'Bila jaraknya dari shuttle masih lebih besar dari jarak henti shuttle, v × waktu reaksi + v² / (2 × perlambatan rem), ditambah cadangan.',
+      'Kapan saja, tepat di depan bemper, supaya perisai diuji paling keras.',
+      'Hanya saat shuttle berhenti di halte.',
+      'Hanya saat cuaca cerah, karena saat hujan pejalan kaki tidak menyeberang.',
+    ],
+    answer: 0,
+    explain:
+      'Pejalan kaki hanya dimunculkan sejauh jarak yang masih cukup untuk berhenti. Kalau belum aman, misalnya di depan shuttle ada persimpangan atau ada kendaraan lain yang terlalu dekat, pejalan kaki menunggu dan kamu diberi tahu alasannya. Pejalan kaki di simulator juga baru melangkah ke jalan bila semua kendaraan yang datang masih bisa berhenti.',
+  },
+  {
+    id: 'hujan-3d',
+    topic: 'shuttle-3d',
+    q: 'Cuaca di Shuttle 3D berganti menjadi Hujan. Gesekan jalan turun dari 0,8 menjadi 0,5. Apa akibatnya bagi shuttle?',
+    options: [
+      'Perlambatan rem terbesar ikut turun, jadi jarak henti lebih panjang dan shuttle menurunkan batas kecepatannya.',
+      'Jarak henti tetap sama, karena rem shuttle listrik tidak terpengaruh jalan basah.',
+      'Radar berhenti bekerja, jadi shuttle hanya memakai kamera.',
+      'Shuttle boleh melaju lebih cepat karena jalanan lebih sepi.',
+    ],
+    answer: 0,
+    explain:
+      'Perlambatan terbesar kira-kira μ × g, jadi μ yang lebih kecil membuat bagian v² / (2 × perlambatan) lebih panjang. Karena itu shuttle membatasi diri 25 km/jam saat hujan. Saat kabut ia membatasi diri 20 km/jam karena jangkauan kamera dan LiDAR memendek. Radar tetap bekerja dalam hujan dan kabut.',
+  },
+  {
+    id: 'bundaran',
+    topic: 'shuttle-3d',
+    q: 'Shuttle mendekati salah satu bundaran di Villa Puncak Tidar. Bagaimana cara shuttle masuk bundaran?',
+    options: [
+      'Memberi jalan kepada kendaraan yang sudah berputar di dalam bundaran, lalu masuk dan berputar searah jarum jam.',
+      'Masuk lebih dulu karena shuttle datang dari kanan, lalu berputar searah jarum jam.',
+      'Memberi jalan kepada kendaraan di dalam bundaran, lalu berputar berlawanan arah jarum jam.',
+      'Berhenti sampai bundaran benar-benar kosong, berapa lama pun antreannya.',
+    ],
+    answer: 0,
+    explain:
+      'Kendaraan yang sudah di dalam bundaran didahulukan, jadi shuttle menunggu celah sebelum masuk. Indonesia berlalu lintas di kiri, sehingga bundaran diputari searah jarum jam. Menunggu sampai bundaran kosong sama sekali tidak perlu, cukup sampai ada celah yang aman.',
+  },
+  {
+    id: 'motor-malang',
+    topic: 'shuttle-3d',
+    q: 'Jalan di sekitar Ma Chung dan Malang ramai sepeda motor dan angkot. Mengapa lapisan Pahami shuttle mengawasi motor dengan ketat?',
+    options: [
+      'Motor kecil dan bisa berubah arah dengan cepat, jadi posisinya harus terus dilacak dan gerakannya ditebak.',
+      'Motor tidak terlihat oleh LiDAR, jadi hanya bisa dideteksi oleh radar.',
+      'Motor selalu melaju lebih cepat dari batas kecepatan, jadi pasti menabrak.',
+      'Motor tidak boleh lewat di jalan yang dilalui shuttle.',
+    ],
+    answer: 0,
+    explain:
+      'Benda kecil yang lincah seperti motor dan pejalan kaki paling mudah terlewat dan paling cepat berubah arah. Karena itu persepsi melacak setiap benda dari waktu ke waktu, bukan hanya melihat satu gambar, supaya gerakan berikutnya bisa diperkirakan.',
   },
 ];

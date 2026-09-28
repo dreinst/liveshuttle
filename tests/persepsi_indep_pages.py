@@ -1,7 +1,7 @@
 """Tangkapan layar penuh pelajaran Persepsi (panel kontrol, kartu langkah, ringkasan) di desktop dan mobile.
 
 Pemakaian: python3 tests/persepsi_indep_pages.py [--mobile] [prefix]
-Butuh server statis di port 8133.
+Butuh server: python3 tests/serve.py 8243 (atau --port P).
 """
 import sys
 
